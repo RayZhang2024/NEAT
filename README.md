@@ -1,0 +1,1 @@
+**N**eutron Bragg **E**dge **A**nalysis **T**oolkit **NEAT** is an open-source software suite designed to handle time-of-flight neutron transmission data analysis with a focus on streamlined workflows, ease of use, and computational efficiency.
