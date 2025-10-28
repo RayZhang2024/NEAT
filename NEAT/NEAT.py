@@ -27,7 +27,7 @@ from PyQt5.QtWidgets import (
     , QInputDialog, QCheckBox, QScrollArea, QComboBox, QHeaderView, QTableWidget, QTableWidgetItem, QAbstractItemView
 )
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEventLoop
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEventLoop, QCoreApplication
 from PyQt5.QtGui import QFont, QKeySequence
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -4634,16 +4634,55 @@ class FitsViewer(QMainWindow):
             rect = Rectangle((xmin, ymin), width, height, edgecolor='yellow', facecolor='none', lw=1)
             self.canvas.axes.add_patch(rect)
     
+        # # Draw the batch fitting moving box, if available
+        # if self.current_batch_box:
+        #     xmin, xmax, ymin, ymax = self.current_batch_box
+        #     if self.batch_box_patch:
+        #         self.batch_box_patch.remove()
+        #     self.batch_box_patch = Rectangle((ymin, xmin), ymax - ymin, xmax - xmin, edgecolor='red', facecolor='none', lw=1)
+        #     self.canvas.axes.add_patch(self.batch_box_patch)
+    
+        # self.canvas.axes.set_title(f"Image {self.current_image_index + 1}/{len(self.images)}")
+        # self.canvas.draw()
+
         # Draw the batch fitting moving box, if available
         if self.current_batch_box:
             xmin, xmax, ymin, ymax = self.current_batch_box
-            if self.batch_box_patch:
-                self.batch_box_patch.remove()
-            self.batch_box_patch = Rectangle((ymin, xmin), ymax - ymin, xmax - xmin, edgecolor='red', facecolor='none', lw=1)
-            self.canvas.axes.add_patch(self.batch_box_patch)
-    
+        
+            # If a rectangle already exists, update it
+            if self.batch_box_patch is not None and self.batch_box_patch.axes is not None:
+                try:
+                    # Update position and size instead of removing/re-adding
+                    self.batch_box_patch.set_xy((ymin, xmin))
+                    self.batch_box_patch.set_width(ymax - ymin)
+                    self.batch_box_patch.set_height(xmax - xmin)
+                except Exception:
+                    # Fallback: recreate it cleanly
+                    self.batch_box_patch.remove()
+                    self.batch_box_patch = Rectangle(
+                        (ymin, xmin),
+                        ymax - ymin,
+                        xmax - xmin,
+                        edgecolor="red",
+                        facecolor="none",
+                        lw=1,
+                    )
+                    self.canvas.axes.add_patch(self.batch_box_patch)
+            else:
+                # No existing patch — create a new one
+                self.batch_box_patch = Rectangle(
+                    (ymin, xmin),
+                    ymax - ymin,
+                    xmax - xmin,
+                    edgecolor="red",
+                    facecolor="none",
+                    lw=1,
+                )
+                self.canvas.axes.add_patch(self.batch_box_patch)
+        
         self.canvas.axes.set_title(f"Image {self.current_image_index + 1}/{len(self.images)}")
-        self.canvas.draw()
+        self.canvas.draw_idle()
+
 
     def update_display(self):
         # Update the displayed image to show the moving batch box
@@ -4899,11 +4938,11 @@ class FitsViewer(QMainWindow):
     
         try:
             # Validate structure type
-            if is_known_phase:
-                structure_type = self.structure_type
-                if structure_type != "cubic":
-                    raise ValueError(f"Non-cubic structure '{structure_type}' not supported. "
-                                      "Only cubic structures allowed.")
+            # if is_known_phase:
+            #     structure_type = self.structure_type
+            #     if structure_type != "cubic":
+            #         raise ValueError(f"Non-cubic structure '{structure_type}' not supported. "
+            #                           "Only cubic structures allowed.")
             
             # Get lattice parameter (cubic-specific logic)
             if is_known_phase:
@@ -9760,11 +9799,12 @@ class FilteringWorker(QThread):
             self.message.emit(f"Error copying related files: {e}")
 
     
-QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
 
     
 def main():
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
 
     # Optionally set a style sheet if needed
