@@ -34,7 +34,7 @@ All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil,
 Open a terminal (Git Bash, PowerShell, or macOS/Linux terminal) and run:
 ```bash
 git clone https://github.com/RayZhang2024/NEAT.git
-cd NEAT
+cd ~/NEAT
 ````
 
 ---
@@ -47,6 +47,12 @@ Because this project includes a `pyproject.toml`, you can install it directly:
 pip install .
 ```
 
+or
+
+```bash
+python -m pip install .
+```
+
 This automatically installs NEAT **and all dependencies** specified in `pyproject.toml`.
 
 
@@ -57,7 +63,7 @@ This automatically installs NEAT **and all dependencies** specified in `pyprojec
 After installation, simply launch the GUI with:
 
 ```bash
-cd NEAT/NEAT
+cd ~/NEAT/NEAT
 python NEAT.py
 ```
 
