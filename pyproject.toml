@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polysolve"
+version = "0.1"
+description = "Module to compute quadratic and cubic roots."
+authors = [
+    { name = "Ruiyao Zhang", email = "rayzhang@example.com" }
+]
+readme = "README.md"
+license = { text = "MIT" }
+dependencies = [
+    "PyQt5>=5.15",
+    "matplotlib>=3.5",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "astropy>=5",
+    "pandas>=1.5",
+    "psutil>=5.9"
+]
