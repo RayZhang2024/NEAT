@@ -3970,7 +3970,7 @@ class FitsViewer(QMainWindow):
                 'o',
                 markersize=3,
                 color='blue',
-                label='Experimental Data'
+                # label='Experimental Data'
             )
             # Fitted model
             x_fit = result_dict['x_data']
@@ -3979,7 +3979,7 @@ class FitsViewer(QMainWindow):
                 x_fit,
                 y_fit,
                 'r-',
-                label='Fitted Model'
+                # label='Fitted Model'
             )
     
             # Plot theoretical edges in [min_wavelength, max_wavelength]
@@ -4762,7 +4762,7 @@ class FitsViewer(QMainWindow):
             'o',
             markersize=3,
             color='blue',
-            label='Experimental Data'
+            # label='Experimental Data'
         )
         
         # **Calculate and Plot Theoretical Bragg Edges within the Range**
@@ -4799,7 +4799,7 @@ class FitsViewer(QMainWindow):
             if label not in unique_labels:
                 unique_labels.append(label)
                 unique_handles.append(handle)
-        self.plot_canvas_a.axes.legend(unique_handles, unique_labels)
+        # self.plot_canvas_a.axes.legend(unique_handles, unique_labels)
         
         self.plot_canvas_a.draw()
 
@@ -4809,6 +4809,12 @@ class FitsViewer(QMainWindow):
                 ('Region 2',  r1_min, r1_max, self.plot_canvas_c),
                 ('Region 3',  r3_min, r3_max, self.plot_canvas_d),
             ]
+        # try:    
+        #     regions = [
+        #         (r2_min, r2_max, self.plot_canvas_b),
+        #         (r1_min, r1_max, self.plot_canvas_c),
+        #         (r3_min, r3_max, self.plot_canvas_d),
+        #     ]
         except ValueError:
             self.message_box.append("Please enter valid min and max wavelengths.")
             return
@@ -4830,12 +4836,12 @@ class FitsViewer(QMainWindow):
                     region_y,
                     'o',
                     markersize=3,
-                    label=name
+                    # label=name
                 )
                 canvas.axes.set_xlabel("Wavelength (Å)")
                 canvas.axes.set_ylabel("Summed Intensity")
                 canvas.axes.set_title(f"Intensity Profile of {name}")
-                canvas.axes.legend()
+                # canvas.axes.legend()
                 canvas.draw()
             except Exception:
                 # self.message_box.append("Select a Bragg Edge to display the regions")
@@ -4992,7 +4998,8 @@ class FitsViewer(QMainWindow):
     
             if not skip_ui_updates:
                 self.plot_canvas_c.axes.plot(x_r1, y_r1, 'b.', 
-                                             label=f"Edge {row_number + 1} R1 Data")
+                                             # label=f"Edge {row_number + 1} R1 Data"
+                                             )
             p0 = [0,0]
             lower = [-10, -10]
             upper = [10, 10]
@@ -5003,8 +5010,9 @@ class FitsViewer(QMainWindow):
     
             if not skip_ui_updates:
                 self.plot_canvas_c.axes.plot(x_r1, fit_y1, 'r-', 
-                                             label=f"Edge {row_number + 1} Fit R1")
-                self.plot_canvas_c.axes.legend()
+                                             # label=f"Edge {row_number + 1} Fit R1"
+                                             )
+                # self.plot_canvas_c.axes.legend()
                 self.plot_canvas_c.draw()
                 self.message_box.append(
                     f"Edge {row_number + 1} - Fitted Region 1: "
@@ -5037,7 +5045,8 @@ class FitsViewer(QMainWindow):
     
             if not skip_ui_updates:
                 self.plot_canvas_b.axes.plot(x_r2, y_r2, 'b.', 
-                                             label=f"Edge {row_number + 1} R2 Data")
+                                             # label=f"Edge {row_number + 1} R2 Data"
+                                             )
     
             popt_r2, _ = curve_fit(
                 lambda xx, a_hkl, b_hkl: fitting_function_2(xx, a_hkl, b_hkl, a0, b0),
@@ -5049,8 +5058,10 @@ class FitsViewer(QMainWindow):
     
             if not skip_ui_updates:
                 self.plot_canvas_b.axes.plot(
-                    x_r2, fit_y2, 'r-', label=f"Edge {row_number + 1} Fit R2")
-                self.plot_canvas_b.axes.legend()
+                    x_r2, fit_y2, 'r-', 
+                    # label=f"Edge {row_number + 1} Fit R2"
+                    )
+                # self.plot_canvas_b.axes.legend()
                 self.plot_canvas_b.draw()
                 self.message_box.append(
                     f"Edge {row_number + 1} - Fitted Region 2: "
@@ -5093,7 +5104,8 @@ class FitsViewer(QMainWindow):
 
             if not skip_ui_updates:
                 self.plot_canvas_d.axes.plot(
-                    x_r3, y_r3, "b.", label=f"Edge {row_number+1} R3 Data"
+                    x_r3, y_r3, "b.", 
+                    # label=f"Edge {row_number+1} R3 Data"
                 )
 
             # ---------- build p0 / bounds -------------------------
@@ -5223,9 +5235,9 @@ class FitsViewer(QMainWindow):
             if not skip_ui_updates:
                 self.plot_canvas_d.axes.plot(
                     x_r3, func_r3(x_r3, *popt_3), "r-",
-                    label=f"Edge {hkl} Fit R3"
+                    # label=f"Edge {hkl} Fit R3"
                 )
-                self.plot_canvas_d.axes.legend()
+                # self.plot_canvas_d.axes.legend()
                 self.plot_canvas_d.draw()
                 self.message_box.append(
                     f"Edge {row_number + 1} - Fitted Region 1: "
@@ -6926,19 +6938,22 @@ class FitVisualizationDialog(QDialog):
         # Experimental data & global pattern
         ax.plot(x_exp, y_exp, 'bo', ms=4, label="Experimental")
         if len(model_x):
-            ax.plot(model_x, model_y, 'k-', alpha=0.3, lw=10, label="Fitted pattern")
+            ax.plot(model_x, model_y, 'k-', alpha=0.3, lw=10, 
+                    # label="Fitted pattern"
+                    )
 
         # Individual Region‑3 edge fits (dashed)
         for ef in p.get('edge_fits', []):
             ax.plot(ef['x'], ef['fit'], '--', lw=4,
-                    label=f"Fitted Edge {ef['hkl']}")
+                    # label=f"Fitted Edge {ef['hkl']}"
+                    )
 
         # Axes cosmetics
         ax.set_xlabel("Wavelength (Å)")
         ax.set_ylabel("Summed Intensity")
         ax.set_title(f"ROI centre ({self.x_pos},{self.y_pos})  •  "
                      f"Box {self.box_width}×{self.box_height}")
-        ax.legend()
+        # ax.legend()
 
         # ───── info box with lattice, d, s, t, η ────────────────
         info_lines = ["Lattice parameters:"]
