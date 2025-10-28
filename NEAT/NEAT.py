@@ -54,12 +54,11 @@ from PyQt5.QtWidgets import QShortcut
 import matplotlib as mpl
 
 
-# from PyQt5.QtWidgets import QListView, QTreeView
-
-# app = QApplication([])
 # app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
 # app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-
+QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+app = QApplication([])
 
 # Constants for wavelength range
 
@@ -71,8 +70,6 @@ def fitting_function_1(x, a0, b0):
 
 def fitting_function_2(x, a_hkl, b_hkl, a0, b0):
     return np.exp(-((a0) + (b0 * x))) * np.exp(-((a_hkl) + (b_hkl * x)))
-
-
 
 def fitting_function_3(
     x, a0, b0, a_hkl, b_hkl,
