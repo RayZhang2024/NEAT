@@ -56,9 +56,9 @@ import matplotlib as mpl
 
 # from PyQt5.QtWidgets import QListView, QTreeView
 
-app = QApplication([])
-app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+# app = QApplication([])
+# app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+# app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
 
 # Constants for wavelength range
@@ -9818,8 +9818,8 @@ class FilteringWorker(QThread):
 
     
 def main():
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
 
     # Optionally set a style sheet if needed
