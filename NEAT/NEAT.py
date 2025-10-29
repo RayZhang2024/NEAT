@@ -2881,17 +2881,17 @@ class FitsViewer(QMainWindow):
     
         # ============== Controls in Lower Left Layout ==============
         button_layout = QHBoxLayout()
-        self.load_button = QPushButton("Load Images")
+        self.load_button = QPushButton("Load")
         self.load_button.clicked.connect(self.load_fits_images)
         self.load_button.setToolTip('Select a folder to load fits images')
         button_layout.addWidget(self.load_button)
         
-        self.auto_adjust_button = QPushButton("Auto Adjust")
+        self.auto_adjust_button = QPushButton("Auto Adj.")
         self.auto_adjust_button.clicked.connect(self.auto_adjust)
         self.auto_adjust_button.setToolTip('Auto adjust brightness and contrast')
         button_layout.addWidget(self.auto_adjust_button)
     
-        self.adjust_image_button = QPushButton("Adjust Image")
+        self.adjust_image_button = QPushButton("Manual Adj.")
         self.adjust_image_button.clicked.connect(self.open_adjustments_dialog)
         self.adjust_image_button.setToolTip('Manually adjust brightness and contrast')
         button_layout.addWidget(self.adjust_image_button)
@@ -2911,13 +2911,13 @@ class FitsViewer(QMainWindow):
         button_layout.addWidget(self.smooth_checkbox)
     
         self.phase_dropdown = QComboBox()
-        self.phase_dropdown.addItem("Select Phase")  # Placeholder/default item
+        self.phase_dropdown.addItem("Phase")  # Placeholder/default item
         self.phase_dropdown.setToolTip('Select a phase from the drop down list, or select "unknown_phase" if the material is unknown')
         self.phase_dropdown.addItems(list(PHASE_DATA.keys()))  # Dynamically add phase names
         self.phase_dropdown.currentIndexChanged.connect(self.phase_selection_changed)  # Connect to handler
         button_layout.addWidget(self.phase_dropdown)
     
-        self.show_theoretical_checkbox = QCheckBox("Show Edges")
+        self.show_theoretical_checkbox = QCheckBox("Show")
         self.show_theoretical_checkbox.setToolTip('Check to show the theorectical edges of a selected phase')
         self.show_theoretical_checkbox.setChecked(True)  # Default to shown
         self.show_theoretical_checkbox.stateChanged.connect(self.update_plots)  # Trigger plot update on toggle
