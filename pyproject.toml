@@ -3,11 +3,11 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "polysolve"
-version = "0.1"
-description = "Module to compute quadratic and cubic roots."
+name = "NEAT"
+version = "4.5.3"
+description = "Bragg edge imaging data analysis."
 authors = [
-    { name = "Ruiyao Zhang", email = "rayzhang@example.com" }
+    { name = "Ruiyao Zhang", email = "ruiyao.zhang@stfc.ac.uk" }
 ]
 readme = "README.md"
 license = { text = "MIT" }
