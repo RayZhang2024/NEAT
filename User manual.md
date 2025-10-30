@@ -37,7 +37,7 @@ Export tools: save fitted parameters and spectra as CSV.
 
 ## 1.4 Typical Workflow
 
-Load Data: Import wavelength-resolved transmission files (.fits, .tiff, .npy, etc.).
+Load Data: Import wavelength-resolved transmission files (.fits).
 
 Select ROI: Choose single points or regions for analysis.
 
