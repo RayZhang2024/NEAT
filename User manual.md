@@ -1,6 +1,6 @@
 # NEAT User Manual
 
-A video tutorial is available on Youtube.
+## A video tutorial is available on Youtube.
 [![Watch the video](https://img.youtube.com/vi/fbucLB5Bypc/hqdefault.jpg)](https://www.youtube.com/watch?v=fbucLB5Bypc)
 
 # 1. Introduction
@@ -78,6 +78,7 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 
 ![Data Preprocessing Tab](docs/images/Data_Preprocessing_Tab.png)
 
+## 2.2 Bragg Edge Fitting Tab
 
 | **Section**                       | **Purpose**                                                                                                                                                                                                                          |
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -91,3 +92,5 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 
 ![Bragg Edge Fitting Tab](docs/images/Bragg_Edge_Fitting_Tab.png)
 
+
+## 2.3 Data Post Processing Tab
