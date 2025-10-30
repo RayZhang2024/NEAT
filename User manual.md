@@ -1,13 +1,17 @@
 # NEAT User Manual
 
-1. Introduction
-1.1 Overview
+A video tutorial is available on Youtube.
+[![Watch the video](https://img.youtube.com/vi/fbucLB5Bypc/hqdefault.jpg)](https://www.youtube.com/watch?v=fbucLB5Bypc)
+
+# 1. Introduction
+
+## 1.1 Overview
 
 NEAT (Neutron Bragg Edge Analysis Toolkit) is an open-source Python-based graphical user interface (GUI) designed for Bragg-edge neutron imaging data analysis. It enables users to visualise, fit, and interpret wavelength-resolved transmission data collected from neutron imaging beamlines such as IMAT (ISIS Neutron and Muon Source).
 
 The software provides a streamlined workflow that integrates data loading, edge fitting, mapping, and batch processing — allowing both scientific and industrial users to efficiently extract quantitative information such as lattice spacing and residual strain from transmission spectra.
 
-1.2 Purpose and Motivation
+## 1.2 Purpose and Motivation
 
 Bragg-edge imaging is a powerful neutron technique that reveals material structure and strain information through energy-resolved transmission. However, the analysis of such data is often time-consuming and requires specialised knowledge of fitting functions and image handling.
 
@@ -21,7 +25,7 @@ Offer interactive visualisation tools to inspect transmission spectra, edge posi
 
 Facilitate collaboration and reproducibility through open-source code and transparent fitting algorithms.
 
-1.3 Key Features
+## 1.3 Key Features
 
 User-friendly GUI: intuitive layout for spectrum viewing, ROI selection, and batch analysis.
 
@@ -31,7 +35,7 @@ Result visualisation: generate maps of lattice spacing, strain, and fit quality.
 
 Export tools: save fitted parameters and spectra as CSV.
 
-1.4 Typical Workflow
+## 1.4 Typical Workflow
 
 Load Data: Import wavelength-resolved transmission files (.fits, .tiff, .npy, etc.).
 
@@ -43,7 +47,7 @@ Visualise Results: Display fitted edges and 2D maps.
 
 Export Output: Save results for further analysis or publication.
 
-1.5 Intended Users
+## 1.5 Intended Users
 
 NEAT is intended for:
 
@@ -53,11 +57,11 @@ Beamline scientists conducting in-situ studies at neutron imaging facilities.
 
 Industrial users analysing strain, phase evolution, or microstructural variations in materials.
 
-2. GUI Overview
+# 2. GUI Overview
 
 NEAT’s graphical user interface (GUI) integrates the entire Bragg-edge imaging workflow — from loading and preprocessing data to edge fitting, mapping, and post-processing — within a single interactive environment. It consists of three major tabs: data preprocessing, Bragg edge fitting, and data post processing.
 
-2.1 Data Preprocessing Tab
+## 2.1 Data Preprocessing Tab
 
 The Data Preprocessing tab is the first step in the NEAT workflow. It consolidates all image-level corrections and normalisation steps needed before Bragg-edge fitting.
 Each panel corresponds to a specific operation in the preprocessing chain, and users can execute them individually or as a complete automated batch using the Full Process module.
