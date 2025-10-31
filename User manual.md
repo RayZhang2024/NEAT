@@ -94,3 +94,17 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 
 
 ## 2.3 Data Post Processing Tab
+
+
+
+| **Section**                     | **Purpose**                                                                                                                                                                                                                    |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Batch-Fitting Data Import**   | Allows the user to load previously saved batch-fitting results (CSV file) containing fitted parameters such as lattice parameter *a*, Bragg-edge position, or strain.                                                          |
+| **Metric Selection**            | Enables the user to choose which fitted parameter to visualise — for example, lattice parameter *a*, edge shift, or intensity. The selected metric determines the data displayed in the 2D map.                                |
+| **2D Map Rendering**            | Displays a spatially resolved map of the chosen metric over the defined ROI, providing an intuitive visualisation of parameter distribution across the sample. A dynamic colour scale bar indicates quantitative values.       |
+| **Line Profile Extraction**     | Lets the user select two points on the 2D map to define a line path. The corresponding variation of the metric along this line is plotted in a **pop-up window**, allowing detailed analysis of local gradients or interfaces. |
+| **Export and Analysis Options** | Offers options to save the generated 2D maps and line-profile plots for further documentation, reporting, or comparison with simulation results.                                                                               |
+
+
+![Data Post Processing Tab](docs/images/Data_Post_Processing_Tab.png)
+
