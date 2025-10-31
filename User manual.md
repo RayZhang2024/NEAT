@@ -106,5 +106,5 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 | **Export and Analysis Options** | Offers options to save the generated 2D maps and line-profile plots for further documentation, reporting, or comparison with simulation results.                                                                               |
 
 
-![Data Post Processing Tab](docs/images/Data_Post_Processing_Tab.png)
+![Data Post Processing Tab](docs/images/Data_Post-Processing_Tab.png)
 
