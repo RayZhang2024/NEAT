@@ -28,7 +28,13 @@ All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil,
 
 ---
 
-## 🚀 Installation
+## 🚀 Run the GUI
+
+### Standalone executable
+You can download the Windows standalone executable from the [NEAT v4.5 Release](https://github.com/RayZhang2024/NEAT/releases/tag/v4.5).
+No installation is needed, just run the executable by doule clicking.
+
+### Pull from the repository
 
 ### 1️⃣ Clone the repository
 Open a terminal (Git Bash, PowerShell, or macOS/Linux terminal) and run:
@@ -58,7 +64,7 @@ This automatically installs NEAT **and all dependencies** specified in `pyprojec
 
 ---
 
-## 🧠 Running NEAT
+### 🧠 Running NEAT
 
 After installation, simply launch the GUI with:
 
