@@ -108,3 +108,158 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 
 ![Data Post Processing Tab](docs/images/Data_Post-Processing_Tab.png)
 
+# 3. Functions
+## 3.1 Data Preprocessing
+### 3.1.1 Summation
+
+* Combines multiple **runs of FITS images** by **pixel-wise addition** to boost SNR.
+* Supports batch processing for multiple samples.
+* Writes the **summed images** into a chosen output folder with your **base name**.
+
+## 1) Quick strat (2-level example)
+
+1. **Add data** → choose `/TopFolder` containing `/Run_01`, `/Run_02`, `/Run_03`.
+2. **Set output** → choose `/Results`.
+3. **Base name** → `Fe_summed`.
+4. **Sum** → wait for both progress bars to finish.
+5. Find results at:
+
+   ```
+   /Results/Summed_TopFolder/Fe_images_*.fits
+   ```
+
+---
+
+## 2) Prepare your data (folder layouts NEAT accepts)
+
+NEAT detects the layout automatically and **refuses mixed depths**.
+
+Case 1: if you have a measurement of a sample consists of multiple runs and you want to sum the multiple rusn into one.
+
+**Two-level (folder → runs) – “2-level”**
+
+```
+/TopFolder/
+  /Run_01/
+  /Run_02/
+  /Run_03/
+```
+Case 2: if you have a measurement that consists of multiple samples, and each sample consists of multiple runs, you would like to sum the runs for each of the sample.
+
+**Three-level (folder → sample → run) – “3-level”**
+
+```
+/TopFolder/
+  /Sample_A/
+    /Run_01/
+    /Run_02/
+  /Sample_B/
+    /Run_01/
+    /Run_02/
+```
+
+> ❗ **Not allowed:** mixing some children with subfolders and others without (e.g., a mix of 2- and 3-level under the same parent). NEAT will stop and ask you to reorganize.
+
+---
+
+## 3) Load runs for summation
+
+1. On **Summation** panel.
+2. Click **Add data** and select the **TopFolder** (for 2- or 3-level).
+
+   * NEAT scans immediate children to decide:
+
+     * **“Detected three-level structure (folder → sample → run).”**
+     * **“Detected two-level structure (folder → runs).”**
+     * Or reports an error if structure is invalid (e.g., only one child or mixed).
+
+
+**What NEAT checks when loading:**
+
+* For **3-level**: each sample must have **≥ 2 run subfolders** or it is skipped with an error message.
+* For **2-level**: the selected folder must have **≥ 2 subfolders (runs)**.
+
+---
+
+## 4) Choose where and how to save
+
+* In **Set output**: select a **writable output folder**.
+* In **Base name**: enter a short prefix (e.g., `Summed`).
+
+  * For **3-level**: NEAT creates `<output>/Summed_<SampleName>/`.
+  * For **2-level**: NEAT creates `<output>/Summed_<ParentFolder>/`.
+  * Summed files use your **base name** as the stem.
+
+---
+
+## 5) Run the summation
+
+1. Click **Sum**.
+2. NEAT performs **lazy loading** of runs one by one:
+
+   * **Image Loading Progress** bar reflects per-run loading.
+   * **Summation Progress** shows merge & write progress.
+
+**Strict consistency check (automatic):**
+
+* For each run, NEAT compares the **set of image suffixes (keys)** loaded in the first run.
+* If any run has a **different set/count** (e.g., missing frames), NEAT aborts and reports:
+
+  * *“Run/Sub-folder ‘…’ has N images – expected M. Aborting summation.”*
+
+**Merging logic (per image key):**
+
+* For each matching suffix, NEAT **adds arrays**: `combined[suffix] += run[suffix]`.
+
+---
+
+## 6) Completion (and what gets written)
+
+* On **2-level** completion: message *“Summation process (2-level) completed successfully!”*
+* On **3-level** completion: for each sample, NEAT writes to:
+
+  ```
+  <output>/Summed_<SampleName>/<base_name>_*.fits
+  ```
+
+  and finally reports *“Batch summation (3-level) completed successfully!”*
+* The **message pane** logs:
+
+  * Runs loaded per sample
+  * Any errors
+  * Output folders created
+* **Sum** is re-enabled; **Stop** is disabled.
+
+---
+
+## 7) Stopping a run
+
+* Click **Stop** at any time:
+
+  * NEAT sets a global cancel flag, asks workers to stop, and terminates loader threads.
+  * **Sum** re-enabled; **Stop** disabled.
+  * Message: *“Stop signal sent – aborting all processes.”*
+
+---
+
+## 8) Progress & messages you’ll see
+
+* **“Detected three-level structure…” / “Detected two-level structure…”**
+* **“Processing sample: … with X run(s).”**
+* **“Loading run i of sample …: …”** (3-level) or **“Loading subfolder i: …”** (2-level)
+* **“All runs for sample ‘…’ loaded and merged.”**
+* **“All 2-level subfolders loaded and merged => SummationWorker.”**
+* **“Finished summation for sample ‘…’.”**
+* **Error cases:** mixed structure, single child, mismatched image counts, cannot create output folder.
+
+---
+
+## 9) Troubleshooting (common pitfalls)
+
+* **Only one subfolder detected:** Add at least a second run folder or choose a different parent.
+* **Mixed 2- and 3-level structure:** Move run folders so every child has the **same depth**.
+* **Mismatched frame sets:** Ensure every run contains the **same set of FITS frames** (same suffix keys).
+* **Output path invalid:** Use **Set output** to pick an existing, writable directory.
+* **Base name empty:** Provide a short, valid string (no path separators).
+
+---
