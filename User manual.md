@@ -779,13 +779,13 @@ Runs the **entire preprocessing pipeline** in one go:
 
 # 4 Bragg Edge Fitting — step-by-step
 
-## 1) Load data & set experiment info
+## 4.2 Load data & set experiment info
 
 1. **Load normalised or filtered dataset**.
 2. Enter **flight path** (it's default to 56.4 m which is an often used filght path at IMAT, ask scientist if you don't know the filght path of your experiment).
 3. (Optional) **Select phase / material** so NEAT can list the theoretical **Bragg edges (hkl)** in the **Edge Table** for your wavelength range.
 
-## 2) Establish a spectrum (coarse macro-pixel)
+## 4.2 Establish a spectrum (coarse macro-pixel)
 
 1. Entre min/max x and y coordinates to **define a macro-pixel** to boost SNR.
 2. Hit **Pick** to show the ToF/λ spectrum on the right canvas.
@@ -793,7 +793,7 @@ Runs the **entire preprocessing pipeline** in one go:
 
 > Tip: Use a stable, representative region (avoid strong gradients) for this first pass.
 
-## 3) Configure fitting windows & model parameters
+## 4.3 Configure fitting windows & model parameters
 
 1. In the **Edge Table** (per hkl edge):
 
@@ -805,7 +805,7 @@ Runs the **entire preprocessing pipeline** in one go:
    * Set **σ**, **τ**, **η** (edge width associated with sample, edge width associated with instrument, Lorentzian fraction) as needed.
    * Choose which to **refine** vs **fix** (checkboxes).
 
-## 4) Test fit on the macro-pixel
+## 4.4 Test fit on the macro-pixel
 
 1. Click **Fit edges** (individual), or **Fit pattern** (multi-edge with shared lattice parameter **a**).
 2. Inspect:
@@ -818,13 +818,13 @@ Runs the **entire preprocessing pipeline** in one go:
    * Relax/tighten **bounds** on σ/τ/η.
    * Re-run the fit until stable.
 
-## 5) Set up full-field (map) fitting
+## 4.5 Set up full-field (map) fitting
 
 1. **Macro-pixel size**: choose the spatial bin size for mapping (keep the same macro-pixel szie as the test fit).
 2. **Pixel-skip** (optional): set step (e.g., 5×5 or 10×10) to massively speed up fitting; NEAT interpolates skipped pixels after.
 3. **ROI mask** (optional): map only on the region of interest.
 
-## 6) Run batch fitting over ROI
+## 4.6 Run batch fitting over ROI
 
 1. Click **Batch edges** or **Batch patterns** — depending on your chosen mode.
 2. Watch progress; the **message pane** streams diagnostics (failures, retries, bounds hits).
