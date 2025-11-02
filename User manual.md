@@ -57,6 +57,8 @@ Beamline scientists conducting in-situ studies at neutron imaging facilities.
 
 Industrial users analysing strain, phase evolution, or microstructural variations in materials.
 
+---
+
 # 2. GUI Overview
 
 NEAT’s graphical user interface (GUI) integrates the entire Bragg-edge imaging workflow — from loading and preprocessing data to edge fitting, mapping, and post-processing — within a single interactive environment. It consists of three major tabs: data preprocessing, Bragg edge fitting, and data post processing.
@@ -78,6 +80,8 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 
 ![Data Preprocessing Tab](docs/images/Data_Preprocessing_Tab.png)
 
+---
+
 ## 2.2 Bragg Edge Fitting Tab
 
 | **Section**                       | **Purpose**                                                                                                                                                                                                                          |
@@ -92,9 +96,9 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 
 ![Bragg Edge Fitting Tab](docs/images/Bragg_Edge_Fitting_Tab.png)
 
+---
 
 ## 2.3 Data Post Processing Tab
-
 
 
 | **Section**                     | **Purpose**                                                                                                                                                                                                                    |
@@ -107,6 +111,8 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 
 
 ![Data Post Processing Tab](docs/images/Data_Post-Processing_Tab.png)
+
+---
 
 # 3. Functions
 ## 3.1 Data Preprocessing
@@ -128,8 +134,6 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
    ```
    /Results/Summed_TopFolder/Fe_summed_*.fits
    ```
-
----
 
 #### 2) Prepare your data (folder layouts NEAT accepts)
 
@@ -171,8 +175,6 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 
 > ❗ **Not allowed:** mixing some children with subfolders and others without (e.g., a mix of 2- and 3-level under the same parent). NEAT will stop and ask you to reorganize.
 
----
-
 #### 3) Load runs for summation
 
 1. On **Summation** panel.
@@ -190,8 +192,6 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 * For **3-level**: each sample must have **≥ 2 run subfolders** or it is skipped with an error message.
 * For **2-level**: the selected folder must have **≥ 2 subfolders (runs)**.
 
----
-
 #### 4) Choose where and how to save
 
 * In **Set output**: select a **writable output folder**.
@@ -200,8 +200,6 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
   * For **3-level**: NEAT creates `<output>/Summed_<SampleName>/`.
   * For **2-level**: NEAT creates `<output>/Summed_<ParentFolder>/`.
   * Summed files use your **base name** as the stem.
-
----
 
 #### 5) Run the summation
 
@@ -222,8 +220,6 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 
 * For each matching suffix, NEAT **adds arrays**: `combined[suffix] += run[suffix]`.
 
----
-
 #### 6) Completion (and what gets written)
 
 * On **2-level** completion: message *“Summation process (2-level) completed successfully!”*
@@ -241,8 +237,6 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
   * Output folders created
 * **Sum** is re-enabled; **Stop** is disabled.
 
----
-
 #### 7) Stopping a run
 
 * Click **Stop** at any time:
@@ -250,8 +244,6 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
   * NEAT sets a global cancel flag, asks workers to stop, and terminates loader threads.
   * **Sum** re-enabled; **Stop** disabled.
   * Message: *“Stop signal sent – aborting all processes.”*
-
----
 
 #### 8) Progress & messages you’ll see
 
@@ -263,8 +255,6 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 * **“Finished summation for sample ‘…’.”**
 * **Error cases:** mixed structure, single child, mismatched image counts, cannot create output folder.
 
----
-
 #### 9) Troubleshooting (common pitfalls)
 
 * **Only one subfolder detected:** Add at least a second run folder or choose a different parent.
@@ -274,3 +264,93 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 * **Base name empty:** Provide a short, valid string (no path separators).
 
 ---
+
+### 3.1.2 Clean
+
+* Cleans FITS image stacks by running an **OutlierFilteringWorker** per dataset and saving the cleaned frames to a new output folder. 
+* You can process **one dataset** (a single folder of images) or **a batch** (a parent folder with many sub-folders, each treated as a separate dataset).
+
+#### 1) Quick start (batch mode)
+
+1. **Add data** → select `/ParentFolder` containing `/Run_01`, `/Run_02`, …
+2. **Set output** → choose `/Results`.
+3. **Base name** → `Cleaned_Fe`.
+4. **Clean**.
+5. Find cleaned frames at:
+
+   ```
+   /Results/outlier_removed_Run_01/
+   /Results/outlier_removed_Run_02/
+   ...
+   ```
+
+#### 2) Prepare your data (folder layouts NEAT accepts)
+
+* **Batch mode (recommended for experiments with many runs/samples)**
+
+  ```
+  /ParentFolder/
+    /Dataset_01/
+    /Dataset_02/
+    /Dataset_03/
+  ```
+
+  The app detects sub-folders and processes them **sequentially**.
+
+* **Single-dataset mode**
+
+  ```
+  /DatasetA/  (contains FITS images directly)
+  ```
+
+  If no sub-folders are detected, the selected folder is treated as **one dataset**.
+
+> The panel does **not** require a specific “2-level” or “3-level” structure here; it simply checks whether the selected folder contains child folders (batch) or not (single).
+
+#### 3) How it runs (step-by-step)
+
+1. **Add data**
+
+   * Pick a folder.
+   * If it contains sub-folders: message shows e.g. “Detected 5 sub-folders. They will be processed sequentially…” (batch mode).
+   * If not: message shows “No sub-folders detected; the selected folder will be treated as a single dataset.”
+
+2. **Set output**
+
+   * Choose a valid folder where results can be written.
+
+3. **Base name**
+
+   * Enter a short stem (e.g., `Cleaned_Fe`). This becomes the prefix of saved files.
+
+4. **Clean**
+
+   * The **OutlierFilteringWorker** runs and writes cleaned images using your **Base name** (watch **Clean Progress**).
+   * On completion, memory is released and the next dataset (if any) starts automatically.
+
+5. **Completion**
+
+   * Message: “Batch outlier removal completed.”
+
+#### 4) Messages you’ll see (examples)
+
+* “Detected N sub-folders. They will be processed sequentially for outlier removal.”
+* “No sub-folders detected; the selected folder will be treated as a single dataset.”
+* “Loading dataset from folder: <parent><X>”
+* “Starting outlier removal for dataset: <X>”
+* “Finished outlier removal for dataset i of N.”
+* “Batch outlier removal completed.”
+* Errors:
+
+  * “Please select a valid output folder.”
+  * “Please enter a base name.”
+  * “Failed to load dataset; skipping…”
+  * “Failed to create output folder for <X>: <error>”
+
+#### 5) Troubleshooting
+
+* **“No outlier dataset folder selected”**: Use **Add data** first.
+* **Invalid output folder**: Use **Set output** to pick an existing writable directory.
+* **Empty base name**: Provide a non-empty stem (no path separators).
+* **“Failed to load dataset; skipping…”**: Check the dataset folder contains readable FITS files.
+* **“Failed to create output folder …”**: Verify permissions or free space; try a different output root.
