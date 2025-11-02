@@ -559,14 +559,9 @@ The **Open Beam** folder is separate and can be any folder containing open-beam 
 
 🔹 1. Purpose of the parameters
 
-When normalising neutron imaging data, the raw division
-[
-I_\text{norm}(x, y, \lambda) = \frac{I_\text{sample}(x, y, \lambda)}{I_\text{open-beam}(x, y, \lambda)}
-]
-is often noisy due to:
+When normalising neutron imaging data, the raw division is often noisy due to:
 
 * pixel-wise beam intensity fluctuations,
-* hot or dead pixels,
 * frame-to-frame statistical variation.
 
 So NEAT introduces **local averaging** in **space** and **wavelength (or frame)** to stabilise the ratio, while preserving overall contrast.
@@ -585,7 +580,7 @@ Definition
 
 For each pixel position ((x, y)), NEAT forms a local patch of size:
 [
-(2n + 1) \times (2n + 1)
+(2n + 1) x (2n + 1)
 ]
 centred at ((x, y)).
 It then computes a local statistic (typically a mean or median intensity) from that region.
@@ -593,7 +588,7 @@ It then computes a local statistic (typically a mean or median intensity) from t
 Effect
 
 * **n = 0** → no spatial smoothing; each pixel normalised independently.
-* **n = 10** → uses a (21 \times 21) kernel (441 neighbouring pixels).
+* **n = 10** → uses a (21 x 21) kernel (441 neighbouring pixels).
 * **Larger n** → smoother images, better SNR, but reduced spatial resolution.
 
 Conceptual illustration
@@ -643,19 +638,9 @@ This helps reduce noise or intensity spikes along the wavelength dimension — f
 For each image frame (k):
 
 1. NEAT collects the **temporal neighbourhood** of ((2m+1)) frames around (k).
-2. For each frame, a **spatial filter** with kernel ((2n+1)\times(2n+1)) is applied.
+2. For each frame, a **spatial filter** with kernel ((2n+1) x (2n+1)) is applied.
 3. These spatially smoothed frames are **averaged** together.
-4. The result is used in the normalisation formula:
-   [
-   I_\text{norm}(x,y,k)
-   ====================
-
-   \frac{
-   \text{SmoothedSample}(x,y,k)
-   }{
-   \text{SmoothedOpenBeam}(x,y,k)
-   }
-   ]
+4. The result is used in the normalisation.
 
 This two-dimensional (spatial × temporal) smoothing improves the stability of the normalised transmission curve and helps prevent streaks, hot pixels, or wavelength-wise artefacts.
 
