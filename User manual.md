@@ -1,7 +1,23 @@
 # NEAT User Manual
 
-## A video tutorial is available on Youtube.
+## Video tutorials are available on Youtube:
+
+**Data Preprocessing:**
+
+[![Watch the video](https://img.youtube.com/vi/396dxUIt5Mo/hqdefault.jpg)](https://www.youtube.com/watch?v=396dxUIt5Mo)
+
+**Data Preprocessing - full process:**
+
+[![Watch the video](https://img.youtube.com/vi/ycSKno3tYpY/hqdefault.jpg)](https://www.youtube.com/watch?v=ycSKno3tYpY)
+
+**Bragg Edge Fitting:**
+
 [![Watch the video](https://img.youtube.com/vi/fbucLB5Bypc/hqdefault.jpg)](https://www.youtube.com/watch?v=fbucLB5Bypc)
+
+**Data Post-processing:**
+
+[![Watch the video](https://img.youtube.com/vi/TB_vlNWM744/hqdefault.jpg)](https://www.youtube.com/watch?v=TB_vlNWM744)
+
 
 # 1. Introduction
 
