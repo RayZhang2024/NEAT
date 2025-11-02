@@ -692,7 +692,7 @@ Applies a **single FITS mask** to one loaded sample dataset and saves the **filt
    * Pick a folder with FITS frames.
 
 2. **Add Mask**
-   * Pick the binary FITS iamge
+   * Pick the binary FITS image
 
 3. **Set output**
    * Choose an existing directory. If the path doesn’t exist, you’ll get:
@@ -776,4 +776,59 @@ Runs the **entire preprocessing pipeline** in one go:
 #### 4) Notes
 
 * **Summation** only runs when the sample folder contains multiple child folders (runs).
+
+---
+
+## 3.2 Bragg Edge Fitting — step-by-step
+
+### 1) Load data & set experiment info
+
+1. **Load normalised or filtered dataset**.
+2. Enter **flight path** (it's default to 56.4 m which is an often used filght path at IMAT, ask scientist if you don't know the filght path of your experiment).
+3. (Optional) **Select phase / material** so NEAT can list the theoretical **Bragg edges (hkl)** in the **Edge Table** for your wavelength range.
+
+### 2) Establish a spectrum (coarse macro-pixel)
+
+1. Entre min/max x and y coordinates to **define a macro-pixel** to boost SNR.
+2. Hit **Pick** to show the ToF/λ spectrum on the right canvas.
+3. Adjust the **global wavelength range** to include the target edge(s).
+
+> Tip: Use a stable, representative region (avoid strong gradients) for this first pass.
+
+### 3) Configure fitting windows & model parameters
+
+1. In the **Edge Table** (per hkl edge):
+
+   * Set **Left** window (1 Min / 1 Max, pre-edge linear region).
+   * Set **Right** window (2 Min / 2 Max, post-edge linear region).
+   * Set **Edge** window (3 Min / 3 Max, the transition).
+2. In **Fitting Parameters**:
+
+   * Set **σ**, **τ**, **η** (edge width associated with sample, edge width associated with instrument, Lorentzian fraction) as needed.
+   * Choose which to **refine** vs **fix** (checkboxes).
+
+### 4) Test fit on the macro-pixel
+
+1. Click **Fit edges** (individual), or **Fit pattern** (multi-edge with shared lattice parameter **a**).
+2. Inspect:
+
+   * **Fit curves** (right canvas).
+   * **Message pane** for convergence, parameter values and uncertainties.
+3. If fitting show bias:
+
+   * Nudge **Left/Right/Edge windows**.
+   * Relax/tighten **bounds** on σ/τ/η.
+   * Re-run the fit until stable.
+
+### 5) Set up full-field (map) fitting
+
+1. **Macro-pixel size**: choose the spatial bin size for mapping (keep the same macro-pixel szie as the test fit).
+2. **Pixel-skip** (optional): set step (e.g., 5×5 or 10×10) to massively speed up fitting; NEAT interpolates skipped pixels after.
+3. **ROI mask** (optional): map only on the region of interest.
+
+### 6) Run batch fitting over ROI
+
+1. Click **Batch edges** or **Batch patterns** — depending on your chosen mode.
+2. Watch progress; the **message pane** streams diagnostics (failures, retries, bounds hits).
+3. On completion NEAT save results in csv files.
 
