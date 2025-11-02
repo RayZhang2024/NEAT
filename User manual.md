@@ -457,3 +457,231 @@ If either file is missing or fails to load, that dataset is **skipped** with a m
   Check permissions, path length, disk space; try a different output root.
 
 ---
+
+### 3.1.4 Normalisation
+
+Divides each **data image** by an **open-beam reference** to remove source/detector flux variations. Works on a **single dataset** (one folder of FITS images) or a **batch** (a parent folder with many sub-folders, each treated as one dataset). 
+
+#### 1) Quick recipe (batch process)
+
+1. **Add Data** → `/Parent` with `/Dataset_01`, `/Dataset_02`, …
+2. **Add Open Beam** → `/OpenBeamFolder`
+3. **Set output** → `/Results`
+4. **Base name** → `Normalised_Fe`; 
+5. **Window half** → `10`; **Adjacent** → `0`
+6. **Normalise**
+7. Find outputs under:
+
+   ```
+   /Results/normalised_Dataset_01/
+   /Results/normalised_Dataset_02/
+   ...
+   ```
+
+#### 2) Accepted folder layouts
+
+**Batch mode**
+
+```
+/ParentFolder/
+  /Dataset_01/   <-- FITS images
+  /Dataset_02/
+  /Dataset_03/
+```
+
+**Single-dataset mode**
+
+```
+/Dataset_A/      <-- FITS images directly in this folder
+```
+
+The **Open Beam** folder is separate and can be any folder containing open-beam frames.
+
+**Open Beam**
+
+```
+/Dataset_Openbeam/      <-- FITS images directly in this folder
+```
+
+#### 3) How it runs (step-by-step)
+
+1. **Add Data**
+
+   * If sub-folders are found:
+     *“Detected N sub-folders. They will be processed sequentially when normalisation starts.”*
+   * Otherwise:
+     *“No sub-folders detected; the selected folder will be treated as a single dataset.”*
+     Internally, paths are stored in `_normalisation_batch_paths`.
+
+2. **Add Open Beam**
+
+   * Select the open-beam folder.
+   * The `OpenBeamLoadWorker` loads and reduces it; on success, an entry is appended to `normalisation_open_beam_runs`.
+   * (Optional plotting is present but commented out.)
+
+3. **Set output**
+
+   * Choose an existing, writable directory.
+
+4. **Set parameters**
+
+   * **Base name** (e.g., `Normalised_Fe`)
+   * **Window half n** (spatial kernel `(2n+1)×(2n+1)`)
+   * **Adjacent m** (temporal window `(2m+1)` frames)
+
+5. **Normalise**
+
+   * On finish, memory is cleaned; the next dataset starts automatically.
+
+6. **Completion**
+
+   * When all datasets are processed:
+     *“**Normalisation completed.**”*
+
+
+#### 4) Typical status messages
+
+* “Detected N sub-folders. They will be processed sequentially when normalisation starts.”
+* “No sub-folders detected; the selected folder will be treated as a single dataset.”
+* “Loading dataset from folder: **<short_path>**”
+* “Starting normalisation for dataset: **<short_path>**”
+* “Finished normalisation for dataset i of N.”
+* “**Normalisation completed.**”
+* Errors:
+
+  * “No sample dataset folder selected. Please add data images first.”
+  * “No open beam data loaded. Please load open beam images first.”
+  * “Please select a valid overall output folder to save normalised images.”
+  * “Failed to load dataset, skipping…”
+  * “Failed to create output folder for <short_path>: <error>”
+
+#### 5) **window half (n)** and **adjacent (m)** parameter
+
+🔹 1. Purpose of the parameters
+
+When normalising neutron imaging data, the raw division
+[
+I_\text{norm}(x, y, \lambda) = \frac{I_\text{sample}(x, y, \lambda)}{I_\text{open-beam}(x, y, \lambda)}
+]
+is often noisy due to:
+
+* pixel-wise beam intensity fluctuations,
+* hot or dead pixels,
+* frame-to-frame statistical variation.
+
+So NEAT introduces **local averaging** in **space** and **wavelength (or frame)** to stabilise the ratio, while preserving overall contrast.
+
+The two parameters define the **size of these smoothing windows**:
+
+| Parameter           | Applies to                  | Meaning                                                                                                       | Typical range |
+| ------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------- |
+| **window half (n)** | Spatial domain (x–y pixels) | Defines half the side length of a square moving window used to average pixel intensities within each frame    | 5–15          |
+| **adjacent (m)**    | Temporal / frame domain     | Defines half the number of neighbouring frames (in wavelength order) to average together before normalisation | 0–3           |
+
+
+🔹 2. Spatial window — `window_half = n`
+
+Definition
+
+For each pixel position ((x, y)), NEAT forms a local patch of size:
+[
+(2n + 1) \times (2n + 1)
+]
+centred at ((x, y)).
+It then computes a local statistic (typically a mean or median intensity) from that region.
+
+Effect
+
+* **n = 0** → no spatial smoothing; each pixel normalised independently.
+* **n = 10** → uses a (21 \times 21) kernel (441 neighbouring pixels).
+* **Larger n** → smoother images, better SNR, but reduced spatial resolution.
+
+Conceptual illustration
+
+```
+Neighbourhood around (x0, y0)
+
+   [ ][ ][ ][ ][ ]
+   [ ][ ][ ][ ][ ]
+   [ ][ ][X][ ][ ]
+   [ ][ ][ ][ ][ ]
+   [ ][ ][ ][ ][ ]
+        <-- n = 2 -->   5x5 window
+```
+
+This window slides across each image frame, producing a “locally averaged” version of both the **sample** and **open-beam** data before division.
+
+
+🔹 3. Temporal / frame window — `adjacent = m`
+
+Definition
+
+Frames are indexed by wavelength or time:
+[
+I(x, y, k), \quad k = 1, 2, 3, \dots
+]
+
+For each frame (k), NEAT averages over frames:
+[
+k-m, , k-m+1, , \dots, , k, , \dots, , k+m
+]
+giving a total of ((2m + 1)) frames.
+
+Effect
+
+* **m = 0** → only the current frame is used (no temporal smoothing).
+* **m = 1** → averages three consecutive frames ((k-1, k, k+1)).
+* **m = 2** → averages five frames, etc.
+
+Conceptual behaviour
+
+This helps reduce noise or intensity spikes along the wavelength dimension — for example, caused by unstable neutron flux or camera exposure fluctuations — without changing the mean intensity trend.
+
+
+🔹 4. Combined operation
+
+For each image frame (k):
+
+1. NEAT collects the **temporal neighbourhood** of ((2m+1)) frames around (k).
+2. For each frame, a **spatial filter** with kernel ((2n+1)\times(2n+1)) is applied.
+3. These spatially smoothed frames are **averaged** together.
+4. The result is used in the normalisation formula:
+   [
+   I_\text{norm}(x,y,k)
+   ====================
+
+   \frac{
+   \text{SmoothedSample}(x,y,k)
+   }{
+   \text{SmoothedOpenBeam}(x,y,k)
+   }
+   ]
+
+This two-dimensional (spatial × temporal) smoothing improves the stability of the normalised transmission curve and helps prevent streaks, hot pixels, or wavelength-wise artefacts.
+
+🔹 5. Practical guidance
+
+| Goal                                   | Suggested n | Suggested m | Notes                                            |
+| -------------------------------------- | ----------- | ----------- | ------------------------------------------------ |
+| High spatial resolution, strong signal | 0–3         | 0           | Fast, but noisier                                |
+| Moderate smoothing for noisy data      | 5–10        | 1           | Typical for most beamline datasets               |
+| Very noisy or low-intensity runs       | 10–15       | 2–3         | Smooths out noise but slightly blurs features    |
+| Quick preview / rough normalisation    | 8–10        | 0           | Stable results without strong temporal averaging |
+
+🔹 6. Example impact
+
+| Parameter Set | Result                                                                                                     |
+| ------------- | ---------------------------------------------------------------------------------------------------------- |
+| **n=0, m=0**  | Fine detail preserved but noisy edges and speckle pattern visible.                                         |
+| **n=10, m=0** | Smooth, stable image; slight softening of sharp boundaries.                                                |
+| **n=5, m=2**  | Uniform background; frame-to-frame flicker suppressed.                                                     |
+| **n=15, m=3** | Very stable signal but significant spatial blur — mainly for qualitative overview or reference correction. |
+
+🔹 7. Summary
+
+| Symbol              | Dimension                           | Averaging window       | Purpose                                                                 |
+| :------------------ | :---------------------------------- | :--------------------- | :---------------------------------------------------------------------- |
+| **n (window half)** | Spatial (x–y)                       | (2n+1) × (2n+1) pixels | Reduces pixel-level noise, corrects local hot/dead pixels               |
+| **m (adjacent)**    | Temporal (frame index / wavelength) | (2m+1) frames          | Reduces temporal intensity fluctuations, improves per-frame consistency |
+
+
