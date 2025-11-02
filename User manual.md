@@ -669,4 +669,111 @@ This two-dimensional (spatial × temporal) smoothing improves the stability of t
 | **n (window half)** | Spatial (x–y)                       | (2n+1) × (2n+1) pixels | Reduces pixel-level noise, corrects local hot/dead pixels               |
 | **m (adjacent)**    | Temporal (frame index / wavelength) | (2m+1) frames          | Reduces temporal intensity fluctuations, improves per-frame consistency |
 
+---
+
+### 3.1.5 Filtering
+
+Applies a **single FITS mask** to one loaded sample dataset and saves the **filtered images**.
+
+#### 1) What inputs are accepted
+
+* **Data images**: A folder contains dataset.
+```
+/Dataset_A/      <-- FITS images directly in this folder
+```
+* **Mask image**: one binary (0/1) FITS image, same pixel size as the data frames.
+
+> If dimensions don’t match or the mask can’t be read, filtering will fail for that job (you’ll see an error message).
+
+
+#### 2) How to run (step-by-step)
+
+1. **Add data**
+   * Pick a folder with FITS frames.
+
+2. **Add Mask**
+   * Pick the binary FITS iamge
+
+3. **Set output**
+   * Choose an existing directory. If the path doesn’t exist, you’ll get:
+     *“Specified output folder '…' does not exist.”*
+
+4. **Base name**
+   * Enter a stem such as `Filtered_Fe`. Required.
+
+5. **Filter**
+   * Starts `FilteringWorker` with:
+   * You’ll see *“— Starting Filtering —”* and progress updates.
+
+6. **Completion**
+   * Log: *“Filtering process finished.”*
+
+#### 3) Typical status/error messages
+
+* “No data images loaded for filtering. Please add data images first.”
+* “No mask image loaded. Please add a FITS mask image first.”
+* “Please select an output folder to save filtered images.”
+* “Specified output folder ‘…’ does not exist.”
+* “Mask image loaded from: …”
+* “Filtering process finished.”
+* Loader messages while reading runs; any exceptions from FITS I/O are shown in the message pane.
+
+Practical tips
+
+* **Mask size must match** your data frames exactly (same rows × columns).
+* Use **binary masks** (0/1) to “keep or drop” pixels.
+
+---
+
+### 3.1.6 Full Process
+
+Runs the **entire preprocessing pipeline** in one go:
+
+1. **Summation** (only if the sample folder contains multiple subfolders/runs)
+2. **Outlier Removal (Clean)**
+3. **Overlap Correction**
+4. **Normalisation**
+
+#### 1) How to run
+
+1. In **Full Process**, set:
+
+   * **Output** → Choose an existing, writable directory where all processed images will be saved.
+   * **Base name** → Filename stem for outputs (e.g., `FullProcess_Fe`). If left empty, defaults to `FullProcess`.
+   * **Window half** → Spatial moving-bin half-size used later by the normalisation step. Kernel is `(2n+1) × (2n+1)` (default `10` if the input is invalid).
+2. Click **Full Process** → Starts the full pipeline, choose **Sample Folder**, then **Open Beam Folder** when prompted.
+3. **Pipeline stages (inside the worker)**
+   * **Summation** (if the sample folder has multiple subfolders): merges runs by suffix (pixel-wise sum).
+   * **Clean (Outlier Removal)**: removes outliers from the (summed or single) dataset.
+   * **Overlap Correction**: loads `*_Spectra.txt` and `*_ShutterCount.txt`; skips if either text file is missing/unreadable.
+   * **Normalisation**: uses the selected **Open Beam**; applies **spatial window** `(2n+1)×(2n+1)` with **n** from the panel; **adjacent m = 0**.
+4. On completion, find results under `/FullProcess_Fe` (stage-specific subfolders; files starting with `FullProcess_Fe_…`).
+
+#### 2) Typical messages you’ll see
+
+* “Starting the Full Process pipeline…”
+* “Please select a valid output folder for the full process.”
+* “No sample folder selected. Aborting full process.”
+* “No open beam folder selected. Aborting full process.”
+* Stage-wise loading/processing messages (summation, clean, overlap correction, normalisation)
+* “Stop signal sent to Full Process.”
+* (On finish) *Full Process button becomes active again.*
+
+#### 3) Troubleshooting
+
+* **“Please select a valid output folder…”**
+  The path must exist and be writable. Use **Set output** to pick one.
+
+* **Aborted at start (no folders)**
+  You must choose both a **Sample Folder** and an **Open Beam Folder** when prompted.
+
+* **Missing Spectra/ShutterCount in overlap correction**
+  Each dataset needs `*_Spectra.txt` and `*_ShutterCount.txt`. If missing, that dataset is skipped (logged in the message pane).
+
+* **Want temporal smoothing too?**
+  Full Process currently fixes **adjacent (m)** to **0**. To enable temporal averaging, expose and wire the `full_process_adjacent_input` (commented out in your code) and pass its value to `FullProcessWorker`.
+
+#### 4) Notes
+
+* **Summation** only runs when the sample folder contains multiple child folders (runs).
 
