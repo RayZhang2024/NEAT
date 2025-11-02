@@ -354,3 +354,106 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 * **Empty base name**: Provide a non-empty stem (no path separators).
 * **“Failed to load dataset; skipping…”**: Check the dataset folder contains readable FITS files.
 * **“Failed to create output folder …”**: Verify permissions or free space; try a different output root.
+
+---
+
+### 3.1.3 Overlap Correction
+
+Runs an **OverlapCorrectionWorker** on FITS image datasets to correct frame overlap artifacts. You can process:
+
+* **A single dataset** (a folder that directly contains FITS images), or
+* **A batch of datasets** (a parent folder where **each sub-folder** is treated as one dataset).
+It reauires files per dataset:
+
+* `*_Spectra.txt`
+* `*_ShutterCount.txt`
+
+If either file is missing or fails to load, that dataset is **skipped** with a message.
+
+
+#### 1) Quick start
+
+1. **Add data** → `/Parent` with `/Run_01`, `/Run_02`, … (each has FITS + `_Spectra.txt` + `_ShutterCount.txt`)
+2. **Set output** → `/Results`
+3. **Base name** → `Overlap_Corrected_Fe`
+4. **Correct**
+5. Find outputs under:
+
+   ```
+   /Results/Corrected_Run_01/
+   /Results/Corrected_Run_02/
+   ...
+   ```
+
+#### 2) Accepted folder layouts
+
+**Batch mode (multiple datasets processed sequentially)**
+
+```
+/ParentFolder/
+  /Dataset_01/   <-- contains FITS images + *_Spectra.txt + *_ShutterCount.txt
+  /Dataset_02/
+  /Dataset_03/
+```
+
+**Single-dataset mode**
+
+```
+/Dataset_A/      <-- contains FITS images + *_Spectra.txt + *_ShutterCount.txt
+```
+
+#### 3) How to run (step-by-step)
+
+1. **Add data**
+
+   * Select a folder.
+   * If it has sub-folders (batch process), you’ll see:
+     *“Detected N sub-folders. They will be processed sequentially for overlap correction.”*
+   * If not:
+     *“No sub-folders detected; the selected folder will be treated as a single dataset.”*
+
+2. **Set output**
+
+   * Choose a valid, writable directory.
+
+3. **Base name**
+
+   * Enter a stem, e.g., `Overlap_Corrected_Fe`.
+
+4. **Correct**
+
+   * Runs and saves corrected images using your **Base name**.
+   * On finish, the app cleans memory and moves to the **next dataset** (if for batch process) automatically.
+
+5. **Completion**
+
+   * When all datasets finish:
+     *“Batch overlap correction completed.”*
+
+#### 4) Typical status messages
+
+* “Detected N sub-folders. They will be processed sequentially for overlap correction.”
+* “No sub-folders detected; the selected folder will be treated as a single dataset.”
+* “Loading dataset from folder: <…>”
+* “Spectra file not found in ‘<…>’.” / “ShutterCount file not found in ‘<…>’.”
+* “Failed to load Spectra/ShutterCount file ‘…’: <error>”
+* “Dataset in <folder> lacks necessary Spectra or ShutterCount data; skipping.”
+* “Starting overlap correction for dataset: <…>”
+* “Finished overlap correction for dataset i of N.”
+* “Batch overlap correction completed.”
+* “Failed to create output folder for <…>: <error>”
+
+#### 5) Troubleshooting
+
+* **“No overlap correction dataset folder selected”**
+  Use **Add data** first.
+* **“Please select a valid output folder”**
+  Use **Set output** and choose an existing, writable directory.
+* **“Please enter a base name”**
+  Provide a non-empty, valid stem (no path separators).
+* **Dataset skipped (missing Spectra/ShutterCount)**
+  Ensure the dataset folder contains `*_Spectra.txt` and `*_ShutterCount.txt` with valid numeric data.
+* **Failed to create output folder**
+  Check permissions, path length, disk space; try a different output root.
+
+---
