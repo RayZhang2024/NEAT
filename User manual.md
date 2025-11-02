@@ -832,3 +832,82 @@ Runs the **entire preprocessing pipeline** in one go:
 2. Watch progress; the **message pane** streams diagnostics (failures, retries, bounds hits).
 3. On completion NEAT save results in csv files.
 
+---
+
+## 3.3 **Data Post-Processing**
+
+* Click **Load csv** to load a csv file that stores the results obtained from a batch fitting.
+* Then select a metric to visualise any fitted **parameter map** (`Z`) on a 2D grid.
+* Adjust colour limits, units, and derive **strain** from a reference ( d_0 ).
+* Compute a **mean** over a rectangular ROI.
+* Interactively pick **line profiles** (multiple pairs), view, and export them.
+* Apply a **FITS mask** to filter the map, and **save** the map to **FITS**.
+
+### 3.3.1 Layout & live elements
+
+* **Left pane:** read-only **Metadata** (includes the loaded CSV filename and key–value metadata).
+* **Right pane:**
+
+  * Top bar of **controls** (colour limits, (d_0), ROI bounds, tools).
+  * **Matplotlib canvas** with the parameter map and a navigation toolbar (zoom/pan).
+  * **Status labels** for the current cursor coordinate and **Mean Value** (updates after ROI mean).
+
+### 3.3.2 Controls (top bar)
+
+#### 1) Colour scale
+
+* **Color Bar Min / Max**: set numeric limits and hit *Enter* or de-focus → the map updates.
+* If left blank on first plot, they are **auto-filled** from `Z` (min / max).
+
+#### 2) Units
+
+* **Display in mm** (checkbox): toggles axes and inputs between **pixels** and **mm**.
+
+  * Conversion uses a fixed factor **0.055 mm / pixel**.
+  * Axis labels switch accordingly.
+
+#### 3) Strain from ( d_0 )
+
+* **d0**: enter a positive value (same units as your parameter, e.g. Å for ( d ) or ( a )).
+* **Calculate Strain**: computes ((d-d0)/d0)*1e6 **(µε)** at each pixel and opens a **new** post-processing dialog showing the strain map.
+
+  * Unit in the coordinate readout switches to **µε** for this map.
+
+####4) ROI mean
+
+* **x min / x max / y min / y max**: define a rectangle in current **display units** (pixels or mm).
+* **Calculate Mean**:
+
+  * Calculates and shows the **Mean Value** (Å for parameters, µε for strain) over the defined ROI.
+
+#### 5) Point selection & line profile
+
+* **Select Points (toggle)**:
+
+  * **ON** → “Selection Mode: ON” (green). Click to select start/end **pairs**:
+
+    * 1st click: adds **start N**.
+    * 2nd click: adds **end N**, draws a red **line**, labels **path N**, **opens a Line Profile** window, then readies for the next pair (N+1).
+  * **OFF** → removes **all annotations/lines/markers** from the canvas and resets the counter.
+* You can pan while selecting; a small drag toggles a panning state in the handler.
+
+#### 6) Mask filter
+
+* **Filter**: pick a binary (0/1) **FITS** image; its 2D data must match the map shape.
+
+  * All zeros in the result are converted to **NaN** → blanked in the plot.
+  * Opens a **new** post-processing dialog with the **Filtered <parameter>** map.
+
+#### 7) Save map to FITS
+
+* **Save as FITS**:
+
+#### 8) Tips & edge cases
+
+* **Shape check for masks**: the FITS mask must be exactly the same shape as `Z` (or you’ll get a clear error).
+* **ROI bounds**: numbers are clipped to the valid range; empty selections warn “No Data”.
+* **Colour limits**: must satisfy `min < max`; otherwise unchanged.
+* **Units**: when you toggle mm/pixels, everything (axes, ROI inputs, line-profile coordinates) follows the **current** units.
+* **FITS export**: resizing and vertical flip are **intentional**—so the saved file matches the GUI orientation and offers a standard 512×512 output for interoperability.
+
+---
