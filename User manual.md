@@ -118,14 +118,14 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 
 ## 1) Quick strat (2-level example)
 
-1. **Add data** → choose `/TopFolder` containing `/Run_01`, `/Run_02`, `/Run_03`.
-2. **Set output** → choose `/Results`.
-3. **Base name** → `Fe_summed`.
+1. **Add data** → choose the containing `/Run_01`, `/Run_02`, `/Run_03`.
+2. **Set output** → choose a folder that will store the summed images.
+3. **Base name** → i.e. `Fe_summed`.
 4. **Sum** → wait for both progress bars to finish.
 5. Find results at:
 
    ```
-   /Results/Summed_TopFolder/Fe_images_*.fits
+   /Results/Summed_TopFolder/Fe_summed_*.fits
    ```
 
 ---
@@ -141,6 +141,11 @@ Case 1: if you have a measurement of a sample consists of multiple runs and you 
 ```
 /TopFolder/
   /Run_01/
+    /image_00001.fits
+    /image_00002.fits
+    /...
+    /_ShutterCount.txt
+    /_Spectra.txt
   /Run_02/
   /Run_03/
 ```
@@ -152,6 +157,11 @@ Case 2: if you have a measurement that consists of multiple samples, and each sa
 /TopFolder/
   /Sample_A/
     /Run_01/
+      /image_00001.fits
+      /image_00002.fits
+      /...
+      /_ShutterCount.txt
+      /_Spectra.txt
     /Run_02/
   /Sample_B/
     /Run_01/
