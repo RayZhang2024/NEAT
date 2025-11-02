@@ -121,7 +121,7 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 * Supports batch processing for multiple samples.
 * Writes the **summed images** into a chosen output folder with your **base name**.
 
-### 1) Quick strat (2-level example)
+1) Quick strat (2-level example)
 
 1. **Add data** → choose the containing `/Run_01`, `/Run_02`, `/Run_03`.
 2. **Set output** → choose a folder that will store the summed images.
@@ -132,8 +132,7 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
    ```
    /Results/Summed_TopFolder/Fe_summed_*.fits
    ```
-
-### 2) Prepare your data (folder layouts NEAT accepts)
+2) Prepare your data (folder layouts NEAT accepts)
 
 NEAT detects the layout automatically and **refuses mixed depths**.
 
@@ -173,7 +172,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 
 > ❗ **Not allowed:** mixing some children with subfolders and others without (e.g., a mix of 2- and 3-level under the same parent). NEAT will stop and ask you to reorganize.
 
-### 3) Load runs for summation
+3) Load runs for summation
 
 1. On **Summation** panel.
 2. Click **Add data** and select the **TopFolder** (for 2- or 3-level).
@@ -190,7 +189,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 * For **3-level**: each sample must have **≥ 2 run subfolders** or it is skipped with an error message.
 * For **2-level**: the selected folder must have **≥ 2 subfolders (runs)**.
 
-### 4) Choose where and how to save
+4) Choose where and how to save
 
 * In **Set output**: select a **writable output folder**.
 * In **Base name**: enter a short prefix (e.g., `Summed`).
@@ -199,7 +198,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
   * For **2-level**: NEAT creates `<output>/Summed_<ParentFolder>/`.
   * Summed files use your **base name** as the stem.
 
-### 5) Run the summation
+5) Run the summation
 
 1. Click **Sum**.
 2. NEAT performs **lazy loading** of runs one by one:
@@ -218,7 +217,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 
 * For each matching suffix, NEAT **adds arrays**: `combined[suffix] += run[suffix]`.
 
-### 6) Completion (and what gets written)
+6) Completion (and what gets written)
 
 * On **2-level** completion: message *“Summation process (2-level) completed successfully!”*
 * On **3-level** completion: for each sample, NEAT writes to:
@@ -235,7 +234,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
   * Output folders created
 * **Sum** is re-enabled; **Stop** is disabled.
 
-### 7) Stopping a run
+7) Stopping a run
 
 * Click **Stop** at any time:
 
@@ -243,7 +242,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
   * **Sum** re-enabled; **Stop** disabled.
   * Message: *“Stop signal sent – aborting all processes.”*
 
-### 8) Progress & messages you’ll see
+8) Progress & messages you’ll see
 
 * **“Detected three-level structure…” / “Detected two-level structure…”**
 * **“Processing sample: … with X run(s).”**
@@ -253,7 +252,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 * **“Finished summation for sample ‘…’.”**
 * **Error cases:** mixed structure, single child, mismatched image counts, cannot create output folder.
 
-### 9) Troubleshooting (common pitfalls)
+9) Troubleshooting (common pitfalls)
 
 * **Only one subfolder detected:** Add at least a second run folder or choose a different parent.
 * **Mixed 2- and 3-level structure:** Move run folders so every child has the **same depth**.
@@ -268,7 +267,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 * Cleans FITS image stacks by running an **OutlierFilteringWorker** per dataset and saving the cleaned frames to a new output folder. 
 * You can process **one dataset** (a single folder of images) or **a batch** (a parent folder with many sub-folders, each treated as a separate dataset).
 
-### 1) Quick start (batch mode)
+1) Quick start (batch mode)
 
 1. **Add data** → select `/ParentFolder` containing `/Run_01`, `/Run_02`, …
 2. **Set output** → choose `/Results`.
@@ -282,7 +281,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
    ...
    ```
 
-### 2) Prepare your data (folder layouts NEAT accepts)
+2) Prepare your data (folder layouts NEAT accepts)
 
 * **Batch mode (recommended for experiments with many runs/samples)**
 
@@ -305,7 +304,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 
 > The panel does **not** require a specific “2-level” or “3-level” structure here; it simply checks whether the selected folder contains child folders (batch) or not (single).
 
-### 3) How it runs (step-by-step)
+3) How it runs (step-by-step)
 
 1. **Add data**
 
@@ -330,7 +329,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
 
    * Message: “Batch outlier removal completed.”
 
-### 4) Messages you’ll see (examples)
+4) Messages you’ll see (examples)
 
 * “Detected N sub-folders. They will be processed sequentially for outlier removal.”
 * “No sub-folders detected; the selected folder will be treated as a single dataset.”
@@ -345,7 +344,7 @@ Case 2: If your measurement includes multiple samples, and each sample contains 
   * “Failed to load dataset; skipping…”
   * “Failed to create output folder for <X>: <error>”
 
-### 5) Troubleshooting
+5) Troubleshooting
 
 * **“No outlier dataset folder selected”**: Use **Add data** first.
 * **Invalid output folder**: Use **Set output** to pick an existing writable directory.
@@ -369,7 +368,7 @@ It reauires files per dataset:
 If either file is missing or fails to load, that dataset is **skipped** with a message.
 
 
-### 1) Quick start
+1) Quick start
 
 1. **Add data** → `/Parent` with `/Run_01`, `/Run_02`, … (each has FITS + `_Spectra.txt` + `_ShutterCount.txt`)
 2. **Set output** → `/Results`
@@ -383,7 +382,7 @@ If either file is missing or fails to load, that dataset is **skipped** with a m
    ...
    ```
 
-### 2) Accepted folder layouts
+2) Accepted folder layouts
 
 **Batch mode (multiple datasets processed sequentially)**
 
@@ -400,7 +399,7 @@ If either file is missing or fails to load, that dataset is **skipped** with a m
 /Dataset_A/      <-- contains FITS images + *_Spectra.txt + *_ShutterCount.txt
 ```
 
-### 3) How to run (step-by-step)
+3) How to run (step-by-step)
 
 1. **Add data**
 
@@ -428,7 +427,7 @@ If either file is missing or fails to load, that dataset is **skipped** with a m
    * When all datasets finish:
      *“Batch overlap correction completed.”*
 
-### 4) Typical status messages
+4) Typical status messages
 
 * “Detected N sub-folders. They will be processed sequentially for overlap correction.”
 * “No sub-folders detected; the selected folder will be treated as a single dataset.”
@@ -441,7 +440,7 @@ If either file is missing or fails to load, that dataset is **skipped** with a m
 * “Batch overlap correction completed.”
 * “Failed to create output folder for <…>: <error>”
 
-### 5) Troubleshooting
+5) Troubleshooting
 
 * **“No overlap correction dataset folder selected”**
   Use **Add data** first.
@@ -460,7 +459,7 @@ If either file is missing or fails to load, that dataset is **skipped** with a m
 
 Divides each **data image** by an **open-beam reference** to remove source/detector flux variations. Works on a **single dataset** (one folder of FITS images) or a **batch** (a parent folder with many sub-folders, each treated as one dataset). 
 
-### 1) Quick recipe (batch process)
+1) Quick recipe (batch process)
 
 1. **Add Data** → `/Parent` with `/Dataset_01`, `/Dataset_02`, …
 2. **Add Open Beam** → `/OpenBeamFolder`
@@ -476,7 +475,7 @@ Divides each **data image** by an **open-beam reference** to remove source/detec
    ...
    ```
 
-### 2) Accepted folder layouts
+2) Accepted folder layouts
 
 **Batch mode**
 
@@ -501,7 +500,7 @@ The **Open Beam** folder is separate and can be any folder containing open-beam 
 /Dataset_Openbeam/      <-- FITS images directly in this folder
 ```
 
-### 3) How it runs (step-by-step)
+3) How it runs (step-by-step)
 
 1. **Add Data**
 
@@ -537,7 +536,7 @@ The **Open Beam** folder is separate and can be any folder containing open-beam 
      *“**Normalisation completed.**”*
 
 
-### 4) Typical status messages
+4) Typical status messages
 
 * “Detected N sub-folders. They will be processed sequentially when normalisation starts.”
 * “No sub-folders detected; the selected folder will be treated as a single dataset.”
@@ -553,7 +552,7 @@ The **Open Beam** folder is separate and can be any folder containing open-beam 
   * “Failed to load dataset, skipping…”
   * “Failed to create output folder for <short_path>: <error>”
 
-### 5) **window half (n)** and **adjacent (m)** parameter
+5) **window half (n)** and **adjacent (m)** parameter
 
 🔹 1. Purpose of the parameters
 
@@ -669,11 +668,11 @@ This two-dimensional (spatial × temporal) smoothing improves the stability of t
 
 ---
 
-### 3.5 Filtering
+## 3.5 Filtering
 
 Applies a **single FITS mask** to one loaded sample dataset and saves the **filtered images**.
 
-### 1) What inputs are accepted
+1) What inputs are accepted
 
 * **Data images**: A folder contains dataset.
 ```
@@ -684,7 +683,7 @@ Applies a **single FITS mask** to one loaded sample dataset and saves the **filt
 > If dimensions don’t match or the mask can’t be read, filtering will fail for that job (you’ll see an error message).
 
 
-### 2) How to run (step-by-step)
+2) How to run (step-by-step)
 
 1. **Add data**
    * Pick a folder with FITS frames.
@@ -706,7 +705,7 @@ Applies a **single FITS mask** to one loaded sample dataset and saves the **filt
 6. **Completion**
    * Log: *“Filtering process finished.”*
 
-### 3) Typical status/error messages
+3) Typical status/error messages
 
 * “No data images loaded for filtering. Please add data images first.”
 * “No mask image loaded. Please add a FITS mask image first.”
@@ -732,7 +731,7 @@ Runs the **entire preprocessing pipeline** in one go:
 3. **Overlap Correction**
 4. **Normalisation**
 
-### 1) How to run
+1) How to run
 
 1. In **Full Process**, set:
 
@@ -747,7 +746,7 @@ Runs the **entire preprocessing pipeline** in one go:
    * **Normalisation**: uses the selected **Open Beam**; applies **spatial window** `(2n+1)×(2n+1)` with **n** from the panel; **adjacent m = 0**.
 4. On completion, find results under `/FullProcess_Fe` (stage-specific subfolders; files starting with `FullProcess_Fe_…`).
 
-### 2) Typical messages you’ll see
+2) Typical messages you’ll see
 
 * “Starting the Full Process pipeline…”
 * “Please select a valid output folder for the full process.”
@@ -757,7 +756,7 @@ Runs the **entire preprocessing pipeline** in one go:
 * “Stop signal sent to Full Process.”
 * (On finish) *Full Process button becomes active again.*
 
-### 3) Troubleshooting
+3) Troubleshooting
 
 * **“Please select a valid output folder…”**
   The path must exist and be writable. Use **Set output** to pick one.
@@ -771,7 +770,7 @@ Runs the **entire preprocessing pipeline** in one go:
 * **Want temporal smoothing too?**
   Full Process currently fixes **adjacent (m)** to **0**. To enable temporal averaging, expose and wire the `full_process_adjacent_input` (commented out in your code) and pass its value to `FullProcessWorker`.
 
-### 4) Notes
+4) Notes
 
 * **Summation** only runs when the sample folder contains multiple child folders (runs).
 
@@ -852,33 +851,33 @@ Runs the **entire preprocessing pipeline** in one go:
 
 ## 5.2 Controls (top bar)
 
-### 1) Colour scale
+1) Colour scale
 
 * **Color Bar Min / Max**: set numeric limits and hit *Enter* or de-focus → the map updates.
 * If left blank on first plot, they are **auto-filled** from `Z` (min / max).
 
-### 2) Units
+2) Units
 
 * **Display in mm** (checkbox): toggles axes and inputs between **pixels** and **mm**.
 
   * Conversion uses a fixed factor **0.055 mm / pixel**.
   * Axis labels switch accordingly.
 
-### 3) Strain from ( d_0 )
+3) Strain from ( d_0 )
 
 * **d0**: enter a positive value (same units as your parameter, e.g. Å for ( d ) or ( a )).
 * **Calculate Strain**: computes ((d-d0)/d0)*1e6 **(µε)** at each pixel and opens a **new** post-processing dialog showing the strain map.
 
   * Unit in the coordinate readout switches to **µε** for this map.
 
-###4) ROI mean
+4) ROI mean
 
 * **x min / x max / y min / y max**: define a rectangle in current **display units** (pixels or mm).
 * **Calculate Mean**:
 
   * Calculates and shows the **Mean Value** (Å for parameters, µε for strain) over the defined ROI.
 
-### 5) Point selection & line profile
+5) Point selection & line profile
 
 * **Select Points (toggle)**:
 
@@ -889,18 +888,18 @@ Runs the **entire preprocessing pipeline** in one go:
   * **OFF** → removes **all annotations/lines/markers** from the canvas and resets the counter.
 * You can pan while selecting; a small drag toggles a panning state in the handler.
 
-### 6) Mask filter
+6) Mask filter
 
 * **Filter**: pick a binary (0/1) **FITS** image; its 2D data must match the map shape.
 
   * All zeros in the result are converted to **NaN** → blanked in the plot.
   * Opens a **new** post-processing dialog with the **Filtered <parameter>** map.
 
-### 7) Save map to FITS
+7) Save map to FITS
 
 * **Save as FITS**:
 
-### 8) Tips & edge cases
+8) Tips & edge cases
 
 * **Shape check for masks**: the FITS mask must be exactly the same shape as `Z` (or you’ll get a clear error).
 * **ROI bounds**: numbers are clipped to the valid range; empty selections warn “No Data”.
