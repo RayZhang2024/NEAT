@@ -113,10 +113,11 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 ### 3.1.1 Summation
 
 * Combines multiple **runs of FITS images** by **pixel-wise addition** to boost SNR.
+* If you don't have multiple **runs**, simplely skip this step.
 * Supports batch processing for multiple samples.
 * Writes the **summed images** into a chosen output folder with your **base name**.
 
-## 1) Quick strat (2-level example)
+#### 1) Quick strat (2-level example)
 
 1. **Add data** → choose the containing `/Run_01`, `/Run_02`, `/Run_03`.
 2. **Set output** → choose a folder that will store the summed images.
@@ -130,11 +131,11 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 
 ---
 
-## 2) Prepare your data (folder layouts NEAT accepts)
+#### 2) Prepare your data (folder layouts NEAT accepts)
 
 NEAT detects the layout automatically and **refuses mixed depths**.
 
-Case 1: if you have a measurement of a sample consists of multiple runs and you want to sum the multiple rusn into one.
+Case 1: If your measurement consists of multiple runs of the same sample, and you wish to combine these runs into a single summed dataset, use the summation function to merge all runs into one output.
 
 **Two-level (folder → runs) – “2-level”**
 
@@ -149,7 +150,7 @@ Case 1: if you have a measurement of a sample consists of multiple runs and you 
   /Run_02/
   /Run_03/
 ```
-Case 2: if you have a measurement that consists of multiple samples, and each sample consists of multiple runs, you would like to sum the runs for each of the sample.
+Case 2: If your measurement includes multiple samples, and each sample contains multiple runs, you can use the summation function to sum the runs within each sample separately. This produces one combined dataset per sample.
 
 **Three-level (folder → sample → run) – “3-level”**
 
@@ -172,7 +173,7 @@ Case 2: if you have a measurement that consists of multiple samples, and each sa
 
 ---
 
-## 3) Load runs for summation
+#### 3) Load runs for summation
 
 1. On **Summation** panel.
 2. Click **Add data** and select the **TopFolder** (for 2- or 3-level).
@@ -191,7 +192,7 @@ Case 2: if you have a measurement that consists of multiple samples, and each sa
 
 ---
 
-## 4) Choose where and how to save
+#### 4) Choose where and how to save
 
 * In **Set output**: select a **writable output folder**.
 * In **Base name**: enter a short prefix (e.g., `Summed`).
@@ -202,7 +203,7 @@ Case 2: if you have a measurement that consists of multiple samples, and each sa
 
 ---
 
-## 5) Run the summation
+#### 5) Run the summation
 
 1. Click **Sum**.
 2. NEAT performs **lazy loading** of runs one by one:
@@ -223,7 +224,7 @@ Case 2: if you have a measurement that consists of multiple samples, and each sa
 
 ---
 
-## 6) Completion (and what gets written)
+#### 6) Completion (and what gets written)
 
 * On **2-level** completion: message *“Summation process (2-level) completed successfully!”*
 * On **3-level** completion: for each sample, NEAT writes to:
@@ -242,7 +243,7 @@ Case 2: if you have a measurement that consists of multiple samples, and each sa
 
 ---
 
-## 7) Stopping a run
+#### 7) Stopping a run
 
 * Click **Stop** at any time:
 
@@ -252,7 +253,7 @@ Case 2: if you have a measurement that consists of multiple samples, and each sa
 
 ---
 
-## 8) Progress & messages you’ll see
+#### 8) Progress & messages you’ll see
 
 * **“Detected three-level structure…” / “Detected two-level structure…”**
 * **“Processing sample: … with X run(s).”**
@@ -264,7 +265,7 @@ Case 2: if you have a measurement that consists of multiple samples, and each sa
 
 ---
 
-## 9) Troubleshooting (common pitfalls)
+#### 9) Troubleshooting (common pitfalls)
 
 * **Only one subfolder detected:** Add at least a second run folder or choose a different parent.
 * **Mixed 2- and 3-level structure:** Move run folders so every child has the **same depth**.
