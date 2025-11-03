@@ -86,8 +86,7 @@ will appear, with tabs for:
 
 ## 🧑‍💻 Citation / Acknowledgment
 
-If you use NEAT in your research, please cite the associated publication (once available) or acknowledge
-“NEAT – Neutron Bragg Edge Analysis Toolkit, ISIS Neutron and Muon Source, STFC Rutherford Appleton Laboratory.”
+RayZhang2024. (2025). RayZhang2024/NEAT: NEAT v4.6 (v4.6). Zenodo. https://doi.org/10.5281/zenodo.17512269
 
 ---
 
