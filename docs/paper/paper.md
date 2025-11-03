@@ -30,8 +30,8 @@ bibliography: paper.bib
 
 # Summary
 
-**NEAT (Neutron Bragg-Edge Analysis Toolkit)** is an open-source Python graphical user interface (GUI) that enables scientists to analyse neutron imaging data without advanced programming experience.  
-Neutron imaging uses beams of neutrons to look inside solid objects in a non-destructive way, revealing how atoms are arranged and how materials deform under stress. When a neutron beam passes through a crystalline solid, sharp changes—called *Bragg edges*—appear in the transmitted intensity as a function of neutron wavelength. The position and shape of these edges provide information about lattice spacing, elastic strain, phase composition, and microstructure.
+**NEAT (Neutron Bragg-Edge Analysis Toolkit)** is an open-source Python graphical user interface (GUI) [@RayZhang2024_NEAT_v4_6_2025] that enables scientists to analyse neutron imaging data without advanced programming experience.  
+Neutron imaging uses beams of neutrons to look inside solid objects in a non-destructive way, revealing how atoms are arranged and how materials deform under stress [@Santisteban2001]. When a neutron beam passes through a crystalline solid, sharp changes—called *Bragg edges*—appear in the transmitted intensity as a function of neutron wavelength. The position and shape of these edges provide information about lattice spacing, elastic strain, phase composition, and microstructure [@Ramadhan2022].
 
 **NEAT** offers a complete and user-friendly environment to transform raw neutron time-of-flight images into quantitative maps of material properties. It combines data cleaning, correction, fitting, and visualisation steps into a single tool, reducing the need for multiple scripts or external software.  
 The program is particularly suited for experiments performed at energy-resolved neutron imaging instruments such as **IMAT (ISIS, UK)**, **RADEN (J-PARC, Japan)**, and **VENUS (SNS, USA)**, but can also be used with data from similar facilities worldwide.
@@ -40,7 +40,7 @@ The program is particularly suited for experiments performed at energy-resolved 
 
 Bragg-edge neutron imaging (NBEI) is increasingly used to study residual stress, deformation, and phase transformation in engineering components, cultural artefacts, and advanced manufactured parts. Despite its growing importance, analysis tools remain fragmented—often requiring manual scripting for each stage of data processing.  
 
-Existing packages such as **RITS** (Sato et al., 2011), **TPX_EdgeFit** (Tremsin 2016), **BEATRIX** (Minniti et al., 2019), and **iBeatles** (Bilheux et al., 2018) address parts of the workflow, but none integrate pre-processing, fitting, and map visualisation in one open-source, cross-platform environment.
+Existing packages such as **RITS** [@Sato2011], **TPX_EdgeFit** [@Tremsin2016], **BEATRIX** [@Minniti2019], and **iBeatles** [@Bilheux2017] address parts of the workflow, but none integrate pre-processing, fitting, and map visualisation in one open-source, cross-platform environment.
 
 **NEAT** was developed to fill this gap by providing:
 - A consolidated pipeline from raw detector frames to strain or phase maps, all within a single GUI;
@@ -60,7 +60,7 @@ The tool has since been applied to projects on additively manufactured superallo
 
 # Example of Use
 
-To demonstrate NEAT’s workflow, we analysed Bragg-edge imaging data collected from U-shaped iron specimens measured at the IMAT beamline (ISIS, UK).  
+To demonstrate NEAT’s workflow, we analysed Bragg-edge imaging data collected from U-shaped iron specimens measured at the IMAT beamline (ISIS, UK). The sample was bent to U-shape from a straight bar, leaving residual stress / strain in the bend [@Haribabu2024]. 
 
 The raw time-of-flight image stacks were loaded into NEAT, where the runs were automatically summed, cleaned, and normalised using the built-in preprocessing pipeline.  
 
@@ -68,14 +68,17 @@ After selecting the Fe-bcc phase, a macro-pixel region was defined to extract th
 
 The automated batch-fitting routine then produced two-dimensional maps of lattice spacing, Bragg-edge width, and edge height across the sample within minutes.
 
-The resulting strain map revealed tensile regions on the inner bend and compressive regions on the outer bend—matching the expected elastic bending behaviour.  
+The resulting lattice parameter map revealed tensile regions (red) on the inner bend and compressive regions (blue) on the outer bend, matching the expected plastic bending behaviour, as shown in *Figure 1*.  
 
 Maps of edge width and height highlighted microstructural changes associated with plastic deformation, illustrating NEAT’s ability to quantify both strain and microstructure directly from imaging data.
+
+![Example](docs/images/Example.png)
+**Figure 1:** From left to right, fitted lattice parameter, 110 edge width and 110 edge height of the U-shape bent sample.
 
 # Acknowledgements
 
 This work was supported by the **Engineering and Imaging Group** at the **ISIS Neutron and Muon Source**, Science and Technology Facilities Council (STFC), United Kingdom.  
-The authors thank **Dr Chris Frost**, **Dr Amanda Hampden-Smith**, and the IMAT user community for their valuable feedback during development and testing.
+The authors thank computing division at ISIS and Scientific Computing Department, as well as the IMAT user community for their valuable feedback during development and testing.
 
 # References
 
