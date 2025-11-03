@@ -10,7 +10,7 @@
 
 [![Watch the video](https://img.youtube.com/vi/ycSKno3tYpY/hqdefault.jpg)](https://www.youtube.com/watch?v=ycSKno3tYpY)
 
-**Bragg Edge Fitting:**
+**Bragg Edge Fitting and Mapping:**
 
 [![Watch the video](https://img.youtube.com/vi/fbucLB5Bypc/hqdefault.jpg)](https://www.youtube.com/watch?v=fbucLB5Bypc)
 
