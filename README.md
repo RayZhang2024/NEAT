@@ -22,7 +22,7 @@ Developed at ISIS Neutron and Muon Source, NEAT is designed for use with IMAT an
 ## ⚙️ Requirements
 
 - **Python** ≥ 3.9  
-- Supported platforms: **Windows**, **macOS**, **Linux**
+- Supported platforms: **Windows**
 
 All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil, etc.) will be installed automatically.
 
@@ -31,13 +31,13 @@ All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil,
 ## 🚀 Run the GUI
 
 ### Standalone executable
-You can download the Windows standalone executable from the [NEAT v4.5 Release](https://github.com/RayZhang2024/NEAT/releases/tag/v4.5).
+You can download the Windows standalone executable from the [NEAT v4.5 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.5/NEAT.exe).
 No installation is needed, just run the executable by doule clicking.
 
 ### Pull from the repository
 
 ### 1️⃣ Clone the repository
-Open a terminal (Git Bash, PowerShell, or macOS/Linux terminal) and run:
+Open a terminal (Git Bash, PowerShell) and run:
 ```bash
 git clone https://github.com/RayZhang2024/NEAT.git
 cd ~/NEAT
