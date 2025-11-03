@@ -769,7 +769,7 @@ Runs the **entire preprocessing pipeline** in one go:
    * **Normalisation**: uses the selected **Open Beam**; applies **spatial window** `(2n+1)×(2n+1)` with **n** from the panel; **adjacent m = 0**.
 4. On completion, find results under `/FullProcess_Fe` (stage-specific subfolders; files starting with `FullProcess_Fe_…`).
 
-![Full process](docs/images/Full_process.png)
+![Full process](docs/images/Full_Process.png)
 
 2) Typical messages you’ll see
 
@@ -845,7 +845,7 @@ Runs the **entire preprocessing pipeline** in one go:
    * Re-run the fit until stable.
 
 ![Fitting](docs/images/Fitting.png)
-* (a) Pattern fitting, (b) individual edge fitting. *
+*(a) Pattern fitting, (b) individual edge fitting.*
 
 ## 4.5 Set up full-field (map) fitting
 
