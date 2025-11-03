@@ -8,18 +8,22 @@ tags:
   - strain mapping
   - open-source software
 authors:
-  - name: Ruiyao (Ray) Zhang
+  - name: Ruiyao Zhang
     orcid: 0000-0002-5557-5210
     affiliation: 1
   - name: Ranggi Ramadhan
+    orcid: 0000-0003-1256-7015
     affiliation: 1
   - name: Manuel Morgano
+    orcid: 0000-0001-6195-5538
     affiliation: 1
   - name: Scott Young
     affiliation: 1
   - name: Winfried Kockelmann
+    orcid: 0000-0003-2325-5076
     affiliation: 1
   - name: Sylvia Britto
+    orcid: 0000-0003-1515-307X
     affiliation: 1
 affiliations:
   - name: ISIS Neutron and Muon Source, Rutherford Appleton Laboratory, Harwell, United Kingdom
@@ -56,7 +60,6 @@ The tool has since been applied to projects on additively manufactured superallo
 - **Automated preprocessing:** run summation, pixel cleaning, overlap (pile-up) correction, and normalisation with optional binary masking.  
 - **Edge fitting:** individual or multi-edge pattern fitting using pseudo-Voigt profiles to extract lattice spacing, strain, edge width, and edge height.  
 - **Post-processing and visualisation:** immediate 2-D maps and line-profiles of fitted parameters for interpretation and publication.  
-- **Open-source and extensible:** written in Python 3 (NumPy, SciPy, Matplotlib, PyQt5, Pandas) and released under the MIT License.  
 
 # Example of Use
 
@@ -68,9 +71,7 @@ After selecting the Fe-bcc phase, a macro-pixel region was defined to extract th
 
 The automated batch-fitting routine then produced two-dimensional maps of lattice spacing, Bragg-edge width, and edge height across the sample within minutes.
 
-The resulting lattice parameter map revealed tensile regions (red) on the inner bend and compressive regions (blue) on the outer bend, matching the expected plastic bending behaviour, as shown in *Figure 1*.  
-
-Maps of edge width and height highlighted microstructural changes associated with plastic deformation, illustrating NEAT’s ability to quantify both strain and microstructure directly from imaging data.
+The resulting lattice-parameter map revealed tensile regions (red) along the inner bend and compressive regions (blue) along the outer bend, consistent with the expected plastic bending behaviour (*Figure 1*). In addition to strain mapping, NEAT quantifies Bragg-edge width and height, which provide complementary information on microstructural evolution due to plastic deformation induced by bending.
 
 ![Example](https://github.com/RayZhang2024/NEAT/blob/main/docs/paper/Example.png)
 **Figure 1:** From left to right, fitted lattice parameter, 110 edge width and 110 edge height of the U-shape bent sample.
@@ -78,7 +79,7 @@ Maps of edge width and height highlighted microstructural changes associated wit
 # Acknowledgements
 
 This work was supported by the **Engineering and Imaging Group** at the **ISIS Neutron and Muon Source**, Science and Technology Facilities Council (STFC), United Kingdom.  
-The authors thank computing division at ISIS and Scientific Computing Department, as well as the IMAT user community for their valuable feedback during development and testing.
+The authors thank **Computing Division at ISIS** and **Scientific Computing Department** of STFC for their technical support, and the **IMAT user community** for their valuable feedback during development and testing.
 
 # References
 
