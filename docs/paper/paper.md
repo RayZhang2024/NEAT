@@ -72,7 +72,7 @@ The resulting lattice parameter map revealed tensile regions (red) on the inner 
 
 Maps of edge width and height highlighted microstructural changes associated with plastic deformation, illustrating NEAT’s ability to quantify both strain and microstructure directly from imaging data.
 
-![Example](docs/images/Example.png)
+![Example](https://github.com/RayZhang2024/NEAT/blob/main/docs/paper/Example.png)
 **Figure 1:** From left to right, fitted lattice parameter, 110 edge width and 110 edge height of the U-shape bent sample.
 
 # Acknowledgements
