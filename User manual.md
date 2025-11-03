@@ -682,6 +682,9 @@ This two-dimensional (spatial × temporal) smoothing improves the stability of t
 | **n (window half)** | Spatial (x–y)                       | (2n+1) × (2n+1) pixels | Reduces pixel-level noise, corrects local hot/dead pixels               |
 | **m (adjacent)**    | Temporal (frame index / wavelength) | (2m+1) frames          | Reduces temporal intensity fluctuations, improves per-frame consistency |
 
+
+![Normalisation](docs/images/Normalisation.png)
+
 ---
 
 ## 3.5 Filtering
@@ -720,6 +723,10 @@ Applies a **single FITS mask** to one loaded sample dataset and saves the **filt
 
 6. **Completion**
    * Log: *“Filtering process finished.”*
+
+![Filtering](docs/images/Filtering.png)
+*(a) Transmission image without masking, (b) Fit using a 30×30 macro-pixel that includes ~50% background (outside the sample), yielding poorer statistics and a degraded fit. (c) Transmission image with binary mask applied to exclude background, (d) Fit using the same 30×30 macro-pixel restricted to in-sample pixels only, giving higher signal-noise-ratio and a visibly improved Bragg-edge fit compared with (b).*
+
 
 3) Typical status/error messages
 
@@ -761,6 +768,8 @@ Runs the **entire preprocessing pipeline** in one go:
    * **Overlap Correction**: loads `*_Spectra.txt` and `*_ShutterCount.txt`; skips if either text file is missing/unreadable.
    * **Normalisation**: uses the selected **Open Beam**; applies **spatial window** `(2n+1)×(2n+1)` with **n** from the panel; **adjacent m = 0**.
 4. On completion, find results under `/FullProcess_Fe` (stage-specific subfolders; files starting with `FullProcess_Fe_…`).
+
+![Full process](docs/images/Full_process.png)
 
 2) Typical messages you’ll see
 
@@ -815,6 +824,9 @@ Runs the **entire preprocessing pipeline** in one go:
    * Set **Left** window (1 Min / 1 Max, pre-edge linear region).
    * Set **Right** window (2 Min / 2 Max, post-edge linear region).
    * Set **Edge** window (3 Min / 3 Max, the transition).
+
+![Fitting windows](docs/images/Wavelength_window.png)
+
 2. In **Fitting Parameters**:
 
    * Set **σ**, **τ**, **η** (edge width associated with sample, edge width associated with instrument, Lorentzian fraction) as needed.
@@ -828,10 +840,12 @@ Runs the **entire preprocessing pipeline** in one go:
    * **Fit curves** (right canvas).
    * **Message pane** for convergence, parameter values and uncertainties.
 3. If fitting show bias:
-
    * Nudge **Left/Right/Edge windows**.
    * Relax/tighten **bounds** on σ/τ/η.
    * Re-run the fit until stable.
+
+![Fitting](docs/images/Fitting.png)
+* (a) Pattern fitting, (b) individual edge fitting. *
 
 ## 4.5 Set up full-field (map) fitting
 
