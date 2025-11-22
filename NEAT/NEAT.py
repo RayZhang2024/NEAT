@@ -1185,7 +1185,7 @@ class FitsViewer(QMainWindow):
         upper_layout.addWidget(filtering_group)
         # ------------------------------------------------------
 
-    # --------------------------------------------------------------------
+        # --------------------------------------------------------------------
         # Full Process Section (Similar Layout to Normalisation)
         # --------------------------------------------------------------------
         full_process_group = QGroupBox("Full Process")

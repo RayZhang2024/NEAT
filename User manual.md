@@ -18,6 +18,8 @@
 
 [![Watch the video](https://img.youtube.com/vi/TB_vlNWM744/hqdefault.jpg)](https://www.youtube.com/watch?v=TB_vlNWM744)
 
+## Example dataset for Bragg edge fitting
+An example dataset is available for Bragg edge fitting tutorial, click to download [Example_dataset](https://github.com/RayZhang2024/NEAT/releases/download/v4.6/5_Ubend_normalised.zip). The dataset has been pre-processed and is ready for Bragg edge fitting, go and have a try!
 
 # 1. Introduction
 
