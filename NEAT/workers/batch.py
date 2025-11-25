@@ -506,6 +506,8 @@ class BatchFitEdgesWorker(QThread):
             ("fix_t", self.fix_t),
             ("fix_eta", self.fix_eta),
             ("flight_path", self.parent.flight_path),
+            ("min_wavelength", self._safe_float(getattr(self.parent, "min_wavelength_input", None))),
+            ("max_wavelength", self._safe_float(getattr(self.parent, "max_wavelength_input", None))),
             ("selected_phase", self.parent.phase_dropdown.currentText()),
         ]
         if self.num_edges is not None:
@@ -1130,6 +1132,8 @@ class BatchFitWorker(QThread):
             ("fix_t", self.fix_t),
             ("fix_eta", self.fix_eta),
             ("flight_path", self.parent.flight_path),
+            ("min_wavelength", self._safe_float(getattr(self.parent, "min_wavelength_input", None))),
+            ("max_wavelength", self._safe_float(getattr(self.parent, "max_wavelength_input", None))),
             ("selected_phase", self.parent.phase_dropdown.currentText()),
             ("number_of_edges", self.num_edges),
         ]
