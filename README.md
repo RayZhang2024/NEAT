@@ -50,30 +50,42 @@ cd ~/NEAT
 
 ### 2️⃣ Install NEAT via `pip`
 
-Because this project includes a `pyproject.toml`, you can install it directly:
+From the repository root (the folder containing `pyproject.toml`), install into a virtual environment:
 
 ```bash
-pip install .
-```
+python -m venv .venv
+# Windows
+.\.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
 
-or
-
-```bash
+python -m pip install --upgrade pip
 python -m pip install .
 ```
 
-This automatically installs NEAT **and all dependencies** specified in `pyproject.toml`.
+If you are developing and want changes to take effect without reinstalling, use editable mode:
+
+```bash
+python -m pip install -e .
+```
+
+This installs NEAT and all dependencies declared in `pyproject.toml`.
 
 
 ---
 
 ### 🧠 Running NEAT
 
-After installation, simply launch the GUI with:
+With the virtual environment activated, launch the GUI with the installed console script:
 
 ```bash
-cd ~/NEAT/NEAT
-python NEAT.py
+neat
+```
+
+If you prefer to run straight from the source checkout, execute:
+
+```bash
+python -m NEAT.app
 ```
 
 ✅ The main window titled
