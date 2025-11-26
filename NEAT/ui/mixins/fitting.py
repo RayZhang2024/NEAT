@@ -1695,11 +1695,17 @@ class FittingMixin:
         if enabled:
             self.tof_array = None
             self.message_box.append(
-                "Manual wavelength mode enabled. Adjust bounds in the Config dialog."
+                "Manual mode enabled. Set anchors (wavelength or ToF) in the Config dialog."
             )
             self.update_manual_wavelengths()
         else:
             self.message_box.append("Spectra file detected. Manual wavelength controls disabled.")
+
+    def _format_image_suffix(self, image_index: int) -> str:
+        """Convert a 1-based image index into the zero-padded file suffix."""
+        if image_index <= 0:
+            return "--"
+        return f"_{image_index - 1:05d}"
 
     def update_manual_wavelengths(self):
         """Compute wavelengths via interpolation when no spectra file is available."""
@@ -1708,19 +1714,73 @@ class FittingMixin:
             self.wavelengths = np.array([])
             return
 
-        min_wl = getattr(self, "manual_wavelength_min", 1.0)
-        max_wl = getattr(self, "manual_wavelength_max", 3.0)
-        if max_wl <= min_wl:
-            self.message_box.append("Manual wavelength bounds must satisfy min < max.")
+        count = len(self.images)
+
+        raw_anchors = getattr(self, "manual_wavelength_anchors", [])
+        anchor_mode = getattr(self, "manual_anchor_mode", "wavelength")
+        flight_path = getattr(self, "flight_path", 0.0) or 0.0
+        delay = getattr(self, "delay", 0.0)
+        if anchor_mode == "tof" and flight_path == 0:
+            self.message_box.append("Flight path must be > 0 to convert time-of-flight anchors.")
+            self.wavelengths = np.array([])
+            return
+        anchor_map = {}
+        for entry in raw_anchors:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                idx = int(entry.get("index", 0))
+                raw_val = float(entry.get("value", entry.get("wavelength")))
+            except (TypeError, ValueError):
+                continue
+            if idx <= 0:
+                continue
+            if idx > count:
+                self.message_box.append(f"Anchor at image {idx} exceeds available images ({count}); clamped to last image.")
+                idx = count
+            if anchor_mode == "tof":
+                wl = ((raw_val + delay) * 3.956) / flight_path * 1000
+            else:
+                wl = raw_val
+            anchor_map[idx - 1] = wl
+
+        user_anchor_count = len(anchor_map)
+        anchors = sorted(anchor_map.items())
+        if not anchors:
+            self.message_box.append("Provide at least two anchors in Config to compute manual wavelengths.")
             self.wavelengths = np.array([])
             return
 
-        count = len(self.images)
-        self.wavelengths = np.linspace(min_wl, max_wl, count)
-        self.start_wavelength = self.wavelengths[0]
-        self.end_wavelength = self.wavelengths[-1]
+        if len(anchors) == 1:
+            wl_value = anchors[0][1]
+            self.wavelengths = np.full(count, wl_value)
+            self.start_wavelength = self.end_wavelength = wl_value
+            self.message_box.append(
+                f"Only one anchor provided; assigned constant wavelength {wl_value:.6f} Å to all images."
+            )
+            return
+
+        # Ensure coverage from first to last image by extending anchors to edges
+        if anchors[0][0] > 0:
+            anchors.insert(0, (0, anchors[0][1]))
+        if anchors[-1][0] < count - 1:
+            anchors.append((count - 1, anchors[-1][1]))
+
+        self.wavelengths = np.empty(count)
+        for i in range(len(anchors) - 1):
+            start_idx, start_wl = anchors[i]
+            end_idx, end_wl = anchors[i + 1]
+            if end_idx <= start_idx:
+                self.wavelengths[start_idx] = start_wl
+                continue
+            segment = np.linspace(start_wl, end_wl, end_idx - start_idx + 1)
+            self.wavelengths[start_idx:end_idx + 1] = segment
+
+        self.start_wavelength = float(self.wavelengths[0])
+        self.end_wavelength = float(self.wavelengths[-1])
         self.message_box.append(
-            f"Manual wavelengths set from {self.start_wavelength:.6f} to {self.end_wavelength:.6f} Å"
+            f"Manual wavelengths set from {self.start_wavelength:.6f} to {self.end_wavelength:.6f} Å "
+            f"using {user_anchor_count} user anchors ({len(anchors)} points including edges)."
         )
 
     def set_delay(self):
@@ -1893,23 +1953,70 @@ class FittingMixin:
         form_layout.addRow("Symbol Size:", symbol_spin)
         layout.addLayout(form_layout)
 
-        manual_wl_layout = QFormLayout()
-        manual_min_spin = QDoubleSpinBox()
-        manual_min_spin.setRange(-10.0, 100.0)
-        manual_min_spin.setDecimals(6)
-        manual_min_spin.setValue(getattr(self, "manual_wavelength_min", 1.0))
-        manual_min_spin.setEnabled(getattr(self, "manual_wavelength_mode", False))
-        manual_min_spin.setToolTip("Active only when no spectra file is available.")
-        manual_wl_layout.addRow("Wavelength Min (Å):", manual_min_spin)
+        anchor_mode_combo = QComboBox()
+        anchor_mode_combo.addItems(["Wavelength (Å)", "Time of Flight (ms)"])
+        anchor_mode_combo.setToolTip("Choose whether anchor values are wavelengths or time-of-flight.")
+        anchor_mode_combo.setCurrentIndex(1 if getattr(self, "manual_anchor_mode", "wavelength") == "tof" else 0)
+        layout.addWidget(anchor_mode_combo)
 
-        manual_max_spin = QDoubleSpinBox()
-        manual_max_spin.setRange(-10.0, 100.0)
-        manual_max_spin.setDecimals(6)
-        manual_max_spin.setValue(getattr(self, "manual_wavelength_max", 3.0))
-        manual_max_spin.setEnabled(getattr(self, "manual_wavelength_mode", False))
-        manual_max_spin.setToolTip("Active only when no spectra file is available.")
-        manual_wl_layout.addRow("Wavelength Max (Å):", manual_max_spin)
-        layout.addLayout(manual_wl_layout)
+        anchor_group = QGroupBox("Manual anchors (up to 10 rows; leave index as 'Unused' to skip)")
+        anchor_layout = QGridLayout(anchor_group)
+        anchor_layout.addWidget(QLabel("Image #"), 0, 0)
+        anchor_layout.addWidget(QLabel("Suffix"), 0, 1)
+        value_header = QLabel("Wavelength (Å)")
+        anchor_layout.addWidget(value_header, 0, 2)
+
+        max_index = max(len(getattr(self, "images", [])), 5000)
+        existing_anchors = getattr(self, "manual_wavelength_anchors", [])
+        anchor_rows = []
+        for row in range(10):
+            idx_spin = QSpinBox()
+            idx_spin.setRange(0, max_index)
+            idx_spin.setSpecialValueText("Unused")
+            preset_index = 0
+            preset_val = 1.0
+            if row < len(existing_anchors):
+                try:
+                    preset_index = int(existing_anchors[row].get("index", 0))
+                    preset_val = float(
+                        existing_anchors[row].get(
+                            "value",
+                            existing_anchors[row].get("wavelength", preset_val)
+                        )
+                    )
+                except Exception:
+                    pass
+            idx_spin.setValue(preset_index)
+            idx_spin.setEnabled(getattr(self, "manual_wavelength_mode", False))
+
+            suffix_label = QLabel(self._format_image_suffix(idx_spin.value()))
+            idx_spin.valueChanged.connect(lambda val, lbl=suffix_label: lbl.setText(self._format_image_suffix(val)))
+
+            val_spin = QDoubleSpinBox()
+            val_spin.setRange(-10.0, 100.0)
+            val_spin.setDecimals(6)
+            val_spin.setValue(preset_val)
+            val_spin.setEnabled(getattr(self, "manual_wavelength_mode", False))
+
+            anchor_layout.addWidget(idx_spin, row + 1, 0)
+            anchor_layout.addWidget(suffix_label, row + 1, 1)
+            anchor_layout.addWidget(val_spin, row + 1, 2)
+            anchor_rows.append((idx_spin, val_spin, suffix_label))
+
+        def _update_anchor_header(idx: int):
+            if idx == 1:
+                value_header.setText("ToF (ms)")
+                for _, val_spin, _ in anchor_rows:
+                    val_spin.setSuffix("")
+            else:
+                value_header.setText("Wavelength (Å)")
+                for _, val_spin, _ in anchor_rows:
+                    val_spin.setSuffix("")
+
+        _update_anchor_header(anchor_mode_combo.currentIndex())
+        anchor_mode_combo.currentIndexChanged.connect(_update_anchor_header)
+
+        layout.addWidget(anchor_group)
 
         load_cfg_btn = QPushButton("Load configuration")
         load_cfg_btn.setToolTip("Load metadata from a result CSV to reuse settings.")
@@ -1973,8 +2080,6 @@ class FittingMixin:
                 if key in metadata:
                     _set_float(delay_spin, key)
                     break
-            _set_float(manual_min_spin, "manual_wavelength_min")
-            _set_float(manual_max_spin, "manual_wavelength_max")
             _set_line_float(self.min_wavelength_input, "min_wavelength")
             _set_line_float(self.max_wavelength_input, "max_wavelength")
             try:
@@ -2047,8 +2152,15 @@ class FittingMixin:
                 self.update_plots()
             self.apply_symbol_size()
 
-            self.manual_wavelength_min = manual_min_spin.value()
-            self.manual_wavelength_max = manual_max_spin.value()
+            anchors = []
+            self.manual_anchor_mode = "tof" if anchor_mode_combo.currentIndex() == 1 else "wavelength"
+            anchors = []
+            for idx_spin, val_spin, _ in anchor_rows:
+                idx_val = idx_spin.value()
+                if idx_val <= 0:
+                    continue
+                anchors.append({"index": idx_val, "value": val_spin.value()})
+            self.manual_wavelength_anchors = anchors
             if getattr(self, "manual_wavelength_mode", False):
                 self.update_manual_wavelengths()
                 if getattr(self, "selected_area", None):

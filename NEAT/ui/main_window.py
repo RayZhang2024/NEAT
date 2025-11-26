@@ -183,8 +183,8 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.current_r3_max = None
         
         self.manual_wavelength_mode = False
-        self.manual_wavelength_min = 1.0
-        self.manual_wavelength_max = 3.0
+        self.manual_anchor_mode = "wavelength"  # "wavelength" or "tof"
+        self.manual_wavelength_anchors = []
 
         self._summation_cancelled = False
         self._two_level_subfolders  = []
@@ -808,8 +808,10 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             self.apply_symbol_size()
 
         manual_range = data.get("manual_wavelength", {})
-        self.manual_wavelength_min = manual_range.get("min", self.manual_wavelength_min)
-        self.manual_wavelength_max = manual_range.get("max", self.manual_wavelength_max)
+        anchors = manual_range.get("anchors")
+        if isinstance(anchors, list):
+            self.manual_wavelength_anchors = anchors
+        self.manual_anchor_mode = manual_range.get("mode", getattr(self, "manual_anchor_mode", "wavelength"))
 
         batch = data.get("batch_settings", {})
         self.box_width_input.setText(str(batch.get("box_width", self.box_width_input.text())))
@@ -847,8 +849,8 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             "fix_eta": self.fix_eta_checkbox.isChecked(),
             "symbol_size": getattr(self, "symbol_size", 4),
             "manual_wavelength": {
-                "min": self.manual_wavelength_min,
-                "max": self.manual_wavelength_max,
+                "mode": getattr(self, "manual_anchor_mode", "wavelength"),
+                "anchors": getattr(self, "manual_wavelength_anchors", []),
             },
             "batch_settings": {
                 "box_width": self.box_width_input.text(),
