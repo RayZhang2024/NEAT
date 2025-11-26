@@ -1959,7 +1959,7 @@ class FittingMixin:
         anchor_mode_combo.setCurrentIndex(1 if getattr(self, "manual_anchor_mode", "wavelength") == "tof" else 0)
         layout.addWidget(anchor_mode_combo)
 
-        anchor_group = QGroupBox("Manual anchors (up to 10 rows; leave index as 'Unused' to skip)")
+        anchor_group = QGroupBox("Manual anchors (leave index as 'Unused' to skip)")
         anchor_layout = QGridLayout(anchor_group)
         anchor_layout.addWidget(QLabel("Image #"), 0, 0)
         anchor_layout.addWidget(QLabel("Suffix"), 0, 1)
@@ -1969,23 +1969,22 @@ class FittingMixin:
         max_index = max(len(getattr(self, "images", [])), 5000)
         existing_anchors = getattr(self, "manual_wavelength_anchors", [])
         anchor_rows = []
-        for row in range(10):
+
+        def _update_anchor_header(idx: int):
+            if idx == 1:
+                value_header.setText("ToF (ms)")
+                for _, val_spin, _ in anchor_rows:
+                    val_spin.setSuffix("")
+            else:
+                value_header.setText("Wavelength (Å)")
+                for _, val_spin, _ in anchor_rows:
+                    val_spin.setSuffix("")
+
+        def add_anchor_row(preset_index=0, preset_val=1.0):
+            row = len(anchor_rows) + 1  # +1 for header
             idx_spin = QSpinBox()
             idx_spin.setRange(0, max_index)
             idx_spin.setSpecialValueText("Unused")
-            preset_index = 0
-            preset_val = 1.0
-            if row < len(existing_anchors):
-                try:
-                    preset_index = int(existing_anchors[row].get("index", 0))
-                    preset_val = float(
-                        existing_anchors[row].get(
-                            "value",
-                            existing_anchors[row].get("wavelength", preset_val)
-                        )
-                    )
-                except Exception:
-                    pass
             idx_spin.setValue(preset_index)
             idx_spin.setEnabled(getattr(self, "manual_wavelength_mode", False))
 
@@ -1998,25 +1997,38 @@ class FittingMixin:
             val_spin.setValue(preset_val)
             val_spin.setEnabled(getattr(self, "manual_wavelength_mode", False))
 
-            anchor_layout.addWidget(idx_spin, row + 1, 0)
-            anchor_layout.addWidget(suffix_label, row + 1, 1)
-            anchor_layout.addWidget(val_spin, row + 1, 2)
+            anchor_layout.addWidget(idx_spin, row, 0)
+            anchor_layout.addWidget(suffix_label, row, 1)
+            anchor_layout.addWidget(val_spin, row, 2)
             anchor_rows.append((idx_spin, val_spin, suffix_label))
+            _update_anchor_header(anchor_mode_combo.currentIndex())
 
-        def _update_anchor_header(idx: int):
-            if idx == 1:
-                value_header.setText("ToF (ms)")
-                for _, val_spin, _ in anchor_rows:
-                    val_spin.setSuffix("")
-            else:
-                value_header.setText("Wavelength (Å)")
-                for _, val_spin, _ in anchor_rows:
-                    val_spin.setSuffix("")
+        base_rows = max(10, len(existing_anchors))
+        for i in range(base_rows):
+            preset_index = 0
+            preset_val = 1.0
+            if i < len(existing_anchors):
+                try:
+                    preset_index = int(existing_anchors[i].get("index", 0))
+                    preset_val = float(
+                        existing_anchors[i].get(
+                            "value",
+                            existing_anchors[i].get("wavelength", preset_val)
+                        )
+                    )
+                except Exception:
+                    pass
+            add_anchor_row(preset_index, preset_val)
 
         _update_anchor_header(anchor_mode_combo.currentIndex())
         anchor_mode_combo.currentIndexChanged.connect(_update_anchor_header)
 
         layout.addWidget(anchor_group)
+
+        add_row_btn = QPushButton("Add more lines")
+        add_row_btn.setToolTip("Append another anchor row for manual wavelength/ToF input.")
+        add_row_btn.clicked.connect(lambda: add_anchor_row())
+        layout.addWidget(add_row_btn)
 
         load_cfg_btn = QPushButton("Load configuration")
         load_cfg_btn.setToolTip("Load metadata from a result CSV to reuse settings.")
