@@ -92,18 +92,23 @@ class PostProcessingMixin:
         • Ranggi Ramadhan (ranggi.ramadhan@stfc.ac.uk)</p>
 
         <p><b>Release date:</b><br>
-        May 2025</p>
+        Nov 2025</p>
 
         <p><b>Font size adjustment:</b><br>
         UI Font:     Shift + Up / Shift + Down<br>
         Canvas Font: Ctrl + Up / Ctrl + Down</p>
 
+        <p><b>Project resources:</b><br>
+        <a href="https://github.com/RayZhang2024/NEAT">GitHub Repository</a><br>
+        <a href="https://github.com/RayZhang2024/NEAT/blob/main/User%20manual.md">User Manual</a><br>
+        <a href="https://www.youtube.com/@RayOnNeutrons">Video tutorial</a></p>
         """
 
         about_label = QLabel(about_text)
         about_label.setAlignment(Qt.AlignTop)
         about_label.setWordWrap(True)
         about_label.setTextFormat(Qt.RichText)
+        about_label.setOpenExternalLinks(True)
 
 
         scroll = QScrollArea()
