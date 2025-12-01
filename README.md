@@ -95,6 +95,7 @@ will appear, with tabs for:
 
 ## 🧑‍💻 Citation / Acknowledgment
 
+Please cite the following reference if you use NEAT for your data analysis:
 RayZhang2024. (2025). RayZhang2024/NEAT: NEAT v4.6 (v4.6). Zenodo. https://doi.org/10.5281/zenodo.17512269
 
 ---
