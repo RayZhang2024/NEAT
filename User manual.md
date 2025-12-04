@@ -35,45 +35,33 @@ Bragg-edge imaging is a powerful neutron technique that reveals material structu
 
 NEAT was developed to:
 
-Simplify the analysis process for both new and experienced neutron users.
-
-Provide a consistent and reproducible data analysis workflow.
-
-Offer interactive visualisation tools to inspect transmission spectra, edge positions, and strain maps.
-
-Facilitate collaboration and reproducibility through open-source code and transparent fitting algorithms.
+- Simplify the analysis process for both new and experienced neutron users.
+- Provide a consistent and reproducible data analysis workflow.
+- Offer interactive visualisation tools to inspect transmission spectra, edge positions, and strain maps.
+- Facilitate collaboration and reproducibility through open-source code and transparent fitting algorithms.
 
 ## 1.3 Key Features
 
-User-friendly GUI: intuitive layout for spectrum viewing, ROI selection, and batch analysis.
-
-Flexible fitting functions: pseudo-Voigt model used, Jørgensen Bragg-edge models is planned to included in the future.
-
-Result visualisation: generate maps of lattice spacing, strain, and fit quality.
-
-Export tools: save fitted parameters and spectra as CSV.
+- User-friendly GUI: intuitive layout for spectrum viewing, ROI selection, and batch analysis.
+- Flexible fitting functions: pseudo-Voigt model used, Jørgensen Bragg-edge models is planned to included in the future.
+- Result visualisation: generate maps of lattice spacing, strain, and fit quality.
+- Export tools: save fitted parameters and spectra as CSV.
 
 ## 1.4 Typical Workflow
 
-Load Data: Import wavelength-resolved transmission files (.fits).
-
-Select ROI: Choose single points or regions for analysis.
-
-Fit Bragg Edges: Apply fitting models to extract lattice spacing.
-
-Visualise Results: Display fitted edges and 2D maps.
-
-Export Output: Save results for further analysis or publication.
+- Load Data: Import wavelength-resolved transmission files (.fits).
+- Select ROI: Choose single points or regions for analysis.
+- Fit Bragg Edges: Apply fitting models to extract lattice spacing.
+- Visualise Results: Display fitted edges and 2D maps.
+- Export Output: Save results for further analysis or publication.
 
 ## 1.5 Intended Users
 
 NEAT is intended for:
 
-Researchers and engineers performing Bragg-edge imaging experiments.
-
-Beamline scientists conducting in-situ studies at neutron imaging facilities.
-
-Industrial users analysing strain, phase evolution, or microstructural variations in materials.
+- Researchers and engineers performing Bragg-edge imaging experiments.
+- Beamline scientists conducting in-situ studies at neutron imaging facilities.
+- Industrial users analysing strain, phase evolution, or microstructural variations in materials.
 
 ---
 
