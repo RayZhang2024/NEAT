@@ -45,7 +45,7 @@ The program is particularly suited for experiments performed at energy-resolved 
 
 Bragg-edge neutron imaging (NBEI) is increasingly used to study residual stress, deformation, and phase transformation in engineering components, cultural artefacts, and advanced manufactured parts. Despite its growing importance, analysis tools remain fragmented—often requiring manual scripting for each stage of data processing.  
 
-Existing packages such as **RITS** [@Sato2011], **TPX\_EdgeFit** [@Tremsin2016], **BEATRIX** [@Minniti2019], **BEAn** [@Liptak2019], and **iBeatles** [@Bilheux2025] address parts of the workflow, but none integrate pre-processing, fitting, and map visualisation in one open-source, cross-platform environment.
+Existing packages such as **RITS** [@Sato2011], **TPX\_EdgeFit** [@Tremsin2011], **BEATRIX** [@Minniti2019], **BEAn** [@Liptak2019], and **iBeatles** [@Bilheux2025] address parts of the workflow, but none integrate pre-processing, fitting, and map visualisation in one open-source, cross-platform environment.
 
 **NEAT** was developed to fill this gap by providing:
 - A consolidated pipeline from raw detector frames to strain or phase maps, all within a single GUI;
