@@ -1,5 +1,5 @@
 ---
-title: "NEAT: A Python Toolkit for Neutron Bragg-Edge Imaging Data Analysis"
+title: "NEAT: A Neutron Bragg-Edge Imaging Data Analysis Toolkit"
 tags:
   - Python
   - neutron imaging
@@ -35,7 +35,7 @@ bibliography: paper.bib
 
 # Summary
 
-**NEAT (Neutron Bragg-Edge Analysis Toolkit)** is an open-source Python graphical user interface (GUI) [@Zhang2025] that enables scientists to analyse neutron imaging data without advanced programming experience.  
+**NEAT (Neutron Bragg-Edge Analysis Toolkit)** is an open-source graphical user interface (GUI) [@Zhang2025] that enables scientists to analyse neutron imaging data without advanced programming experience.  
 Neutron imaging uses beams of neutrons to look inside solid objects in a non-destructive way, revealing the inner structure of samples through the neutrons’ interaction with the nuclei contained in the traversed object [@Santisteban2001]. When a neutron beam passes through a powder-like multi-crystalline solid, sharp changes—called *Bragg edges*—appear in the transmitted intensity as a function of neutron wavelength. The position and shape of these edges provide information about lattice spacing, elastic strain, phase composition, and microstructure [@Ramadhan2022].
 
 **NEAT** offers a complete and user-friendly environment to transform raw neutron time-of-flight images acquired through spatially and temporally resolving detector such as the Berkeley-developed MCP-based detector [@Tremsin2020] in use at ISIS neutron and muon source [@Kockelmann2018] into quantitative maps of material properties. It combines data cleaning, correction, fitting, and visualisation steps into a single tool, reducing the need for multiple scripts or external software. NEAT adopts key aspects of the data-analysis workflow presented in Ramadhan’s doctoral thesis [@Ramadhan2019]. 
