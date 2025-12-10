@@ -18,6 +18,7 @@ authors:
     orcid: 0000-0001-6195-5538
     affiliation: 1
   - name: Scott Young
+    orcid: 0000-0002-4478-7656
     affiliation: 1
   - name: Winfried Kockelmann
     orcid: 0000-0003-2325-5076
@@ -28,7 +29,7 @@ authors:
 affiliations:
   - name: ISIS Neutron and Muon Source, Rutherford Appleton Laboratory, Harwell, United Kingdom
     index: 1
-date: 2025-11-03
+date: 2025-12-10
 bibliography: paper.bib
 ---
 
