@@ -61,7 +61,7 @@ The tool has since been applied to projects on additively manufactured superallo
 - **Edge fitting:** individual or multi-edge pattern fitting using pseudo-Voigt profiles to extract lattice spacing, strain, edge width, and edge height.  
 - **Post-processing and visualisation:** immediate 2-D maps and line-profiles of fitted parameters for interpretation and publication.
 
-Detailed explanations and instructions for each function can be found in the ![user_manual] (https://github.com/RayZhang2024/NEAT/blob/main/User%20manual.md)
+Detailed explanations and instructions for each function can be found in the **user manual** (https://github.com/RayZhang2024/NEAT/blob/main/User%20manual.md)
 
 # Example of Use
 
