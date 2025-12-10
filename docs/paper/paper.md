@@ -39,7 +39,7 @@ bibliography: paper.bib
 Neutron imaging uses beams of neutrons to look inside solid objects in a non-destructive way, revealing the inner structure of samples through the neutrons’ interaction with the nuclei contained in the traversed object [@Santisteban2001]. When a neutron beam passes through a powder-like multi-crystalline solid, sharp changes—called *Bragg edges*—appear in the transmitted intensity as a function of neutron wavelength. The position and shape of these edges provide information about lattice spacing, elastic strain, phase composition, and microstructure [@Ramadhan2022].
 
 **NEAT** offers a complete and user-friendly environment to transform raw neutron time-of-flight images acquired through spatially and temporally resolving detector such as the Berkeley-developed MCP-based detector [@Tremsin2020] in use at ISIS neutron and muon source [@Kockelmann2018] into quantitative maps of material properties. It combines data cleaning, correction, fitting, and visualisation steps into a single tool, reducing the need for multiple scripts or external software. NEAT adopts key aspects of the data-analysis workflow presented in Ramadhan’s doctoral thesis [@Ramadhan2019]. 
-The program is particularly suited for experiments performed at energy-resolved neutron imaging instruments such as **IMAT (ISIS, UK)**, but can also be used with data from similar facilities worldwide like **RADEN (J-PARC, Japan)** [@Shinohara2016], and **POLDI (PSI, Swiss)** [@Polatidis2020], where the data pipeline is broadly similar given the use of temperolly resolving detector.
+The program is particularly suited for experiments performed at energy-resolved neutron imaging instruments such as **IMAT (ISIS, UK)**, but can also be used with data from similar facilities worldwide like **RADEN (J-PARC, Japan)** [@Shinohara2016], and **POLDI (PSI, Swiss)** [@Polatidis2020], where the data pipeline is broadly similar given the use of temporally resolving detector.
 
 # Statement of Need
 
@@ -76,7 +76,7 @@ The automated batch-fitting routine then produced two-dimensional maps of lattic
 
 The resulting lattice-parameter map revealed tensile regions (red) along the inner bend and compressive regions (blue) along the outer bend, consistent with the expected plastic bending behaviour (*Figure 1*). In addition to lattice spacing mapping, NEAT quantifies Bragg-edge width and height, which provide complementary information on microstructural evolution due to plastic deformation induced by bending. These results have been validated through the use of other similar software, FEA modelling and have been replicated at other facilities as part of a round-robin measurement campaign to compare the performances of various neutron instruments.
 
-![Example](https://github.com/RayZhang2024/NEAT/blob/main/docs/paper/Example.png)
+![Example](Example.png)
 **Figure 1:** From left to right, fitted lattice parameter, 110 edge width and 110 edge height of the U-shape bent sample.
 
 # Acknowledgements
