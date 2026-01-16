@@ -931,80 +931,66 @@ Runs the **entire preprocessing pipeline** in one go:
 
 # Appendix A: Fitting Functions and Logic
 
-This appendix documents the fitting functions used by NEAT and the logic of the three-stage and pattern fitting workflows as implemented in the current codebase.
+## A.1 Fitting functions
 
-## A.1 Fitting functions (three regions)
+The Bragg-edge fitting function implemented in NEAT is based on the analytical formulation of Santisteban et al. (2001), extended from the original Gaussian profile to a pseudo-Voigt form to more accurately represent asymmetric or broadened edge profiles observed in experimental data.
 
-NEAT fits each Bragg edge using three wavelength windows (Region 1, Region 2, Region 3). The model is written in terms of wavelength `x` and is built from exponential baselines plus a pseudo-Voigt step.
-
-```
-Region 1 (pre-edge baseline):
-I1(x) = exp(-(a0 + b0 * x))
-
-Region 2 (post-edge plateau):
-I2(x) = exp(-(a0 + b0 * x)) * exp(-(a_hkl + b_hkl * x))
-
-Region 3 (edge transition):
-pre(x)  = exp(-(a_hkl + b_hkl * x))
-step(x) = (1 - eta) * G(x) + eta * L_tail(x)
-I3(x)   = exp(-(a0 + b0 * x)) * (pre(x) + (1 - pre(x)) * step(x))
-```
-
-`a0, b0` model the smooth baseline. `a_hkl, b_hkl` control the edge height (contrast between pre-edge and post-edge plateaus). `s` controls Gaussian broadening, `t` controls an exponential tail (instrument response), and `eta` is the pseudo-Voigt mixing fraction (0 = Gaussian, 1 = Lorentzian).
-
-The step terms are implemented as:
+The Bragg-edge profile is obtained by integrating the convolution of an exponential decay (representing attenuation and instrumental response) with a Gaussian peak function proposed by Kropff et al. (1982):
 
 ```
-u    = (x - x_hkl) / (s * sqrt(2))
-G(x) = 0.5 * [erfc(-u) - exp(-(x - x_hkl)/t + s^2/(2*t^2)) * erfc(-u + s/t)]
-
-L(u)   = 0.5 + arctan(u) / pi
-u_s    = (x - x_hkl - s^2/t) / (s * sqrt(2))
-L_s    = 0.5 + arctan(u_s) / pi
-L_tail = L(u) - exp(-(x - x_hkl)/t) * (L(u) - L_s)
+R_G(λ, t) = θ(t − t₀) (1/τ) exp(−(t − t₀)/τ) ⊗ [1/(√(2π) σ)] exp(−(t − t₀)²/(2σ²))  (3)
 ```
 
-For a single edge, `x_hkl` is the theoretical edge position. If multiple edges are in range, NEAT sums their `I3(x)` contributions to form the total modeled intensity.
-
-## A.2 Edge positions from lattice parameters
-
-NEAT computes theoretical edge positions from lattice parameters using:
+Integration of this convolution yields the Gaussian-type Bragg-edge function:
 
 ```
-x_hkl = 2 * d_hkl
+B_G(λ_hkl, λ) = 1/2 [erfc(−(λ − λ_hkl)/(√2 σ)) − exp(−(λ − λ_hkl)/τ + σ²/(2τ²)) × erfc(−(λ − λ_hkl)/(√2 σ) + σ/τ)]  (4)
 ```
 
-The spacing `d_hkl` is computed by structure type:
+For diffraction line shapes, a mixed Gaussian–Lorentzian representation often provides greater flexibility in describing both instrumental broadening and microstructural effects (Stephens, J. Appl. Cryst., 1999). The Lorentzian response function can be expressed as:
 
 ```
-Cubic (bcc/fcc):    d_hkl = a / sqrt(h^2 + k^2 + l^2)
-Tetragonal:         d_hkl = 1 / sqrt((h^2 + k^2)/a^2 + l^2/c^2)
-Hexagonal:          d_hkl = 1 / sqrt((4/3) * (h^2 + h*k + k^2)/a^2 + l^2/c^2)
-Orthorhombic:       d_hkl = 1 / sqrt(h^2/a^2 + k^2/b^2 + l^2/c^2)
+R_L(λ, t) = θ(t − t₀) (1/τ) exp(−(t − t₀)/τ) ⊗ [1/π] (√2 σ)/((t − t₀)² + 2σ²)  (5)
 ```
 
-If the phase is unknown and no `hkl` list is provided, NEAT falls back to a single edge position derived from the fitted lattice parameter (`x_hkl = 2 * a`).
+whose integral gives the Lorentzian-type Bragg-edge function:
 
-## A.3 Three-stage fitting logic (single-edge mode)
+```
+B_L(λ_hkl, λ) = L(λ_hkl, λ) − exp(−(λ − λ_hkl)/τ) × [L(λ_hkl, λ) − L(λ_hkl, λ − σ²/τ)]  (6)
 
-For each edge row in the Bragg table, NEAT performs a staged fit for stability:
+L(λ_hkl, λ) = 1/2 + (1/π) arctan(−(λ − λ_hkl)/(√2 σ))  (7)
+```
 
-1) Region 1 fit: Fit `a0, b0` to `I1(x)` using the left window.
-2) Region 2 fit: Fit `a_hkl, b_hkl` to `I2(x)` using the right window, while holding `a0, b0` fixed from Region 1.
-3) Region 3 fit: Fit the edge transition in the center window using `I3(x)`:
-   - Uses Region 1/2 results to seed `a0, b0, a_hkl, b_hkl`.
-   - Refines lattice parameters (for known phases) or a single edge position (for unknown phases).
-   - `s`, `t`, and `eta` are either fixed or refined based on the "Fix s/t/eta" checkboxes.
+A pseudo-Voigt Bragg-edge function is then constructed as a linear combination of the Gaussian and Lorentzian components:
 
-Bounds in Region 3 are set to approximately +/-50 percent around the Region 1/2 estimates for `a0, b0, a_hkl, b_hkl`, and +/-5 percent around the lattice-parameter guesses.
+```
+B_PV(λ_hkl, λ) = (1 − η) B_G(λ_hkl, λ) + η B_L(λ_hkl, λ)  (8)
+```
 
-## A.4 Pattern fitting logic (multi-edge mode)
+where 0 ≤ η ≤ 1 is the Lorentzian fraction controlling the relative weighting of the two contributions.
 
-Pattern fitting refines multiple edges at once using a single least-squares solve over all Region 3 windows:
+Finally, the transmission near a Bragg edge is described following Santisteban et al. (2001) as:
 
-- Lattice parameters are shared across all edges for the selected structure type.
-- Each edge keeps its own `a0, b0, a_hkl, b_hkl`.
-- `s`, `t`, and `eta` can be fixed globally or refined per edge.
-- Only edges with valid Region 3 data are included; edges outside the wavelength range are skipped.
+```
+T(λ) = exp[−(a₀ + b₀ λ)] (exp[−(a_hkl + b_hkl λ)] + {1 − exp[−(a_hkl + b_hkl λ)]} B_PV(λ_hkl, σ, τ, λ))  (9)
+```
 
-This mode is analogous to a global pattern refinement and is recommended once a stable single-edge fit has been obtained.
+where a₀, b₀, a_hkl, b_hkl are empirical constants describing background attenuation and spectral slope.
+
+## A.2 Three-stage fitting logic
+
+The three-stage fitting approach proposed by Santisteban et al. (2001) is adopted. In the first stage, the parameters a₀ and b₀ are determined by fitting the linear region on the right-hand side of the Bragg edge using:
+
+```
+T(λ) = exp[−(a₀ + b₀ λ)]  (10)
+```
+
+In the second stage, the parameters a_hkl and b_hkl are obtained by fitting the left-hand side of the edge according to:
+
+```
+T(λ) = exp[−(a₀ + b₀ λ)] exp[−(a_hkl + b_hkl λ)]  (11)
+```
+
+In the final stage, rather than fixing a₀, b₀, a_hkl and b_hkl, NEAT allows them to vary within specified bounds during the Bragg-edge fit to determine λ_hkl, σ, τ, and η in equation (9). This preserves the robustness of the original method for avoiding local minima while reducing sensitivity to the chosen left and right fitting windows. As shown in Table 1, fixing these four parameters leads to variations in λ_hkl, σ, τ depending on window selection, whereas allowing them to refine yields consistent results.
+
+
