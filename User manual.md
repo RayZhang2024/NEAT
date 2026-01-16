@@ -976,7 +976,7 @@ where $0 \le \eta \le 1$ is the Lorentzian fraction controlling the relative wei
 Finally, the transmission near a Bragg edge is described following Santisteban et al. (2001) as:
 
 $$
-T(\lambda) = \exp\left[-(a_0 + b_0\lambda)\right]\left(\exp\left[-(a_{hkl} + b_{hkl}\lambda)\right] + \left\{1 - \exp\left[-(a_{hkl} + b_{hkl}\lambda)\right]\right\}B_{PV}(\lambda_{hkl}, \sigma, \tau, \lambda)\right) \qquad (9)
+T(\lambda) = \exp\left[-(a_0 + b_0\lambda)\right]\left(\exp\left[-(a_{hkl} + b_{hkl}\lambda)\right] + \left(1 - \exp\left[-(a_{hkl} + b_{hkl}\lambda)\right]\right)B_{PV}(\lambda_{hkl}, \sigma, \tau, \lambda)\right) \qquad (9)
 $$
 
 where $a_0, b_0, a_{hkl}, b_{hkl}$ are empirical constants describing background attenuation and spectral slope.
