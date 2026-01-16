@@ -940,3 +940,83 @@ Runs the **entire preprocessing pipeline** in one go:
 * **FITS export**: resizing and vertical flip are **intentional**—so the saved file matches the GUI orientation and offers a standard 512×512 output for interoperability.
 
 ---
+
+# Appendix A: Fitting Functions and Logic
+
+This appendix documents the fitting functions used by NEAT and the logic of the three-stage and pattern fitting workflows as implemented in the current codebase.
+
+## A.1 Fitting functions (three regions)
+
+NEAT fits each Bragg edge using three wavelength windows (Region 1, Region 2, Region 3). The model is written in terms of wavelength `x` and is built from exponential baselines plus a pseudo-Voigt step.
+
+```
+Region 1 (pre-edge baseline):
+I1(x) = exp(-(a0 + b0 * x))
+
+Region 2 (post-edge plateau):
+I2(x) = exp(-(a0 + b0 * x)) * exp(-(a_hkl + b_hkl * x))
+
+Region 3 (edge transition):
+pre(x)  = exp(-(a_hkl + b_hkl * x))
+step(x) = (1 - eta) * G(x) + eta * L_tail(x)
+I3(x)   = exp(-(a0 + b0 * x)) * (pre(x) + (1 - pre(x)) * step(x))
+```
+
+`a0, b0` model the smooth baseline. `a_hkl, b_hkl` control the edge height (contrast between pre-edge and post-edge plateaus). `s` controls Gaussian broadening, `t` controls an exponential tail (instrument response), and `eta` is the pseudo-Voigt mixing fraction (0 = Gaussian, 1 = Lorentzian).
+
+The step terms are implemented as:
+
+```
+u    = (x - x_hkl) / (s * sqrt(2))
+G(x) = 0.5 * [erfc(-u) - exp(-(x - x_hkl)/t + s^2/(2*t^2)) * erfc(-u + s/t)]
+
+L(u)   = 0.5 + arctan(u) / pi
+u_s    = (x - x_hkl - s^2/t) / (s * sqrt(2))
+L_s    = 0.5 + arctan(u_s) / pi
+L_tail = L(u) - exp(-(x - x_hkl)/t) * (L(u) - L_s)
+```
+
+For a single edge, `x_hkl` is the theoretical edge position. If multiple edges are in range, NEAT sums their `I3(x)` contributions to form the total modeled intensity.
+
+## A.2 Edge positions from lattice parameters
+
+NEAT computes theoretical edge positions from lattice parameters using:
+
+```
+x_hkl = 2 * d_hkl
+```
+
+The spacing `d_hkl` is computed by structure type:
+
+```
+Cubic (bcc/fcc):    d_hkl = a / sqrt(h^2 + k^2 + l^2)
+Tetragonal:         d_hkl = 1 / sqrt((h^2 + k^2)/a^2 + l^2/c^2)
+Hexagonal:          d_hkl = 1 / sqrt((4/3) * (h^2 + h*k + k^2)/a^2 + l^2/c^2)
+Orthorhombic:       d_hkl = 1 / sqrt(h^2/a^2 + k^2/b^2 + l^2/c^2)
+```
+
+If the phase is unknown and no `hkl` list is provided, NEAT falls back to a single edge position derived from the fitted lattice parameter (`x_hkl = 2 * a`).
+
+## A.3 Three-stage fitting logic (single-edge mode)
+
+For each edge row in the Bragg table, NEAT performs a staged fit for stability:
+
+1) Region 1 fit: Fit `a0, b0` to `I1(x)` using the left window.
+2) Region 2 fit: Fit `a_hkl, b_hkl` to `I2(x)` using the right window, while holding `a0, b0` fixed from Region 1.
+3) Region 3 fit: Fit the edge transition in the center window using `I3(x)`:
+   - Uses Region 1/2 results to seed `a0, b0, a_hkl, b_hkl`.
+   - Refines lattice parameters (for known phases) or a single edge position (for unknown phases).
+   - `s`, `t`, and `eta` are either fixed or refined based on the "Fix s/t/eta" checkboxes.
+
+Bounds in Region 3 are set to approximately +/-50 percent around the Region 1/2 estimates for `a0, b0, a_hkl, b_hkl`, and +/-5 percent around the lattice-parameter guesses.
+
+## A.4 Pattern fitting logic (multi-edge mode)
+
+Pattern fitting refines multiple edges at once using a single least-squares solve over all Region 3 windows:
+
+- Lattice parameters are shared across all edges for the selected structure type.
+- Each edge keeps its own `a0, b0, a_hkl, b_hkl`.
+- `s`, `t`, and `eta` can be fixed globally or refined per edge.
+- Only edges with valid Region 3 data are included; edges outside the wavelength range are skipped.
+
+This mode is analogous to a global pattern refinement and is recommended once a stable single-edge fit has been obtained.
