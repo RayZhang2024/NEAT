@@ -1,5 +1,41 @@
 # NEAT User Manual
 
+## Contents
+
+- [Video tutorials are available on Youtube:](#video-tutorials-are-available-on-youtube)
+- [Example dataset for Bragg edge fitting](#example-dataset-for-bragg-edge-fitting)
+- [1. Introduction](#1-introduction)
+  - [1.1 Overview](#11-overview)
+  - [1.2 Purpose and Motivation](#12-purpose-and-motivation)
+  - [1.3 Key Features](#13-key-features)
+  - [1.4 Typical Workflow](#14-typical-workflow)
+  - [1.5 Intended Users](#15-intended-users)
+- [2. GUI Overview](#2-gui-overview)
+  - [2.1 Data Preprocessing Tab](#21-data-preprocessing-tab)
+  - [2.2 Bragg Edge Fitting Tab](#22-bragg-edge-fitting-tab)
+  - [2.3 Data Post Processing Tab](#23-data-post-processing-tab)
+- [3 Data Preprocessing](#3-data-preprocessing)
+  - [3.1 Summation](#31-summation)
+  - [3.2 Clean](#32-clean)
+  - [3.3 Overlap Correction](#33-overlap-correction)
+  - [3.4 Normalisation](#34-normalisation)
+  - [3.5 Filtering](#35-filtering)
+  - [3.6 Full Process](#36-full-process)
+- [4 Bragg Edge Fitting — step-by-step](#4-bragg-edge-fitting-step-by-step)
+  - [4.2 Load data & set experiment info](#42-load-data-set-experiment-info)
+  - [4.2 Establish a spectrum (coarse macro-pixel)](#42-establish-a-spectrum-coarse-macro-pixel)
+  - [4.3 Configure fitting windows & model parameters](#43-configure-fitting-windows-model-parameters)
+  - [4.4 Test fit on the macro-pixel](#44-test-fit-on-the-macro-pixel)
+  - [4.5 Set up full-field (map) fitting](#45-set-up-full-field-map-fitting)
+  - [4.6 Run batch fitting over ROI](#46-run-batch-fitting-over-roi)
+- [5 **Data Post-Processing**](#5-data-post-processing)
+  - [5.1 Layout & live elements](#51-layout-live-elements)
+  - [5.2 Controls (top bar)](#52-controls-top-bar)
+- [Appendix A: Fitting Functions and Logic](#appendix-a-fitting-functions-and-logic)
+  - [A.1 Fitting functions](#a1-fitting-functions)
+  - [A.2 Three-stage fitting logic](#a2-three-stage-fitting-logic)
+
+
 ## Video tutorials are available on Youtube:
 
 **Data Preprocessing:**
