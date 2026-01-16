@@ -929,68 +929,73 @@ Runs the **entire preprocessing pipeline** in one go:
 
 ---
 
+<!-- MathJax for renderers that allow HTML scripts (not rendered on GitHub). -->
+<script id="MathJax-script" async
+  src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
 # Appendix A: Fitting Functions and Logic
 
 ## A.1 Fitting functions
 
 The Bragg-edge fitting function implemented in NEAT is based on the analytical formulation of Santisteban et al. (2001), extended from the original Gaussian profile to a pseudo-Voigt form to more accurately represent asymmetric or broadened edge profiles observed in experimental data.
 
-The Bragg-edge profile is obtained by integrating the convolution of an exponential decay (representing attenuation and instrumental response) with a Gaussian peak function proposed by Kropff et al. (1982):
+In Santisteban's model, the Bragg-edge profile is obtained by integrating the convolution of an exponential decay (representing attenuation and instrumental response) with a Gaussian peak function proposed by Kropff et al. (1982):
 
-```
-R_G(λ, t) = θ(t − t₀) (1/τ) exp(−(t − t₀)/τ) ⊗ [1/(√(2π) σ)] exp(−(t − t₀)²/(2σ²))  (3)
-```
+$$
+R_G(\lambda, t) = \theta(t - t_0)\frac{1}{\tau}\exp\left(-\frac{t - t_0}{\tau}\right)\otimes \frac{1}{\sqrt{2\pi}\sigma}\exp\left[-\frac{(t - t_0)^2}{2\sigma^2}\right] \tag{3}
+$$
 
 Integration of this convolution yields the Gaussian-type Bragg-edge function:
 
-```
-B_G(λ_hkl, λ) = 1/2 [erfc(−(λ − λ_hkl)/(√2 σ)) − exp(−(λ − λ_hkl)/τ + σ²/(2τ²)) × erfc(−(λ − λ_hkl)/(√2 σ) + σ/τ)]  (4)
-```
+$$
+B_G(\lambda_{hkl}, \lambda) = \frac{1}{2}\left[\operatorname{erfc}\left(-\frac{\lambda - \lambda_{hkl}}{\sqrt{2}\sigma}\right) - \exp\left(-\frac{\lambda - \lambda_{hkl}}{\tau} + \frac{\sigma^2}{2\tau^2}\right)\operatorname{erfc}\left(-\frac{\lambda - \lambda_{hkl}}{\sqrt{2}\sigma} + \frac{\sigma}{\tau}\right)\right] \tag{4}
+$$
 
-For diffraction line shapes, a mixed Gaussian–Lorentzian representation often provides greater flexibility in describing both instrumental broadening and microstructural effects (Stephens, J. Appl. Cryst., 1999). The Lorentzian response function can be expressed as:
+For diffraction line shapes, a mixed Gaussian-Lorentzian representation often provides greater flexibility in describing both instrumental broadening and microstructural effects (Stephens, J. Appl. Cryst., 1999). The Lorentzian response function can be expressed as:
 
-```
-R_L(λ, t) = θ(t − t₀) (1/τ) exp(−(t − t₀)/τ) ⊗ [1/π] (√2 σ)/((t − t₀)² + 2σ²)  (5)
-```
+$$
+R_L(\lambda, t) = \theta(t - t_0)\frac{1}{\tau}\exp\left(-\frac{t - t_0}{\tau}\right)\otimes \frac{1}{\pi}\frac{\sqrt{2}\sigma}{(t - t_0)^2 + 2\sigma^2} \tag{5}
+$$
 
 whose integral gives the Lorentzian-type Bragg-edge function:
 
-```
-B_L(λ_hkl, λ) = L(λ_hkl, λ) − exp(−(λ − λ_hkl)/τ) × [L(λ_hkl, λ) − L(λ_hkl, λ − σ²/τ)]  (6)
+$$
+B_L(\lambda_{hkl}, \lambda) = L(\lambda_{hkl}, \lambda) - \exp\left(-\frac{\lambda - \lambda_{hkl}}{\tau}\right)\left[L(\lambda_{hkl}, \lambda) - L\left(\lambda_{hkl}, \lambda - \frac{\sigma^2}{\tau}\right)\right] \tag{6}
+$$
 
-L(λ_hkl, λ) = 1/2 + (1/π) arctan(−(λ − λ_hkl)/(√2 σ))  (7)
-```
+$$
+L(\lambda_{hkl}, \lambda) = \frac{1}{2} + \frac{1}{\pi}\arctan\left(-\frac{\lambda - \lambda_{hkl}}{\sqrt{2}\sigma}\right) \tag{7}
+$$
 
 A pseudo-Voigt Bragg-edge function is then constructed as a linear combination of the Gaussian and Lorentzian components:
 
-```
-B_PV(λ_hkl, λ) = (1 − η) B_G(λ_hkl, λ) + η B_L(λ_hkl, λ)  (8)
-```
+$$
+B_{PV}(\lambda_{hkl}, \lambda) = (1 - \eta)B_G(\lambda_{hkl}, \lambda) + \eta B_L(\lambda_{hkl}, \lambda) \tag{8}
+$$
 
-where 0 ≤ η ≤ 1 is the Lorentzian fraction controlling the relative weighting of the two contributions.
+where $0 \le \eta \le 1$ is the Lorentzian fraction controlling the relative weighting of the two contributions.
 
 Finally, the transmission near a Bragg edge is described following Santisteban et al. (2001) as:
 
-```
-T(λ) = exp[−(a₀ + b₀ λ)] (exp[−(a_hkl + b_hkl λ)] + {1 − exp[−(a_hkl + b_hkl λ)]} B_PV(λ_hkl, σ, τ, λ))  (9)
-```
+$$
+T(\lambda) = \exp\left[-(a_0 + b_0\lambda)\right]\left(\exp\left[-(a_{hkl} + b_{hkl}\lambda)\right] + \left\{1 - \exp\left[-(a_{hkl} + b_{hkl}\lambda)\right]\right\}B_{PV}(\lambda_{hkl}, \sigma, \tau, \lambda)\right) \tag{9}
+$$
 
-where a₀, b₀, a_hkl, b_hkl are empirical constants describing background attenuation and spectral slope.
+where $a_0, b_0, a_{hkl}, b_{hkl}$ are empirical constants describing background attenuation and spectral slope.
+
 
 ## A.2 Three-stage fitting logic
 
-The three-stage fitting approach proposed by Santisteban et al. (2001) is adopted. In the first stage, the parameters a₀ and b₀ are determined by fitting the linear region on the right-hand side of the Bragg edge using:
+The three-stage fitting approach proposed by Santisteban et al. (2001) is adopted. In the first stage, the parameters $a_0$ and $b_0$ are determined by fitting the linear region on the right-hand side of the Bragg edge using:
 
-```
-T(λ) = exp[−(a₀ + b₀ λ)]  (10)
-```
+$$
+T(\lambda) = \exp\left[-(a_0 + b_0\lambda)\right] \tag{10}
+$$
 
-In the second stage, the parameters a_hkl and b_hkl are obtained by fitting the left-hand side of the edge according to:
+In the second stage, the parameters $a_{hkl}$ and $b_{hkl}$ are obtained by fitting the left-hand side of the edge according to:
 
-```
-T(λ) = exp[−(a₀ + b₀ λ)] exp[−(a_hkl + b_hkl λ)]  (11)
-```
+$$
+T(\lambda) = \exp\left[-(a_0 + b_0\lambda)\right]\exp\left[-(a_{hkl} + b_{hkl}\lambda)\right] \tag{11}
+$$
 
-In the final stage, rather than fixing a₀, b₀, a_hkl and b_hkl, NEAT allows them to vary within specified bounds during the Bragg-edge fit to determine λ_hkl, σ, τ, and η in equation (9). This preserves the robustness of the original method for avoiding local minima while reducing sensitivity to the chosen left and right fitting windows. As shown in Table 1, fixing these four parameters leads to variations in λ_hkl, σ, τ depending on window selection, whereas allowing them to refine yields consistent results.
-
-
+In the final stage, rather than fixing $a_0, b_0, a_{hkl}$ and $b_{hkl}$, NEAT allows them to vary within specified bounds during the Bragg-edge fit to determine $\lambda_{hkl}, \sigma, \tau,$ and $\eta$ in equation (9). This preserves the robustness of the original method for avoiding local minima while reducing sensitivity to the chosen left and right fitting windows. 
