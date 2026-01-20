@@ -45,8 +45,6 @@ The program is particularly suited for experiments performed at energy-resolved 
 
 Bragg-edge neutron imaging (NBEI) is increasingly used to study residual stress, deformation, and phase transformation in engineering components, cultural artefacts, and advanced manufactured parts. Despite its growing importance, analysis tools remain fragmented—often requiring manual scripting for each stage of data processing.  
 
-Existing packages such as **RITS** [@Sato2011], **TPX\_EdgeFit** [@Tremsin2011], **BEATRIX** [@Minniti2019], **BEAn** [@Liptak2019], and **iBeatles** [@Bilheux2025] address parts of the workflow, but none integrate pre-processing, fitting, and map visualisation in one open-source, cross-platform environment.
-
 **NEAT** was developed to fill this gap by providing:
 - A consolidated pipeline from raw detector frames to strain or phase maps, all within a single GUI;
 - A robust analytical model and a modified three-stage optimisation strategy for stable fitting. By using a **pseudo-Voigt Bragg-edge function**, a standard in the field, it also allows users to directly compare NEAT’s output to any other similar software;
@@ -55,6 +53,11 @@ Existing packages such as **RITS** [@Sato2011], **TPX\_EdgeFit** [@Tremsin2011],
 
 Validation on benchmark iron samples at the IMAT beamline demonstrated that NEAT accurately reproduced the expected tensile–compressive strain fields and microstructural variations, while reducing analysis time from hours to minutes.  
 The tool has since been applied to projects on additively manufactured superalloys, residual-stress mapping, and cultural-heritage specimens.
+
+# State of the field:
+Existing Bragg-edge imaging tools—RITS [@Sato2011], TPX_EdgeFit [@Tremsin2011], BEATRIX [@Minniti2019], BEAn [@Liptak2019], and iBeatles [@Bilheux2025] are used and provide strong capabilities for specific stages of analysis (e.g., edge fitting, dataset handling, or selected visualisation/processing tasks). In practice, however, beamtime users often still need to stitch together multiple programs and bespoke scripts to complete an end-to-end workflow from raw time-of-flight stacks to publication-ready maps, which increases setup time, raises the barrier for non-expert users, and makes parameter provenance harder to track across datasets.
+
+NEAT was developed as a build (rather than a small contribution to an existing codebase) because the missing piece is not a single algorithmic component but an integrated and streamlined workflow that couples batch preprocessing, high-throughput fitting, and map visualisation within one open-source, cross-platform environment. This integration is the primary scholarly contribution: it standardises the analysis path and improves repeatability while enabling rapid, in-beamtime feedback through configurable throughput options.
 
 # Software Design
 
