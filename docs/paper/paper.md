@@ -80,6 +80,6 @@ The authors thank **Computing Division** at ISIS Neutron and Muon Source and **S
 
 # AI Usage Disclosure
 
-AI tools (ChatGPT, Codex) were used to assist with writing most of the code. The core philosophy and equations are from the authors. Most functions were tested by the authors and users to the best they can. ChatGPT was used to improve the language in this paper.
+AI tools (including ChatGPT and Codex) were used to assist with drafting and refining portions of the code. The core methodology, underlying equations, and overall design were developed by the authors. Most functions were implemented and tested by the authors and users to the best of their ability. ChatGPT was also used to help improve the clarity and language of this manuscript.
 
 # References
