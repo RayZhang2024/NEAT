@@ -51,9 +51,6 @@ Bragg-edge neutron imaging (NBEI) is increasingly used to study residual stress,
 - A *pattern-fitting* mode that refines multiple edges simultaneously to obtain a global lattice parameter, analogous to Pawley refinement in diffraction;
 - High-throughput mapping with **pixel-skip** and **macro-pixel** options for rapid feedback during beamtime.
 
-Validation on benchmark iron samples at the IMAT beamline demonstrated that NEAT accurately reproduced the expected tensile–compressive strain fields and microstructural variations, while reducing analysis time from hours to minutes.  
-The tool has since been applied to projects on additively manufactured superalloys, residual-stress mapping, and cultural-heritage specimens.
-
 # State of the field:
 Existing Bragg-edge imaging tools—RITS [@Sato2011], TPX_EdgeFit [@Tremsin2011], BEATRIX [@Minniti2019], BEAn [@Liptak2019], and iBeatles [@Bilheux2025] are used and provide strong capabilities for specific stages of analysis (e.g., edge fitting, dataset handling, or selected visualisation/processing tasks). In practice, however, beamtime users often still need to stitch together multiple programs and bespoke scripts to complete an end-to-end workflow from raw time-of-flight stacks to publication-ready maps, which increases setup time, raises the barrier for non-expert users, and makes parameter provenance harder to track across datasets.
 
