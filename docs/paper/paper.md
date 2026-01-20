@@ -58,11 +58,13 @@ The tool has since been applied to projects on additively manufactured superallo
 
 # Software Design
 
-NEAT is designed as a GUI-first, end-to-end workflow for beamtime users who need reliable results quickly without maintaining bespoke scripts. The main trade-off was usability versus low-level flexibility: a GUI reduces scripting burden and training time, but it requires careful defaults and parameter exposure. We address this with a guided pipeline that exposes key choices (preprocessing, fitting model, mapping resolution) while keeping a single data path from raw time-of-flight stacks to publication-ready maps.
+NEAT is designed as a GUI-first, streamlined end-to-end workflow for Bragg-edge imaging users, covering data preprocessing, Bragg-edge fitting, and result illustration in one consistent pipeline. By avoiding multiple software packages and bespoke scripts, it lowers the barrier for new users, reduces training time, and improves reproducibility while still exposing key choices (e.g., preprocessing, fitting model, mapping resolution).
 
-Fitting uses a pseudo-Voigt Bragg-edge model and a three-stage optimization strategy selected for stability across noisy, low-count pixels, at the cost of extra compute. To keep throughput practical, macro-pixel and pixel-skip options trade spatial resolution for speed, and a multi-edge pattern-fitting mode mirrors diffraction-style fitting to stabilize lattice-parameter estimates.
+To accelerate routine work, NEAT provides batch preprocessing, enabling multiple datasets to be processed in a single run with consistent settings.
 
-Build vs. contribute: existing tools (**RITS** [@Sato2011], **TPX\_EdgeFit** [@Tremsin2011], **BEATRIX** [@Minniti2019], **BEAn** [@Liptak2019], and **iBeatles** [@Bilheux2025]) cover parts of the workflow but lack a unified, cross-platform GUI that integrates preprocessing, fitting, and mapping in one reproducible pipeline. Contributing to them would not achieve the goal of NEAT without modifying those packages significantly.
+For rapid mapping during beamtime, NEAT supports high-throughput fitting via macro-pixel and pixel-skip options, trading spatial resolution for speed. The reduced time-to-map helps users evaluate results quickly and optimize experiments while on the beamline.
+
+Fitting is based on a pseudo-Voigt Bragg-edge model with a three-stage optimization strategy to improve accuracy and repeatability, especially for noisy or low-count pixels. A multi-edge pattern-fitting mode further stabilizes lattice-parameter estimates by fitting multiple edges jointly, analogous to diffraction-style pattern refinement.
 
 # Research Impact Statement
 
