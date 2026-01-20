@@ -56,25 +56,19 @@ Existing packages such as **RITS** [@Sato2011], **TPX\_EdgeFit** [@Tremsin2011],
 Validation on benchmark iron samples at the IMAT beamline demonstrated that NEAT accurately reproduced the expected tensile–compressive strain fields and microstructural variations, while reducing analysis time from hours to minutes.  
 The tool has since been applied to projects on additively manufactured superalloys, residual-stress mapping, and cultural-heritage specimens.
 
-# Functionality Overview
+# Software Design
 
-- **Automated preprocessing:** run summation, pixel cleaning, overlap (pile-up) correction, and normalisation with optional binary masking.  
-- **Edge fitting:** individual or multi-edge pattern fitting using pseudo-Voigt profiles to extract lattice spacing, strain, edge width, and edge height.  
-- **Post-processing and visualisation:** immediate 2-D maps and line-profiles of fitted parameters for interpretation and publication.
+NEAT is designed as a GUI-first, end-to-end workflow for beamtime users who need reliable results quickly without maintaining bespoke scripts. The main trade-off was usability versus low-level flexibility: a GUI reduces scripting burden and training time, but it requires careful defaults and parameter exposure. We address this with a guided pipeline that exposes key choices (preprocessing, fitting model, mapping resolution) while keeping a single data path from raw time-of-flight stacks to publication-ready maps.
 
-Detailed explanations and instructions for each function can be found in the **user manual** (https://github.com/RayZhang2024/NEAT/blob/main/User%20manual.md)
+Fitting uses a pseudo-Voigt Bragg-edge model and a three-stage optimization strategy selected for stability across noisy, low-count pixels, at the cost of extra compute. To keep throughput practical, macro-pixel and pixel-skip options trade spatial resolution for speed, and a multi-edge pattern-fitting mode mirrors diffraction-style fitting to stabilize lattice-parameter estimates.
 
-# Example of Use
+Build vs. contribute: existing tools (**RITS** [@Sato2011], **TPX\_EdgeFit** [@Tremsin2011], **BEATRIX** [@Minniti2019], **BEAn** [@Liptak2019], and **iBeatles** [@Bilheux2025]) cover parts of the workflow but lack a unified, cross-platform GUI that integrates preprocessing, fitting, and mapping in one reproducible pipeline. Contributing to them would not achieve the goal of NEAT without modifying those packages significantly.
 
-To demonstrate NEAT’s workflow, we analysed Bragg-edge imaging data collected from a U-shaped iron specimen measured at the IMAT beamline (ISIS, UK). The sample was bent to U-shape from a straight bar, leaving residual stress / strain in the bend [@Haribabu2024]. 
+# Research Impact Statement
 
-The raw time-of-flight image stacks were loaded into NEAT, where the runs were automatically summed, cleaned, and normalised using the built-in preprocessing pipeline.  
+NEAT has demonstrated realized impact through validated analyses on benchmark iron samples [@Haribabu2024] at the IMAT beamline, where it reproduced expected tensile and compressive strain fields and microstructural variations while reducing analysis time from hours to minutes (*Figure 1*). It is now used in multiple ongoing IMAT experiments, including composition studies in battery electrolytes and strain mapping in Eurofer97 steel (a fusion-reactor material), showing that the tool generalizes across materials and use cases. The reduced time-to-map enables decisions during beamtime and shortens iteration cycles for experiments.
 
-After selecting the Fe-bcc phase, a macro-pixel region of 20 x 20 pixels was defined to extract the transmission spectrum, and the 110, 200, and 211 Bragg edges were fitted using the multi-edge (“pattern”) modes with a pseudo-Voigt profile.  
-
-The automated batch-fitting routine then produced two-dimensional maps of lattice spacing, Bragg-edge width, and edge height across the sample within minutes.
-
-The resulting lattice-parameter map revealed tensile regions (red) along the inner bend and compressive regions (blue) along the outer bend, consistent with the expected plastic bending behaviour (*Figure 1*). In addition to lattice spacing mapping, NEAT quantifies Bragg-edge width and height, which provide complementary information on microstructural evolution due to plastic deformation induced by bending. These results have been validated through the use of other similar software, FEA modelling and have been replicated at other facilities as part of a round-robin measurement campaign to compare the performances of various neutron instruments.
+In the near term, NEAT provides a novel capability for the community: a reproducible, end-to-end Bragg-edge imaging analysis pipeline that integrates preprocessing, fitting, and mapping in a single open-source tool. The project includes user-facing **user manual** (https://github.com/RayZhang2024/NEAT/blob/main/User%20manual.md), lowering the barrier for users to adopt consistent analysis practices across different facilities. By standardizing a workflow that previously required multiple scripts and tools, NEAT enables more reliable, shareable results and accelerates experimental feedback during beamtime.
 
 ![Example](Example.png)
 **Figure 1:** From left to right, fitted lattice parameter, 110 edge width and 110 edge height of the U-shape bent sample.
@@ -84,5 +78,8 @@ The resulting lattice-parameter map revealed tensile regions (red) along the inn
 This work was supported by the **Engineering and Imaging Group** at the **ISIS Neutron and Muon Source**, Science and Technology Facilities Council (STFC), United Kingdom.  
 The authors thank **Computing Division** at ISIS Neutron and Muon Source and **Scientific Computing Department** of STFC for their technical support, and the **IMAT user community** for their valuable feedback during development and testing.
 
-# References
+# AI Usage Disclosure
 
+AI tools (ChatGPT, Codex) were used to assist with writing most of the code. The core philosophy and equations are from the authors. Most functions were tested by the authors and users to the best they can. ChatGPT was used to improve the language in this paper.
+
+# References
