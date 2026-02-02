@@ -45,9 +45,15 @@ The program is particularly suited for experiments performed at energy-resolved 
 
 Bragg-edge neutron imaging (NBEI) is increasingly used to study residual stress, deformation, and phase transformation in engineering components, cultural artefacts, and advanced manufactured parts. Despite its growing importance, analysis tools remain fragmented—often requiring manual scripting for each stage of data processing.  
 
-Existing Bragg-edge imaging tools—RITS [@Sato2011], TPX_EdgeFit [@Tremsin2011], BEATRIX [@Minniti2019], BEAn [@Liptak2019], and iBeatles [@Bilheux2025] are used and provide strong capabilities for specific stages of analysis (e.g., edge fitting, dataset handling, or selected visualisation/processing tasks). In practice, however, beamtime users often still need to stitch together multiple programs and/or bespoke scripts to complete an end-to-end workflow from raw time-of-flight stacks to publication-ready maps, which increases setup time, raises the barrier for non-expert users, and makes parameter provenance harder to track across datasets.
+Beamtime teams therefore juggle facility-specific reduction macros, bespoke Python notebooks, and manual quality-control checks to traverse calibration, fitting, and figure generation. This multi-hop workflow slows in-situ decision making, raises the entry barrier for visiting users, and makes provenance tracking brittle across datasets.
 
 NEAT was developed as a build of an integrated and streamlined workflow that couples batch preprocessing, high-throughput fitting, and map visualisation within one open-source, cross-platform environment. This integration is the primary scholarly contribution: it standardises the analysis path and improves repeatability while enabling rapid, in-beamtime feedback through configurable throughput options.
+
+# State of the Field
+
+Existing Bragg-edge packages each target a narrow slice of the workflow: RITS/GUI-RITS delivers Rietveld-style spectrum fitting for texture and microstructure inference but leaves detector conditioning and mapping to ancillary scripts [@Sato2011]. TPX_EdgeFit [@Tremsin2011] and iBeatles [@Bilheux2025] streamline macro-pixel edge fitting and strain-map display through GUIs that prioritise throughput over facility-agnostic preprocessing. BEATRIX [@Minniti2019] supplies a C++ engine to scale compute-heavy fitting on megapixel time-of-flight stacks, while BEAn [@Liptak2019] offers a Python+Qt toolkit aligned with IMAT reduction steps yet still exports intermediate products for downstream visualisation.
+
+NEAT adopts a build-and-bridge strategy: it imports detector-derived spectra and delivers overlap correction, normalisation, batch fitting, and publication-ready mapping in a single GUI. By integrating these steps into one streamlined, end-to-end workflow, NEAT demonstrates why contributing to any single niche package would not meet the community’s need for a cohesive detector-to-publication solution.
 
 # Software Design
 
