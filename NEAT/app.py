@@ -42,19 +42,77 @@ def _load_launch_splash_pixmap():
     return None
 
 
+def _screen_device_pixel_ratio() -> float:
+    """Return the primary screen device pixel ratio."""
+    app = QApplication.instance()
+    if app is None:
+        return 1.0
+    screen = app.primaryScreen()
+    if screen is None:
+        return 1.0
+    # Prefer floating-point DPR where available.
+    dpr_fn = getattr(screen, "devicePixelRatio", None)
+    if callable(dpr_fn):
+        try:
+            dpr = float(dpr_fn())
+            if dpr > 0:
+                return dpr
+        except (TypeError, ValueError):
+            pass
+    return 1.0
+
+
+def _prepare_splash_pixmap_for_display(source: QPixmap, max_width: int, max_height: int) -> QPixmap:
+    """
+    Prepare splash pixmap for crisp display on HiDPI screens while keeping
+    approximately the same logical on-screen size as legacy behavior.
+    """
+    if source.isNull():
+        return source
+
+    src_w = source.width()
+    src_h = source.height()
+
+    # Legacy logical size cap.
+    logical_pixmap = source
+    if src_w > max_width or src_h > max_height:
+        logical_pixmap = source.scaled(
+            max_width,
+            max_height,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+    logical_w = max(1, logical_pixmap.width())
+    logical_h = max(1, logical_pixmap.height())
+
+    # Determine how much HiDPI density the source can support at this logical size.
+    screen_dpr = _screen_device_pixel_ratio()
+    source_supported_dpr = min(src_w / logical_w, src_h / logical_h)
+    effective_dpr = min(screen_dpr, source_supported_dpr)
+
+    if effective_dpr <= 1.0:
+        return logical_pixmap
+
+    target_w = max(1, int(round(logical_w * effective_dpr)))
+    target_h = max(1, int(round(logical_h * effective_dpr)))
+    hidpi_pixmap = source.scaled(
+        target_w,
+        target_h,
+        Qt.KeepAspectRatio,
+        Qt.SmoothTransformation,
+    )
+    hidpi_pixmap.setDevicePixelRatio(effective_dpr)
+    return hidpi_pixmap
+
+
 def create_launch_splash():
     """Create and show the startup splash screen."""
     pixmap = _load_launch_splash_pixmap()
     if pixmap is not None:
         max_width = 1100
         max_height = 720
-        if pixmap.width() > max_width or pixmap.height() > max_height:
-            pixmap = pixmap.scaled(
-                max_width,
-                max_height,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
+        pixmap = _prepare_splash_pixmap_for_display(pixmap, max_width, max_height)
     else:
         pixmap = QPixmap(520, 260)
         pixmap.fill(QColor("#1f2933"))

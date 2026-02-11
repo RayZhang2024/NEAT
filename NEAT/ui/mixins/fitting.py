@@ -153,6 +153,7 @@ class FittingMixin:
         """
         self.plot_font_size = getattr(self, "plot_font_size", 12)
         self.symbol_size = getattr(self, "symbol_size", 4)
+        self._fit_canvas_nav_state = {}
 
         main_layout = QHBoxLayout(self.FittingTab)  # Main horizontal layout
 
@@ -504,6 +505,7 @@ class FittingMixin:
         plots_layout.addWidget(self.plot_canvas_b, 0, 1)
         plots_layout.addWidget(self.plot_canvas_c, 1, 0)
         plots_layout.addWidget(self.plot_canvas_d, 1, 1)
+        self._connect_fit_canvas_interactions()
 
         upper_right_layout.addLayout(plots_layout)
         upper_right_widget.setMinimumSize(200, 200)
@@ -1529,7 +1531,8 @@ class FittingMixin:
                 self.selected_region_y,
                 'o',
                 markersize=getattr(self, "symbol_size", 4),
-                color='blue',
+                markerfacecolor='blue',
+                markeredgecolor='none',
                 # label='Experimental Data'
             )
             # Fitted model
@@ -2694,6 +2697,163 @@ class FittingMixin:
         ax.set_ylim(new_y0, new_y1)
         self.canvas.draw_idle()
 
+    def _connect_fit_canvas_interactions(self):
+        """Attach wheel-zoom and drag-pan handlers to fitting result canvases."""
+        for canvas in (
+            getattr(self, "plot_canvas_a", None),
+            getattr(self, "plot_canvas_b", None),
+            getattr(self, "plot_canvas_c", None),
+            getattr(self, "plot_canvas_d", None),
+        ):
+            if canvas is None or getattr(canvas, "_fit_nav_connected", False):
+                continue
+            self._fit_canvas_nav_state[id(canvas)] = {
+                "panning": False,
+                "active_axis": None,
+                "start_xdata": None,
+                "start_ydata": None,
+                "start_xlim": None,
+                "start_main_ylim": None,
+                "start_residual_ylim": None,
+            }
+            canvas.mpl_connect(
+                "button_press_event",
+                lambda event, target=canvas: self._on_fit_canvas_press(target, event),
+            )
+            canvas.mpl_connect(
+                "motion_notify_event",
+                lambda event, target=canvas: self._on_fit_canvas_motion(target, event),
+            )
+            canvas.mpl_connect(
+                "button_release_event",
+                lambda event, target=canvas: self._on_fit_canvas_release(target, event),
+            )
+            canvas.mpl_connect(
+                "scroll_event",
+                lambda event, target=canvas: self._on_fit_canvas_scroll(target, event),
+            )
+            canvas._fit_nav_connected = True
+
+    def _fit_canvas_state(self, canvas):
+        """Return mutable navigation state for one fitting canvas."""
+        if not hasattr(self, "_fit_canvas_nav_state"):
+            self._fit_canvas_nav_state = {}
+        return self._fit_canvas_nav_state.setdefault(
+            id(canvas),
+            {
+                "panning": False,
+                "active_axis": None,
+                "start_xdata": None,
+                "start_ydata": None,
+                "start_xlim": None,
+                "start_main_ylim": None,
+                "start_residual_ylim": None,
+            },
+        )
+
+    def _on_fit_canvas_press(self, canvas, event):
+        """Start drag-pan on a fitting canvas."""
+        if event.button != 1:
+            return
+        main_ax, residual_ax = self._ensure_fit_canvas_axes(canvas)
+        if event.inaxes not in (main_ax, residual_ax):
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        state = self._fit_canvas_state(canvas)
+        state["panning"] = True
+        state["active_axis"] = "main" if event.inaxes is main_ax else "residual"
+        state["start_xdata"] = event.xdata
+        state["start_ydata"] = event.ydata
+        state["start_xlim"] = main_ax.get_xlim()
+        state["start_main_ylim"] = main_ax.get_ylim()
+        state["start_residual_ylim"] = residual_ax.get_ylim()
+
+    def _on_fit_canvas_motion(self, canvas, event):
+        """Apply drag-pan to fitting canvas (x is shared between main and residual)."""
+        state = self._fit_canvas_state(canvas)
+        if not state.get("panning"):
+            return
+        main_ax, residual_ax = self._ensure_fit_canvas_axes(canvas)
+        if event.inaxes not in (main_ax, residual_ax):
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        if state["start_xdata"] is None or state["start_xlim"] is None:
+            return
+
+        dx = event.xdata - state["start_xdata"]
+        x0, x1 = state["start_xlim"]
+        main_ax.set_xlim(x0 - dx, x1 - dx)
+
+        dy = event.ydata - state["start_ydata"]
+        if state.get("active_axis") == "main" and state.get("start_main_ylim") is not None:
+            y0, y1 = state["start_main_ylim"]
+            main_ax.set_ylim(y0 - dy, y1 - dy)
+        elif state.get("active_axis") == "residual" and state.get("start_residual_ylim") is not None:
+            y0, y1 = state["start_residual_ylim"]
+            residual_ax.set_ylim(y0 - dy, y1 - dy)
+
+        canvas.draw_idle()
+
+    def _on_fit_canvas_release(self, canvas, _event):
+        """End drag-pan on a fitting canvas."""
+        state = self._fit_canvas_state(canvas)
+        state["panning"] = False
+        state["active_axis"] = None
+        state["start_xdata"] = None
+        state["start_ydata"] = None
+        state["start_xlim"] = None
+        state["start_main_ylim"] = None
+        state["start_residual_ylim"] = None
+
+    @staticmethod
+    def _zoom_axis_limits(a0, a1, center, scale):
+        """Return zoomed limits around center while preserving axis direction."""
+        inverted = a0 > a1
+        lo, hi = (a1, a0) if inverted else (a0, a1)
+        span = hi - lo
+        if span <= 0:
+            return a0, a1
+
+        if center is None:
+            center = (lo + hi) / 2.0
+        rel = (center - lo) / span
+        rel = min(max(rel, 0.0), 1.0)
+
+        new_span = span * scale
+        new_lo = center - new_span * rel
+        new_hi = center + new_span * (1.0 - rel)
+
+        if abs(new_hi - new_lo) < 1e-12:
+            return a0, a1
+        return (new_hi, new_lo) if inverted else (new_lo, new_hi)
+
+    def _on_fit_canvas_scroll(self, canvas, event):
+        """Zoom a fitting canvas with mouse wheel. X zoom is shared with residual."""
+        if event.button not in ("up", "down"):
+            return
+        main_ax, residual_ax = self._ensure_fit_canvas_axes(canvas)
+        if event.inaxes not in (main_ax, residual_ax):
+            return
+
+        state = self._fit_canvas_state(canvas)
+        if state.get("panning"):
+            return
+
+        scale = 0.9 if event.button == "up" else 1.1
+        x0, x1 = main_ax.get_xlim()
+        x_center = event.xdata if event.xdata is not None else (x0 + x1) / 2.0
+        new_x0, new_x1 = self._zoom_axis_limits(x0, x1, x_center, scale)
+        main_ax.set_xlim(new_x0, new_x1)
+
+        target_ax = main_ax if event.inaxes is main_ax else residual_ax
+        y0, y1 = target_ax.get_ylim()
+        y_center = event.ydata if event.ydata is not None else (y0 + y1) / 2.0
+        new_y0, new_y1 = self._zoom_axis_limits(y0, y1, y_center, scale)
+        target_ax.set_ylim(new_y0, new_y1)
+        canvas.draw_idle()
+
     def _sync_selected_area_inputs(self):
         """Keep coordinate text boxes in sync with the current ROI."""
         if not self.selected_area:
@@ -2890,7 +3050,7 @@ class FittingMixin:
             zero_line.set_gid("residual_zero")
 
         residual = y_arr - y_fit_arr
-        residual_ax.plot(x_arr, residual, color="#444444", linewidth=1.0, alpha=0.95)
+        residual_ax.plot(x_arr, residual, color="#444444", linewidth=0.5, alpha=0.95)
 
     def update_plots(self):
         if not self.images or not self.selected_area:
@@ -2958,7 +3118,8 @@ class FittingMixin:
             self.selected_region_y,
             'o',
             markersize=getattr(self, "symbol_size", 4),
-            color='blue',
+            markerfacecolor='blue',
+            markeredgecolor='none',
             # label='Experimental Data'
         )
 
@@ -3077,6 +3238,24 @@ class FittingMixin:
         for rows that have valid (non-empty) data in all required columns.
         """
         self.message_box.append("---------- Starting individual edges fitting ----------")
+
+        # Start each run from clean region canvases so previous fits do not accumulate.
+        for region_name, canvas in (
+            ("Region 1", self.plot_canvas_b),
+            ("Region 2", self.plot_canvas_c),
+            ("Region 3", self.plot_canvas_d),
+        ):
+            ax_main, _ = self._initialize_fit_canvas(canvas)
+            ax_main.text(
+                0.98,
+                0.98,
+                region_name,
+                transform=ax_main.transAxes,
+                ha="right",
+                va="top",
+                fontsize=getattr(self, "plot_font_size", 12),
+            )
+            canvas.draw()
 
         # We'll limit to at most 5 rows, as in your original code:
         max_rows = min(5, self.bragg_table.rowCount())

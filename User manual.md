@@ -837,6 +837,25 @@ Runs the **entire preprocessing pipeline** in one go:
 2. Enter **flight path** (it's default to 56.4 m which is an often used filght path at IMAT, ask scientist if you don't know the filght path of your experiment).
 3. (Optional) **Select phase / material** so NEAT can list the theoretical **Bragg edges (hkl)** in the **Edge Table** for your wavelength range.
 
+### Manual anchors in Config (when no spectra file is available)
+
+If a valid spectra text file is not found/readable, NEAT switches to **manual wavelength mode**. In this mode, use the **Manual anchors** section in the Config dialog to define how image index maps to wavelength.
+
+1. In each anchor row:
+   * **Image #**: 1-based image index.
+   * **Suffix**: file-style index preview (e.g., Image #1 -> `_00000`).
+   * **Wavelength (Å)** or **ToF (ms)** value: depending on the mode selector above the anchor table.
+2. Leave **Image #** as **Unused** to skip that row.
+3. Use at least **two anchors** for a meaningful wavelength curve.
+
+How NEAT uses anchors:
+
+* **Wavelength mode**: anchor values are used directly as wavelengths.
+* **ToF mode**: anchor values are converted to wavelength using current **flight path** and **time delay**.
+* Wavelengths for all images are then computed by **linear interpolation** between anchors.
+* If only one anchor is provided, NEAT assigns that single wavelength to all images.
+* If an anchor image index exceeds the number of loaded images, NEAT clamps it to the last image.
+
 ## 4.2 Establish a spectrum (coarse macro-pixel)
 
 1. Entre min/max x and y coordinates to **define a macro-pixel** to boost SNR.
