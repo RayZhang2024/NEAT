@@ -1318,6 +1318,8 @@ class FittingMixin:
         order = np.argsort(concatenated_x)
         sorted_x = concatenated_x[order]
         sorted_y = model_vals[order]
+        sorted_x_exp = concatenated_x[order]
+        sorted_y_exp = concatenated_y[order]
 
         # We'll also return the entire (x_data, y_data) for plotting
         # x_data => sorted_x, y_data => sorted_y
@@ -1340,6 +1342,8 @@ class FittingMixin:
             'eta_uncertainties': eta_unc_dict,                  # <--- newly added
             'x_data': sorted_x,                             # <--- for plotting
             'y_data': sorted_y,
+            'x_exp_sorted': sorted_x_exp,
+            'y_exp_sorted': sorted_y_exp,
             'residuals': final_res,
             'success': result.success,
             'message': result.message
@@ -1517,10 +1521,10 @@ class FittingMixin:
 
         # 8) Plot if not skipping
         if not skip_plot:
-            self.plot_canvas_a.axes.clear()
+            ax_main_a, _ = self._initialize_fit_canvas(self.plot_canvas_a)
             # Original data for the "selected region"
             # (Assuming you have self.selected_region_x, etc.)
-            self.plot_canvas_a.axes.plot(
+            ax_main_a.plot(
                 self.selected_region_x,
                 self.selected_region_y,
                 'o',
@@ -1531,7 +1535,7 @@ class FittingMixin:
             # Fitted model
             x_fit = result_dict['x_data']
             y_fit = result_dict['y_data']
-            self.plot_canvas_a.axes.plot(
+            ax_main_a.plot(
                 x_fit,
                 y_fit,
                 'r-',
@@ -1542,9 +1546,9 @@ class FittingMixin:
             if self.show_theoretical_checkbox.isChecked():
                 edges_in_range = self.get_edges_in_range(min_wavelength, max_wavelength)
                 for (hkl, x_hkl) in edges_in_range:
-                    self.plot_canvas_a.axes.axvline(x=x_hkl, color='red', linestyle='--')
-                    y_max = self.plot_canvas_a.axes.get_ylim()[1]
-                    self.plot_canvas_a.axes.text(
+                    ax_main_a.axvline(x=x_hkl, color='red', linestyle='--')
+                    y_max = ax_main_a.get_ylim()[1]
+                    ax_main_a.text(
                         x_hkl * 1.02,
                         y_max * 0.95,
                         f'hkl{hkl}',
@@ -1553,13 +1557,11 @@ class FittingMixin:
                         color='red',
                         fontsize=getattr(self, "plot_font_size", 12),
                     )
-
-            self.plot_canvas_a.axes.set_xlabel("Wavelength (Å)")
-            self.plot_canvas_a.axes.set_ylabel("Summed Intensity")
-            self.plot_canvas_a.axes.set_title(
-                f"Fit Results - {structure_type.capitalize()} Structure",
-                fontsize=getattr(self, "plot_font_size", 12),
-            )
+            x_obs = result_dict.get("x_exp_sorted", x_fit)
+            y_obs = result_dict.get("y_exp_sorted")
+            if y_obs is None:
+                y_obs = np.interp(x_fit, self.selected_region_x, self.selected_region_y)
+            self._plot_residual_line(self.plot_canvas_a, x_obs, y_obs, y_fit)
             self.plot_canvas_a.draw()
 
         # 9) Re-enable UI elements
@@ -2794,6 +2796,102 @@ class FittingMixin:
             ymax = min(img_h, max(int(round(y)), ymin + min_h))
         return (xmin, xmax, ymin, ymax)
 
+    def _ensure_fit_canvas_axes(self, canvas):
+        """Ensure a fitting canvas has a main axis and a residual axis."""
+        fig = canvas.fig
+        main_ax = getattr(canvas, "axes", None)
+        residual_ax = getattr(canvas, "residual_axes", None)
+
+        valid_axes = (
+            main_ax is not None
+            and residual_ax is not None
+            and main_ax in fig.axes
+            and residual_ax in fig.axes
+        )
+        if not valid_axes:
+            fig.clf()
+            grid = fig.add_gridspec(2, 1, height_ratios=[4, 1], hspace=0.0)
+            main_ax = fig.add_subplot(grid[0, 0])
+            residual_ax = fig.add_subplot(grid[1, 0], sharex=main_ax)
+            canvas.axes = main_ax
+            canvas.residual_axes = residual_ax
+
+        residual_ax.set_xlabel(self._fit_canvas_xlabel(canvas))
+        return main_ax, residual_ax
+
+    def _fit_canvas_xlabel(self, canvas):
+        """Return residual x-axis label text for a fit canvas based on its 2x2 position."""
+        top_row = (
+            getattr(self, "plot_canvas_a", None),
+            getattr(self, "plot_canvas_b", None),
+        )
+        if canvas in top_row:
+            return ""
+        return "Wavelength (A)"
+
+    def _initialize_fit_canvas(self, canvas, title=None):
+        """Clear and initialize a fit canvas with an empty residual panel."""
+        main_ax, residual_ax = self._ensure_fit_canvas_axes(canvas)
+        main_ax.clear()
+        residual_ax.clear()
+
+        font_size = getattr(self, "plot_font_size", 12)
+        residual_font_size = font_size
+
+        if title:
+            main_ax.set_title(title, fontsize=font_size)
+        main_ax.set_ylabel("")
+        main_ax.tick_params(axis="both", labelsize=font_size, direction="in")
+        main_ax.tick_params(axis="x", labelbottom=False, direction="in")
+        main_ax.xaxis.label.set_size(font_size)
+        main_ax.yaxis.label.set_size(font_size)
+
+        zero_line = residual_ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8)
+        zero_line.set_gid("residual_zero")
+        residual_ax.set_ylabel("")
+        residual_ax.set_xlabel(self._fit_canvas_xlabel(canvas), fontsize=residual_font_size)
+        residual_ax.tick_params(axis="both", labelsize=residual_font_size, direction="in")
+        residual_ax.xaxis.label.set_size(residual_font_size)
+        residual_ax.yaxis.label.set_size(residual_font_size)
+
+        # Reserve enough figure margins for axis labels/titles in 2x2 plot layout.
+        left_margin = min(0.28, max(0.18, 0.12 + 0.006 * font_size))
+        bottom_margin = min(0.30, max(0.16, 0.10 + 0.006 * font_size))
+        canvas.fig.subplots_adjust(
+            left=left_margin,
+            right=0.98,
+            top=0.96,
+            bottom=bottom_margin,
+            hspace=0.0,
+        )
+
+        return main_ax, residual_ax
+
+    def _plot_residual_line(self, canvas, x_data, y_data, y_fit):
+        """Plot residual line (data - fit) on the residual axis of a fit canvas."""
+        _, residual_ax = self._ensure_fit_canvas_axes(canvas)
+        x_arr = np.asarray(x_data)
+        y_arr = np.asarray(y_data)
+        y_fit_arr = np.asarray(y_fit)
+        if x_arr.size == 0 or y_arr.size == 0 or y_fit_arr.size == 0:
+            return
+
+        n_points = min(x_arr.size, y_arr.size, y_fit_arr.size)
+        if n_points == 0:
+            return
+
+        x_arr = x_arr[:n_points]
+        y_arr = y_arr[:n_points]
+        y_fit_arr = y_fit_arr[:n_points]
+
+        has_zero_line = any(line.get_gid() == "residual_zero" for line in residual_ax.lines)
+        if not has_zero_line:
+            zero_line = residual_ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8)
+            zero_line.set_gid("residual_zero")
+
+        residual = y_arr - y_fit_arr
+        residual_ax.plot(x_arr, residual, color="#444444", linewidth=1.0, alpha=0.95)
+
     def update_plots(self):
         if not self.images or not self.selected_area:
             return
@@ -2854,8 +2952,8 @@ class FittingMixin:
             self.message_box.append("Select a Bragg Edge to display the regions")
 
         # Plot (a): Intensity vs Wavelength
-        self.plot_canvas_a.axes.clear()
-        self.plot_canvas_a.axes.plot(
+        ax_a, _ = self._initialize_fit_canvas(self.plot_canvas_a)
+        ax_a.plot(
             self.selected_region_x,
             self.selected_region_y,
             'o',
@@ -2868,15 +2966,15 @@ class FittingMixin:
         edges_in_range = self.get_edges_in_range(min_wavelength, max_wavelength) if self.show_theoretical_checkbox.isChecked() else []
         for (hkl, x_hkl) in edges_in_range:
             # Plot vertical dashed line for the theoretical Bragg edge
-            self.plot_canvas_a.axes.axvline(
+            ax_a.axvline(
                 x=x_hkl,
                 color='red',
                 linestyle='--',
                 # label='Theoretical Bragg Edge'
             )
             # Annotate the (h, k, l) index near the top of the plot
-            y_max = self.plot_canvas_a.axes.get_ylim()[1]
-            self.plot_canvas_a.axes.text(
+            y_max = ax_a.get_ylim()[1]
+            ax_a.text(
                 x_hkl * 1.02,
                 y_max * 0.95,  # Position text slightly below the top
                 f'hkl{hkl}',
@@ -2886,15 +2984,8 @@ class FittingMixin:
                 fontsize=getattr(self, "plot_font_size", 12),
             )
 
-        self.plot_canvas_a.axes.set_xlabel("Wavelength (Å)")
-        self.plot_canvas_a.axes.set_ylabel("Summed Intensity")
-        self.plot_canvas_a.axes.set_title(
-            "Intensity vs Wavelength",
-            fontsize=getattr(self, "plot_font_size", 12),
-        )
-
         # **Handle Legend to Avoid Duplicate Labels**
-        handles, labels = self.plot_canvas_a.axes.get_legend_handles_labels()
+        handles, labels = ax_a.get_legend_handles_labels()
         unique_labels = []
         unique_handles = []
         for handle, label in zip(handles, labels):
@@ -2932,18 +3023,21 @@ class FittingMixin:
                 region_y = self.intensities[region_mask]
 
 
-                canvas.axes.clear()
-                canvas.axes.plot(
+                ax_main, _ = self._initialize_fit_canvas(canvas)
+                ax_main.plot(
                     region_x,
                     region_y,
                     'o',
                     markersize=getattr(self, "symbol_size", 4),
                     # label=name
                 )
-                canvas.axes.set_xlabel("Wavelength (Å)")
-                canvas.axes.set_ylabel("Summed Intensity")
-                canvas.axes.set_title(
-                    f"Intensity Profile of {name}",
+                ax_main.text(
+                    0.98,
+                    0.98,
+                    name,
+                    transform=ax_main.transAxes,
+                    ha="right",
+                    va="top",
                     fontsize=getattr(self, "plot_font_size", 12),
                 )
                 # canvas.axes.legend()
@@ -3133,7 +3227,8 @@ class FittingMixin:
                 return
 
             if not skip_ui_updates:
-                self.plot_canvas_c.axes.plot(
+                ax_r1_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_c)
+                ax_r1_main.plot(
                     x_r1,
                     y_r1,
                     'o',
@@ -3150,9 +3245,11 @@ class FittingMixin:
             fit_y1 = fitting_function_1(x_r1, *popt_r1)
 
             if not skip_ui_updates:
-                self.plot_canvas_c.axes.plot(x_r1, fit_y1, 'r-', 
+                ax_r1_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_c)
+                ax_r1_main.plot(x_r1, fit_y1, 'r-', 
                                              # label=f"Edge {row_number + 1} Fit R1"
                                              )
+                self._plot_residual_line(self.plot_canvas_c, x_r1, y_r1, fit_y1)
                 # self.plot_canvas_c.axes.legend()
                 self.plot_canvas_c.draw()
                 self.message_box.append(
@@ -3185,7 +3282,8 @@ class FittingMixin:
                 return
 
             if not skip_ui_updates:
-                self.plot_canvas_b.axes.plot(
+                ax_r2_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_b)
+                ax_r2_main.plot(
                     x_r2,
                     y_r2,
                     'o',
@@ -3203,10 +3301,12 @@ class FittingMixin:
             fit_y2 = fitting_function_2(x_r2, *popt_r2, a0, b0)
 
             if not skip_ui_updates:
-                self.plot_canvas_b.axes.plot(
+                ax_r2_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_b)
+                ax_r2_main.plot(
                     x_r2, fit_y2, 'r-', 
                     # label=f"Edge {row_number + 1} Fit R2"
                     )
+                self._plot_residual_line(self.plot_canvas_b, x_r2, y_r2, fit_y2)
                 # self.plot_canvas_b.axes.legend()
                 self.plot_canvas_b.draw()
                 self.message_box.append(
@@ -3252,7 +3352,8 @@ class FittingMixin:
             y_r3    = intensities_data[mask_r3]
 
             if not skip_ui_updates:
-                self.plot_canvas_d.axes.plot(
+                ax_r3_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_d)
+                ax_r3_main.plot(
                     x_r3,
                     y_r3,
                     "o",
@@ -3430,10 +3531,12 @@ class FittingMixin:
 
             # ---------- live plotting / messages (GUI) -----------
             if not skip_ui_updates:
-                self.plot_canvas_d.axes.plot(
+                ax_r3_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_d)
+                ax_r3_main.plot(
                     x_r3, func_r3(x_r3, *popt_3), "r-",
                     # label=f"Edge {hkl} Fit R3"
                 )
+                self._plot_residual_line(self.plot_canvas_d, x_r3, y_r3, y3_fit)
                 # self.plot_canvas_d.axes.legend()
                 self.plot_canvas_d.draw()
                 self.message_box.append(
@@ -3840,17 +3943,32 @@ class FittingMixin:
         mpl.rcParams['legend.fontsize'] = font_size
 
         for canvas in self._iter_plot_canvases():
-            ax = canvas.axes
-            ax.tick_params(labelsize=font_size)
-            ax.xaxis.label.set_size(font_size)
-            ax.yaxis.label.set_size(font_size)
-            ax.title.set_fontsize(font_size)
-            legend = ax.get_legend()
-            if legend is not None:
-                for text in legend.get_texts():
+            main_ax = getattr(canvas, "axes", None)
+            if getattr(canvas, "residual_axes", None) is not None:
+                left_margin = min(0.28, max(0.18, 0.12 + 0.006 * font_size))
+                bottom_margin = min(0.30, max(0.16, 0.10 + 0.006 * font_size))
+                canvas.fig.subplots_adjust(
+                    left=left_margin,
+                    right=0.98,
+                    top=0.96,
+                    bottom=bottom_margin,
+                    hspace=0.0,
+                )
+            for ax in self._iter_axes_for_canvas(canvas):
+                axis_font_size = font_size
+                tick_kwargs = {"labelsize": axis_font_size}
+                if getattr(canvas, "residual_axes", None) is not None:
+                    tick_kwargs["direction"] = "in"
+                ax.tick_params(**tick_kwargs)
+                ax.xaxis.label.set_size(axis_font_size)
+                ax.yaxis.label.set_size(axis_font_size)
+                ax.title.set_fontsize(font_size)
+                legend = ax.get_legend()
+                if legend is not None:
+                    for text in legend.get_texts():
+                        text.set_fontsize(axis_font_size)
+                for text in ax.texts:
                     text.set_fontsize(font_size)
-            for text in ax.texts:
-                text.set_fontsize(font_size)
             canvas.draw_idle()
 
     def _iter_plot_canvases(self):
@@ -3860,19 +3978,26 @@ class FittingMixin:
             if canvas is not None:
                 yield canvas
 
+    def _iter_axes_for_canvas(self, canvas):
+        """Yield all axes attached to a canvas (main + optional residual)."""
+        main_ax = getattr(canvas, "axes", None)
+        residual_ax = getattr(canvas, "residual_axes", None)
+        if main_ax is not None:
+            yield main_ax
+        if residual_ax is not None and residual_ax is not main_ax:
+            yield residual_ax
+
     def apply_symbol_size(self):
         """Apply the current symbol size to all existing plot markers."""
         marker_size = getattr(self, "symbol_size", 4)
         for canvas in self._iter_plot_canvases():
-            axes = getattr(canvas, "axes", None)
-            if axes is None:
-                continue
             changed = False
-            for line in axes.lines:
-                marker = line.get_marker()
-                if marker not in (None, "", "None"):
-                    line.set_markersize(marker_size)
-                    changed = True
+            for axes in self._iter_axes_for_canvas(canvas):
+                for line in axes.lines:
+                    marker = line.get_marker()
+                    if marker not in (None, "", "None"):
+                        line.set_markersize(marker_size)
+                        changed = True
             if changed:
                 canvas.draw_idle()
 
@@ -3887,3 +4012,4 @@ class FittingMixin:
         if self.plot_font_size > 6:
             self.plot_font_size -= 1
             self.update_plot_font_size(self.plot_font_size)
+
