@@ -57,6 +57,8 @@
 ## Example dataset for Bragg edge fitting
 An example dataset is available for Bragg edge fitting tutorial, click to download [Example_dataset](https://github.com/RayZhang2024/NEAT/releases/download/v4.6/5_Ubend_normalised.zip). The dataset has been pre-processed and is ready for Bragg edge fitting, go and have a try!
 
+**Credit:** The samples shown in this user manual were provided by the *European Union’s Horizon 2020 research and innovation programme under grant agreement No. 953219 (EASI-STRESS)*, and the example dataset was obtained from measurements on these samples.
+
 # 1. Introduction
 
 ## 1.1 Overview

@@ -7,6 +7,7 @@ import time
 
 import numpy as np
 from astropy.io import fits
+from PIL import Image
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QEventLoop
 from PyQt5.QtWidgets import (
@@ -49,6 +50,7 @@ from ...workers.preprocessing import (
     OverlapCorrectionWorker,
     SummationWorker,
 )
+from ..dialogs import MaskGeneratorDialog
 
 
 class PreprocessingMixin:
@@ -358,9 +360,12 @@ class PreprocessingMixin:
         filtering_mask_buttons_layout = QHBoxLayout()
         self.filtering_add_mask_button = QPushButton("Add Mask")
         self.filtering_add_mask_button.clicked.connect(self.add_filter_mask_image)
+        self.filtering_generate_mask_button = QPushButton("Generate Mask")
+        self.filtering_generate_mask_button.clicked.connect(self.open_filter_mask_generator)
         # self.filtering_remove_mask_button = QPushButton("Remove Mask")
         # self.filtering_remove_mask_button.clicked.connect(self.remove_filter_mask_image)
         filtering_mask_buttons_layout.addWidget(self.filtering_add_mask_button)
+        filtering_mask_buttons_layout.addWidget(self.filtering_generate_mask_button)
         # filtering_mask_buttons_layout.addWidget(self.filtering_remove_mask_button)
         filtering_layout.addLayout(filtering_mask_buttons_layout)
 
@@ -1518,9 +1523,11 @@ class PreprocessingMixin:
         if getattr(self, 'summation_worker', None):
             self.summation_worker.stop()
         if getattr(self, '_lazy_load_worker_3', None):
-            self._lazy_load_worker_3.terminate()   # optional: kill loader threads
+            self._lazy_load_worker_3.requestInterruption()
+            self._lazy_load_worker_3.wait(1000)
         if getattr(self, '_lazy_load_worker_2', None):
-            self._lazy_load_worker_2.terminate()
+            self._lazy_load_worker_2.requestInterruption()
+            self._lazy_load_worker_2.wait(1000)
         self._summation_cancelled = True           # <-- NEW
         self.summation_sum_button.setEnabled(True)
         self.summation_stop_button.setEnabled(False)
@@ -1969,17 +1976,62 @@ class PreprocessingMixin:
             self.preproc_message_box.append("No filtering data images to remove.")
 
     def add_filter_mask_image(self):
-        # Single-file selection for the FITS mask:
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select FITS Mask Image", "", "FITS Files (*.fits)")
+        # Single-file selection for FITS/TIFF masks:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Mask Image",
+            "",
+            (
+                "Mask Files (*.fits *.fit *.fts *.tif *.tiff);;"
+                "FITS Files (*.fits *.fit *.fts);;"
+                "TIFF Files (*.tif *.tiff)"
+            ),
+        )
 
         file_path_short = self.get_short_path(file_path, levels=2)
         if file_path:
             try:
-                with fits.open(file_path) as hdul:
-                    self.filtering_mask_image = hdul[0].data
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext in (".fits", ".fit", ".fts"):
+                    with fits.open(file_path) as hdul:
+                        if hdul[0].data is None:
+                            raise ValueError("No data found in FITS primary HDU.")
+                        raw_mask = hdul[0].data
+                elif ext in (".tif", ".tiff"):
+                    raw_mask = np.array(Image.open(file_path))
+                else:
+                    raise ValueError("Unsupported mask format. Use FITS or TIFF.")
+
+                mask_data = np.asarray(raw_mask)
+                mask_data = np.squeeze(mask_data)
+                if mask_data.ndim == 3:
+                    mask_data = mask_data[..., 0]
+                if mask_data.ndim != 2:
+                    raise ValueError(f"Mask must be 2D after loading, got shape {mask_data.shape}.")
+
+                self.filtering_mask_image = (mask_data != 0).astype(np.float32)
                 self.preproc_message_box.append(f"Mask image loaded from: {file_path_short}")
             except Exception as e:
                 self.preproc_message_box.append(f"Failed to load mask image from {file_path}: {e}")
+
+    def open_filter_mask_generator(self):
+        """Open the mask generator dialog and receive generated mask arrays."""
+        dialog = MaskGeneratorDialog(parent=self)
+        dialog.mask_ready.connect(self._on_generated_filter_mask)
+        if not hasattr(self, "_mask_generator_dialogs"):
+            self._mask_generator_dialogs = []
+        self._mask_generator_dialogs.append(dialog)
+        dialog.show()
+
+    def _on_generated_filter_mask(self, mask):
+        """Store mask created by the generator dialog for filtering."""
+        try:
+            self.filtering_mask_image = np.asarray(mask, dtype=np.float32)
+            self.preproc_message_box.append(
+                f"Generated mask loaded for filtering: shape={self.filtering_mask_image.shape}"
+            )
+        except (TypeError, ValueError) as e:
+            self.preproc_message_box.append(f"Failed to import generated mask: {e}")
 
     def remove_filter_mask_image(self):
         if hasattr(self, 'filtering_mask_image') and self.filtering_mask_image is not None:

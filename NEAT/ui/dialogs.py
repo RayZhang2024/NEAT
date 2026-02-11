@@ -1,22 +1,28 @@
 ﻿"""Dialog and plotting widgets used by the NEAT UI."""
 
 import os
+from collections import deque
 
 import numpy as np
 from astropy.io import fits
-from PyQt5.QtCore import Qt, QSize
+from PIL import Image
+from PyQt5.QtCore import Qt, QSize, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDesktopWidget,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QSlider,
     QSplitter,
     QTextEdit,
@@ -27,7 +33,7 @@ from PyQt5.QtWidgets import (
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Circle, Rectangle
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import zoom
 
@@ -51,6 +57,635 @@ class MplCanvas(FigureCanvas):
         self.fig = Figure(figsize=(width, height), dpi=dpi)
         self.axes = self.fig.add_subplot(111)
         super(MplCanvas, self).__init__(self.fig)
+
+
+class MaskGeneratorDialog(QDialog):
+    """Interactive mask generator for preprocessing filtering."""
+
+    mask_ready = pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Mask Generator")
+        self.setWindowFlags(
+            (self.windowFlags() | Qt.WindowMinMaxButtonsHint | Qt.WindowSystemMenuHint)
+            & ~Qt.WindowContextHelpButtonHint
+        )
+        width, height = _scaled_geometry(0.5, 0.55)
+        self.setGeometry(200, 140, width, height)
+        self.setMinimumSize(760, 520)
+
+        self.source_image = None
+        self.current_mask = None
+        self._threshold_min = None
+        self._threshold_max = None
+        self._painting = False
+        self._brush_outline = None
+        self._last_cursor = None
+        self._undo_stack = deque(maxlen=50)
+        self._overlay_colors = {
+            "Green": (0.0, 1.0, 0.0),
+            "Red": (1.0, 0.1, 0.1),
+            "Blue": (0.2, 0.45, 1.0),
+            "Yellow": (1.0, 0.9, 0.1),
+            "Magenta": (1.0, 0.2, 1.0),
+            "Cyan": (0.1, 1.0, 1.0),
+        }
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(4)
+        splitter = QSplitter(Qt.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
+        main_layout.addWidget(splitter)
+        self.mask_splitter = splitter
+        self.setStyleSheet(
+            "QFrame#mask_left_panel, QFrame#mask_right_panel { border: 1px solid #b9b9b9; }"
+        )
+
+        left_panel = QFrame(self)
+        self.mask_left_panel = left_panel
+        left_panel.setObjectName("mask_left_panel")
+        left_panel.setFrameShape(QFrame.StyledPanel)
+        left_panel.setFrameShadow(QFrame.Plain)
+        left_panel.setMinimumWidth(180)
+        left_panel.setMaximumWidth(16777215)
+        left_panel.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(8)
+        left_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+        right_panel = QFrame(self)
+        self.mask_right_panel = right_panel
+        right_panel.setObjectName("mask_right_panel")
+        right_panel.setFrameShape(QFrame.StyledPanel)
+        right_panel.setFrameShadow(QFrame.Plain)
+        right_panel.setMinimumWidth(320)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(4, 4, 4, 4)
+        right_layout.setSpacing(4)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        controls_row_0 = QHBoxLayout()
+        self.load_image_button = QPushButton("Load Image")
+        self.load_image_button.clicked.connect(self.load_source_image)
+        controls_row_0.addWidget(self.load_image_button)
+        controls_row_0.addStretch()
+        left_layout.addLayout(controls_row_0)
+
+        controls_row_1 = QHBoxLayout()
+        controls_row_1.addWidget(QLabel("Threshold:"))
+        controls_row_1.addStretch()
+        left_layout.addLayout(controls_row_1)
+
+        controls_row_2 = QHBoxLayout()
+        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider.setRange(0, 1000)
+        self.threshold_slider.setValue(500)
+        self.threshold_slider.setMaximumWidth(260)
+        self.threshold_slider.valueChanged.connect(self.regenerate_mask_from_threshold)
+        controls_row_2.addWidget(self.threshold_slider)
+        controls_row_2.addStretch()
+        left_layout.addLayout(controls_row_2)
+
+        controls_row_2_value = QHBoxLayout()
+        self.threshold_value_label = QLabel("0.0000")
+        self.threshold_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.threshold_value_label.setFixedWidth(90)
+        controls_row_2_value.addWidget(self.threshold_value_label)
+        controls_row_2_value.addStretch()
+        left_layout.addLayout(controls_row_2_value)
+
+        controls_row_3 = QHBoxLayout()
+        self.clear_to_threshold_button = QPushButton("Reset")
+        self.clear_to_threshold_button.clicked.connect(self.regenerate_mask_from_threshold)
+        controls_row_3.addWidget(self.clear_to_threshold_button)
+        self.undo_button = QPushButton("Undo")
+        self.undo_button.setEnabled(False)
+        self.undo_button.clicked.connect(self.undo_last_brush_action)
+        controls_row_3.addWidget(self.undo_button)
+        controls_row_3.addStretch()
+        left_layout.addLayout(controls_row_3)
+
+        controls_row_4 = QHBoxLayout()
+        self.invert_threshold_checkbox = QCheckBox("Invert")
+        self.invert_threshold_checkbox.toggled.connect(self.regenerate_mask_from_threshold)
+        controls_row_4.addWidget(self.invert_threshold_checkbox)
+        controls_row_4.addStretch()
+        left_layout.addLayout(controls_row_4)
+
+        controls_row_5 = QHBoxLayout()
+        controls_row_5.addWidget(QLabel("Highlight:"))
+        self.overlay_color_combo = QComboBox()
+        self.overlay_color_combo.addItems(list(self._overlay_colors.keys()))
+        self.overlay_color_combo.setCurrentText("Green")
+        self.overlay_color_combo.setMaximumWidth(160)
+        self.overlay_color_combo.currentTextChanged.connect(lambda _: self._draw_mask_preview())
+        controls_row_5.addWidget(self.overlay_color_combo)
+        controls_row_5.addStretch()
+        left_layout.addLayout(controls_row_5)
+
+        controls_row_6 = QHBoxLayout()
+        controls_row_6.addWidget(QLabel("Brush size:"))
+        controls_row_6.addStretch()
+        left_layout.addLayout(controls_row_6)
+
+        controls_row_7 = QHBoxLayout()
+        self.brush_size_slider = QSlider(Qt.Horizontal)
+        self.brush_size_slider.setRange(1, 40)
+        self.brush_size_slider.setValue(8)
+        self.brush_size_slider.setMaximumWidth(260)
+        self.brush_size_slider.valueChanged.connect(self._refresh_brush_outline_geometry)
+        controls_row_7.addWidget(self.brush_size_slider)
+        controls_row_7.addStretch()
+        left_layout.addLayout(controls_row_7)
+
+        controls_row_8 = QHBoxLayout()
+        controls_row_8.addWidget(QLabel("Shape:"))
+        self.brush_shape_combo = QComboBox()
+        self.brush_shape_combo.addItems(["Circle", "Square"])
+        self.brush_shape_combo.setMaximumWidth(160)
+        self.brush_shape_combo.currentTextChanged.connect(self._refresh_brush_outline_geometry)
+        controls_row_8.addWidget(self.brush_shape_combo)
+        controls_row_8.addStretch()
+        left_layout.addLayout(controls_row_8)
+
+        controls_row_9 = QHBoxLayout()
+        self.keep_radio = QRadioButton("Brush")
+        self.exclude_radio = QRadioButton("Erase")
+        self.keep_radio.setMinimumWidth(90)
+        self.exclude_radio.setMinimumWidth(90)
+        self._brush_mode_updating = False
+        self.keep_radio.setAutoExclusive(False)
+        self.exclude_radio.setAutoExclusive(False)
+        self.brush_mode_group = QButtonGroup(self)
+        self.brush_mode_group.setExclusive(False)
+        self.brush_mode_group.addButton(self.keep_radio)
+        self.brush_mode_group.addButton(self.exclude_radio)
+        self.keep_radio.toggled.connect(self._on_keep_mode_toggled)
+        self.exclude_radio.toggled.connect(self._on_erase_mode_toggled)
+        # Explicitly start with no active paint mode.
+        self.keep_radio.setChecked(False)
+        self.exclude_radio.setChecked(False)
+        controls_row_9.addWidget(self.keep_radio)
+        controls_row_9.addWidget(self.exclude_radio)
+        controls_row_9.addStretch()
+        left_layout.addLayout(controls_row_9)
+
+        self.canvas = MplCanvas(self, width=8, height=6, dpi=100)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.fig.subplots_adjust(left=0.02, right=0.99, top=0.95, bottom=0.03)
+        self.canvas.axes.set_title("Load an image to generate a mask", fontsize=10)
+        self.canvas.axes.set_axis_off()
+        right_layout.addWidget(self.canvas)
+
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.toolbar.setIconSize(QSize(16, 16))
+        right_layout.addWidget(self.toolbar)
+
+        controls_row_10 = QHBoxLayout()
+        self.save_mask_button = QPushButton("Save Mask")
+        self.save_mask_button.clicked.connect(self.save_mask)
+        controls_row_10.addWidget(self.save_mask_button)
+        controls_row_10.addStretch()
+        left_layout.addLayout(controls_row_10)
+
+        self.status_label = QLabel(
+            "Mask values: 1=keep area, 0=excluded area. Select Brush or Erase to edit. "
+            "Close this window to apply the current mask."
+        )
+        right_layout.addWidget(self.status_label)
+        left_layout.addStretch()
+        left_target = max(220, self.mask_left_panel.sizeHint().width() + 24)
+        max_left = int(width * 0.45)
+        left_target = min(left_target, max_left if max_left > 220 else left_target)
+        splitter.setSizes([left_target, max(400, width - left_target)])
+
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
+        self.canvas.mpl_connect("scroll_event", self._on_canvas_scroll)
+
+    def _to_grayscale(self, arr):
+        """Convert input image array to 2D float grayscale."""
+        data = np.asarray(arr)
+        if data.ndim == 2:
+            return data.astype(np.float32)
+        if data.ndim == 3:
+            if data.shape[-1] >= 3:
+                rgb = data[..., :3].astype(np.float32)
+                return (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float32)
+            return np.mean(data.astype(np.float32), axis=-1).astype(np.float32)
+        data = np.squeeze(data)
+        if data.ndim != 2:
+            raise ValueError(f"Unsupported image dimensions: {np.asarray(arr).shape}")
+        return data.astype(np.float32)
+
+    def load_source_image(self):
+        """Load source image from FITS/TIFF and initialize threshold mask."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Source Image",
+            "",
+            "Image Files (*.fits *.fit *.fts *.tif *.tiff);;FITS Files (*.fits *.fit *.fts);;TIFF Files (*.tif *.tiff);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in (".fits", ".fit", ".fts"):
+                with fits.open(file_path) as hdul:
+                    if hdul[0].data is None:
+                        raise ValueError("No image data found in primary FITS HDU.")
+                    raw = hdul[0].data
+            elif ext in (".tif", ".tiff"):
+                raw = np.array(Image.open(file_path))
+            else:
+                raise ValueError("Unsupported file format. Use FITS or TIFF.")
+
+            self.source_image = self._to_grayscale(raw)
+            finite = np.isfinite(self.source_image)
+            if not np.any(finite):
+                raise ValueError("Image contains no finite values.")
+
+            self._threshold_min = float(np.nanmin(self.source_image[finite]))
+            self._threshold_max = float(np.nanmax(self.source_image[finite]))
+            self.regenerate_mask_from_threshold(preserve_view=False)
+            self.status_label.setText(
+                f"Loaded image: {os.path.basename(file_path)} | shape={self.source_image.shape}"
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Load Image Failed", f"Could not load image:\n{e}")
+
+    def regenerate_mask_from_threshold(self, *_args, preserve_view=True):
+        """Rebuild mask from current threshold controls."""
+        if self.source_image is None:
+            return
+        if self._threshold_min is None or self._threshold_max is None:
+            return
+
+        slider_value = self.threshold_slider.value() / 1000.0
+        threshold = self._threshold_min + slider_value * (self._threshold_max - self._threshold_min)
+        self.threshold_value_label.setText(self._format_threshold_value(threshold))
+
+        finite = np.isfinite(self.source_image)
+        if self.invert_threshold_checkbox.isChecked():
+            mask = (self.source_image <= threshold) & finite
+        else:
+            mask = (self.source_image >= threshold) & finite
+
+        self.current_mask = mask.astype(np.uint8)
+        # Threshold-based mask rebuilds are intentionally non-undoable.
+        self._clear_undo_history()
+        self._draw_mask_preview(preserve_view=preserve_view)
+
+    @staticmethod
+    def _format_threshold_value(value):
+        """Format threshold values compactly for UI readability."""
+        abs_value = abs(float(value))
+        if abs_value >= 1e4 or (0 < abs_value < 1e-2):
+            return f"{value:.3g}"
+        return f"{value:.2f}"
+
+    def _draw_mask_preview(self, preserve_view=True):
+        """Draw source image with translucent keep-area overlay."""
+        ax = self.canvas.axes
+        saved_xlim = None
+        saved_ylim = None
+        if preserve_view and self.source_image is not None and ax.has_data():
+            saved_xlim = ax.get_xlim()
+            saved_ylim = ax.get_ylim()
+        ax.clear()
+        self._brush_outline = None
+
+        if self.source_image is None:
+            ax.set_title("Load an image to generate a mask", fontsize=10)
+            ax.set_position([0.01, 0.05, 0.98, 0.90])
+            ax.set_axis_off()
+            self.canvas.draw_idle()
+            return
+
+        finite = np.isfinite(self.source_image)
+        if np.any(finite):
+            vmin = float(np.nanpercentile(self.source_image[finite], 2))
+            vmax = float(np.nanpercentile(self.source_image[finite], 98))
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+        else:
+            vmin, vmax = 0.0, 1.0
+
+        ax.imshow(self.source_image, cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
+        if self.current_mask is not None:
+            color_name = self.overlay_color_combo.currentText()
+            r, g, b = self._overlay_colors.get(color_name, self._overlay_colors["Green"])
+            overlay = np.zeros((*self.current_mask.shape, 4), dtype=np.float32)
+            overlay[..., 0] = r
+            overlay[..., 1] = g
+            overlay[..., 2] = b
+            overlay[..., 3] = 0.45 * (self.current_mask > 0)
+            ax.imshow(overlay, interpolation="nearest")
+
+        if saved_xlim is not None and saved_ylim is not None:
+            ax.set_xlim(saved_xlim)
+            ax.set_ylim(saved_ylim)
+        ax.set_position([0.01, 0.05, 0.98, 0.90])
+        ax.set_title("Mask preview (highlight = kept / value 1)", fontsize=10)
+        ax.set_axis_off()
+        self.canvas.draw_idle()
+
+    def _clear_undo_history(self):
+        self._undo_stack.clear()
+        self._update_undo_button_state()
+
+    def _update_undo_button_state(self):
+        if hasattr(self, "undo_button"):
+            self.undo_button.setEnabled(bool(self._undo_stack))
+
+    def _push_undo_snapshot(self):
+        if self.current_mask is None:
+            return
+        self._undo_stack.append(self.current_mask.copy())
+        self._update_undo_button_state()
+
+    def undo_last_brush_action(self):
+        """Undo the latest brush/erase stroke."""
+        if not self._undo_stack:
+            return
+        self.current_mask = self._undo_stack.pop()
+        self._update_undo_button_state()
+        self._draw_mask_preview(preserve_view=True)
+        if self._last_cursor is not None:
+            self._update_brush_outline(*self._last_cursor)
+
+    def _on_keep_mode_toggled(self, checked):
+        """Ensure Brush/Erase behave as mutually exclusive toggles with optional none state."""
+        if self._brush_mode_updating:
+            return
+        self._brush_mode_updating = True
+        if checked:
+            self.exclude_radio.setChecked(False)
+        self._brush_mode_updating = False
+        self._refresh_brush_outline_style()
+
+    def _on_erase_mode_toggled(self, checked):
+        """Ensure Brush/Erase behave as mutually exclusive toggles with optional none state."""
+        if self._brush_mode_updating:
+            return
+        self._brush_mode_updating = True
+        if checked:
+            self.keep_radio.setChecked(False)
+        self._brush_mode_updating = False
+        self._refresh_brush_outline_style()
+
+    def _remove_brush_outline(self):
+        if self._brush_outline is not None:
+            try:
+                self._brush_outline.remove()
+            except Exception:
+                pass
+            self._brush_outline = None
+
+    def _brush_outline_color(self):
+        if self.keep_radio.isChecked():
+            return "#00ff66"
+        if self.exclude_radio.isChecked():
+            return "#ff4d4d"
+        return "#f0f0f0"
+
+    def _refresh_brush_outline_style(self):
+        if self._brush_outline is not None:
+            self._brush_outline.set_edgecolor(self._brush_outline_color())
+            self.canvas.draw_idle()
+
+    def _refresh_brush_outline_geometry(self, *_args):
+        if self._last_cursor is not None:
+            self._update_brush_outline(*self._last_cursor)
+
+    def _update_brush_outline(self, xdata, ydata):
+        if self.source_image is None or xdata is None or ydata is None:
+            self._remove_brush_outline()
+            self._last_cursor = None
+            self.canvas.draw_idle()
+            return
+        if self._is_navigation_mode_active():
+            self._remove_brush_outline()
+            self.canvas.draw_idle()
+            return
+
+        x = int(round(xdata))
+        y = int(round(ydata))
+        h, w = self.source_image.shape
+        if x < 0 or y < 0 or x >= w or y >= h:
+            self._remove_brush_outline()
+            self._last_cursor = None
+            self.canvas.draw_idle()
+            return
+
+        self._last_cursor = (x, y)
+        size = max(1, int(self.brush_size_slider.value()))
+        color = self._brush_outline_color()
+        ax = self.canvas.axes
+
+        shape = self.brush_shape_combo.currentText()
+        if shape == "Square":
+            x0 = x - size - 0.5
+            y0 = y - size - 0.5
+            width = 2 * size + 1
+            if isinstance(self._brush_outline, Rectangle):
+                self._brush_outline.set_xy((x0, y0))
+                self._brush_outline.set_width(width)
+                self._brush_outline.set_height(width)
+                self._brush_outline.set_edgecolor(color)
+            else:
+                self._remove_brush_outline()
+                self._brush_outline = Rectangle(
+                    (x0, y0),
+                    width,
+                    width,
+                    fill=False,
+                    linewidth=1.2,
+                    edgecolor=color,
+                    linestyle="-",
+                )
+                ax.add_patch(self._brush_outline)
+        else:
+            radius = size
+            if isinstance(self._brush_outline, Circle):
+                self._brush_outline.center = (x, y)
+                self._brush_outline.set_radius(radius)
+                self._brush_outline.set_edgecolor(color)
+            else:
+                self._remove_brush_outline()
+                self._brush_outline = Circle(
+                    (x, y),
+                    radius=radius,
+                    fill=False,
+                    linewidth=1.2,
+                    edgecolor=color,
+                    linestyle="-",
+                )
+                ax.add_patch(self._brush_outline)
+
+        self.canvas.draw_idle()
+
+    def _apply_brush(self, xdata, ydata):
+        if self.current_mask is None or xdata is None or ydata is None:
+            return
+
+        if self.keep_radio.isChecked():
+            brush_value = 1
+        elif self.exclude_radio.isChecked():
+            brush_value = 0
+        else:
+            self.status_label.setText("Select Brush or Erase to edit mask.")
+            return
+
+        h, w = self.current_mask.shape
+        x = int(round(xdata))
+        y = int(round(ydata))
+        if x < 0 or y < 0 or x >= w or y >= h:
+            return
+
+        size = max(1, int(self.brush_size_slider.value()))
+        if self.brush_shape_combo.currentText() == "Square":
+            half = size
+            x_min = max(0, x - half)
+            x_max = min(w, x + half + 1)
+            y_min = max(0, y - half)
+            y_max = min(h, y + half + 1)
+            self.current_mask[y_min:y_max, x_min:x_max] = brush_value
+        else:
+            radius = size
+            yy, xx = np.ogrid[:h, :w]
+            circle = (xx - x) ** 2 + (yy - y) ** 2 <= radius ** 2
+            self.current_mask[circle] = brush_value
+        self._draw_mask_preview()
+        self._update_brush_outline(x, y)
+
+    def _on_canvas_press(self, event):
+        if event.button != 1 or event.inaxes != self.canvas.axes:
+            return
+        if self._is_navigation_mode_active():
+            self._painting = False
+            return
+        if self.current_mask is None:
+            self._painting = False
+            return
+        if not (self.keep_radio.isChecked() or self.exclude_radio.isChecked()):
+            self._painting = False
+            self.status_label.setText("Select Brush or Erase to edit mask.")
+            return
+        # Save one snapshot per stroke for incremental undo.
+        self._push_undo_snapshot()
+        self._update_brush_outline(event.xdata, event.ydata)
+        self._painting = True
+        self._apply_brush(event.xdata, event.ydata)
+
+    def _on_canvas_motion(self, event):
+        if event.inaxes != self.canvas.axes:
+            self._remove_brush_outline()
+            self.canvas.draw_idle()
+            return
+        self._update_brush_outline(event.xdata, event.ydata)
+        if not self._painting or self._is_navigation_mode_active():
+            return
+        self._apply_brush(event.xdata, event.ydata)
+
+    def _on_canvas_release(self, event):
+        if event.button == 1:
+            self._painting = False
+
+    def _on_canvas_scroll(self, event):
+        """Zoom in/out around cursor with mouse wheel."""
+        if self.source_image is None or event.inaxes != self.canvas.axes:
+            return
+        if self._is_navigation_mode_active():
+            return
+        if event.button not in ("up", "down"):
+            return
+
+        ax = self.canvas.axes
+        x_min, x_max = ax.get_xlim()
+        y_min, y_max = ax.get_ylim()
+        x_center = event.xdata if event.xdata is not None else (x_min + x_max) / 2.0
+        y_center = event.ydata if event.ydata is not None else (y_min + y_max) / 2.0
+
+        scale_factor = 0.9 if event.button == "up" else 1.1
+        new_width = (x_max - x_min) * scale_factor
+        new_height = (y_max - y_min) * scale_factor
+
+        if x_max != x_min:
+            rel_x = (x_center - x_min) / (x_max - x_min)
+        else:
+            rel_x = 0.5
+        if y_max != y_min:
+            rel_y = (y_center - y_min) / (y_max - y_min)
+        else:
+            rel_y = 0.5
+
+        ax.set_xlim([x_center - new_width * rel_x, x_center + new_width * (1 - rel_x)])
+        ax.set_ylim([y_center - new_height * rel_y, y_center + new_height * (1 - rel_y)])
+        self.canvas.draw_idle()
+
+    def _is_navigation_mode_active(self):
+        """Return True when matplotlib toolbar pan/zoom mode is active."""
+        mode = str(getattr(self.toolbar, "mode", "")).strip().lower()
+        if mode and mode not in ("none",):
+            return True
+        active = getattr(self.toolbar, "_active", None)
+        return bool(str(active).strip()) if active is not None else False
+
+    def _emit_mask_ready(self):
+        """Emit the current mask to preprocessing if available."""
+        if self.current_mask is not None:
+            self.mask_ready.emit(self.current_mask.astype(np.float32))
+
+    def closeEvent(self, event):
+        """Apply mask to filtering when the dialog is closed."""
+        self._emit_mask_ready()
+        super().closeEvent(event)
+
+    def save_mask(self):
+        """Save current mask as FITS or TIFF."""
+        if self.current_mask is None:
+            QMessageBox.information(self, "No Mask", "Generate or edit a mask first.")
+            return
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Mask",
+            "",
+            "FITS Files (*.fits);;TIFF Files (*.tif *.tiff)",
+        )
+        if not file_path:
+            return
+
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if not ext:
+                if "FITS" in selected_filter:
+                    file_path += ".fits"
+                    ext = ".fits"
+                else:
+                    file_path += ".tif"
+                    ext = ".tif"
+
+            if ext in (".fits", ".fit", ".fts"):
+                fits.writeto(file_path, self.current_mask.astype(np.uint8), overwrite=True)
+            elif ext in (".tif", ".tiff"):
+                Image.fromarray((self.current_mask.astype(np.uint8) * 255)).save(file_path)
+            else:
+                raise ValueError("Unsupported save format. Use FITS or TIFF.")
+
+            QMessageBox.information(self, "Mask Saved", f"Mask saved to:\n{file_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Failed", f"Could not save mask:\n{e}")
 
 class FitVisualizationDialog(QDialog):
     """
@@ -545,6 +1180,9 @@ class ParameterPlotDialog(QDialog):
         self.X_unique = X_unique
         self.Y_unique = Y_unique
         self.Z = Z
+        # Keep parameter map fonts independent from global matplotlib rcParams.
+        base_font = max(8, self.font().pointSize())
+        self._plot_font_size = min(base_font + 1, 12)
 
         # Initialize colorbar and mesh reference
         self.colorbar = None
@@ -571,9 +1209,20 @@ class ParameterPlotDialog(QDialog):
         self.canvas.mpl_connect("button_press_event", self.on_press)
         self.canvas.mpl_connect("button_release_event", self.on_release)
         self.canvas.mpl_connect("motion_notify_event", self.on_motion_and_coordinates)
+        self.canvas.mpl_connect("scroll_event", self.zoom)
 
         # Keep a reference to line profile dialogs to prevent garbage collection
         self.line_profile_dialogs = []
+
+    def _apply_parameter_plot_style(self, x_label, y_label):
+        """Apply consistent local font sizing for parameter map canvas."""
+        font_size = self._plot_font_size
+        self.canvas.axes.set_title(self.parameter_name, fontsize=font_size + 1)
+        self.canvas.axes.set_xlabel(x_label, fontsize=font_size)
+        self.canvas.axes.set_ylabel(y_label, fontsize=font_size)
+        self.canvas.axes.tick_params(labelsize=font_size)
+        if self.colorbar is not None:
+            self.colorbar.ax.tick_params(labelsize=font_size)
         
     def apply_filter(self):
             """
@@ -787,9 +1436,7 @@ class ParameterPlotDialog(QDialog):
             cmax = float(cmax_text)
         self.mesh.set_clim(vmin=cmin, vmax=cmax)
     
-        self.canvas.axes.set_title(self.parameter_name)
-        self.canvas.axes.set_xlabel(x_label)
-        self.canvas.axes.set_ylabel(y_label)
+        self._apply_parameter_plot_style(x_label, y_label)
         self.canvas.draw()
 
 
@@ -812,6 +1459,10 @@ class ParameterPlotDialog(QDialog):
             self.colorbar = self.canvas.fig.colorbar(
                 self.mesh, ax=self.canvas.axes
             )
+
+            x_label = self.canvas.axes.get_xlabel()
+            y_label = self.canvas.axes.get_ylabel()
+            self._apply_parameter_plot_style(x_label, y_label)
 
             self.canvas.draw()
         except ValueError:
@@ -1086,8 +1737,74 @@ class ParameterPlotDialog(QDialog):
 
 
     def zoom(self, event):
-        # Zooming is handled by the Navigation Toolbar
-        pass  # No need to implement custom zoom
+        """Zoom in/out around cursor using mouse wheel."""
+        if event.inaxes != self.canvas.axes:
+            return
+        if event.button not in ("up", "down"):
+            return
+        # Avoid conflicts with matplotlib toolbar pan/zoom mode.
+        mode = str(getattr(self.toolbar, "mode", "")).strip().lower()
+        if mode and mode not in ("none",):
+            return
+        active = getattr(self.toolbar, "_active", None)
+        if active is not None and str(active).strip():
+            return
+        # Avoid zooming while a drag/select interaction is in progress.
+        if self._press_event is not None:
+            return
+
+        if self.unit_in_mm:
+            x_factor = 0.055
+            y_factor = 0.055
+        else:
+            x_factor = 1.0
+            y_factor = 1.0
+
+        x_edges = self.calculate_edges(self.X_unique * x_factor)
+        y_edges = self.calculate_edges(self.Y_unique * y_factor)
+        x_bounds = (float(x_edges[0]), float(x_edges[-1]))
+        y_bounds = (float(y_edges[0]), float(y_edges[-1]))
+
+        ax = self.canvas.axes
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        x_center = event.xdata if event.xdata is not None else (x0 + x1) / 2.0
+        y_center = event.ydata if event.ydata is not None else (y0 + y1) / 2.0
+        scale = 0.9 if event.button == "up" else 1.1
+
+        def _zoom_axis(a0, a1, center, bounds):
+            inverted = a0 > a1
+            lo, hi = (a1, a0) if inverted else (a0, a1)
+            if hi <= lo:
+                return a0, a1
+
+            center = min(max(center, bounds[0]), bounds[1])
+            rel = (center - lo) / (hi - lo)
+            rel = min(max(rel, 0.0), 1.0)
+            span = (hi - lo) * scale
+            full_span = bounds[1] - bounds[0]
+
+            if span >= full_span:
+                new_lo, new_hi = bounds
+            else:
+                new_lo = center - span * rel
+                new_hi = center + span * (1.0 - rel)
+                if new_lo < bounds[0]:
+                    new_hi += (bounds[0] - new_lo)
+                    new_lo = bounds[0]
+                if new_hi > bounds[1]:
+                    new_lo -= (new_hi - bounds[1])
+                    new_hi = bounds[1]
+                new_lo = max(new_lo, bounds[0])
+                new_hi = min(new_hi, bounds[1])
+
+            return (new_hi, new_lo) if inverted else (new_lo, new_hi)
+
+        new_x0, new_x1 = _zoom_axis(x0, x1, x_center, x_bounds)
+        new_y0, new_y1 = _zoom_axis(y0, y1, y_center, y_bounds)
+        ax.set_xlim(new_x0, new_x1)
+        ax.set_ylim(new_y0, new_y1)
+        self.canvas.draw_idle()
 
     def update_coordinates(self, event):
         x, y = event.xdata, event.ydata
@@ -1279,6 +1996,7 @@ class OpenBeamPlotDialog(QDialog):
 
 __all__ = [
     "MplCanvas",
+    "MaskGeneratorDialog",
     "FitVisualizationDialog",
     "AdjustmentsDialog",
     "ParameterPlotDialog",

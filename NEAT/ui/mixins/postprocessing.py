@@ -6,8 +6,10 @@ import numpy as np
 import pandas as pd
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QGridLayout,
+    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -18,6 +20,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from ... import __version__
 from ..dialogs import ParameterPlotDialog
 from ...workers.batch import load_image_file
 
@@ -78,9 +81,10 @@ class PostProcessingMixin:
 
     def setup_about_tab(self):
         layout = QVBoxLayout(self.tab3)
+        app_version = str(__version__).strip()
 
-        about_text = """
-        <h2>NEAT Neutron Bragg Edge Analysis Toolkit v4.6.0</h2>
+        about_text = f"""
+        <h2>NEAT Neutron Bragg Edge Analysis Toolkit v{app_version}</h2>
 
         <p><b>Developed by:</b><br>
         Engineering and imaging group<br>
@@ -116,6 +120,22 @@ class PostProcessingMixin:
         scroll.setWidget(about_label)
 
         layout.addWidget(scroll)
+
+        update_controls = QHBoxLayout()
+        self.update_check_startup_checkbox = QCheckBox("Check for updates on startup")
+        self.update_check_startup_checkbox.setChecked(
+            bool(getattr(self, "check_updates_on_startup", True))
+        )
+        self.update_check_startup_checkbox.toggled.connect(
+            self.on_update_check_startup_toggled
+        )
+        update_controls.addWidget(self.update_check_startup_checkbox)
+
+        self.check_updates_button = QPushButton("Check for Updates Now")
+        self.check_updates_button.clicked.connect(self.check_for_updates_now)
+        update_controls.addWidget(self.check_updates_button)
+        update_controls.addStretch(1)
+        layout.addLayout(update_controls)
 
     def load_csv_file(self):
         """

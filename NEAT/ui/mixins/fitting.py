@@ -73,6 +73,80 @@ from ..dialogs import (
 
 
 class FittingMixin:
+    def _build_batch_fit_context(self):
+        """Snapshot fit inputs from UI so worker threads do not read widgets directly."""
+        def _safe_float_text(text):
+            try:
+                return float(text)
+            except (TypeError, ValueError):
+                return None
+
+        table = self.bragg_table
+        selected_phase = self.phase_dropdown.currentText() if hasattr(self, "phase_dropdown") else "Unknown_Phase"
+        bragg_rows = []
+        bragg_rows_text = []
+
+        for row_idx in range(table.rowCount()):
+            row_items = []
+            for col_idx in range(table.columnCount()):
+                cell_item = table.item(row_idx, col_idx)
+                row_items.append(cell_item.text() if cell_item else "")
+            bragg_rows_text.append("|".join(v.replace(",", ";") for v in row_items))
+
+            hkl_tuple = None
+            hkl_text = row_items[0].strip().strip("()") if row_items else ""
+            if hkl_text:
+                try:
+                    h, k, l = map(int, [v.strip() for v in hkl_text.split(",")])
+                    hkl_tuple = (h, k, l)
+                except (TypeError, ValueError):
+                    hkl_tuple = None
+
+            regions = []
+            valid_regions = True
+            for cmin, cmax in ((2, 3), (4, 5), (6, 7)):
+                min_w = _safe_float_text(row_items[cmin] if len(row_items) > cmin else "")
+                max_w = _safe_float_text(row_items[cmax] if len(row_items) > cmax else "")
+                if min_w is None or max_w is None or min_w >= max_w:
+                    valid_regions = False
+                    break
+                regions.append({"min_wavelength": min_w, "max_wavelength": max_w})
+
+            s_val = _safe_float_text(row_items[8] if len(row_items) > 8 else "")
+            t_val = _safe_float_text(row_items[9] if len(row_items) > 9 else "")
+            eta_val = _safe_float_text(row_items[10] if len(row_items) > 10 else "")
+            d_val = _safe_float_text(row_items[1] if len(row_items) > 1 else "")
+
+            bragg_rows.append(
+                {
+                    "row": row_idx,
+                    "hkl": hkl_tuple,
+                    "d": d_val,
+                    "regions": regions if valid_regions else None,
+                    "s": s_val,
+                    "t": t_val,
+                    "eta": eta_val,
+                    "valid": bool(
+                        valid_regions
+                        and s_val is not None
+                        and t_val is not None
+                        and eta_val is not None
+                        and (hkl_tuple is not None or selected_phase == "Unknown_Phase")
+                    ),
+                }
+            )
+
+        return {
+            "structure_type": getattr(self, "structure_type", "cubic"),
+            "lattice_params": dict(getattr(self, "lattice_params", {})),
+            "selected_phase": selected_phase,
+            "flight_path": getattr(self, "flight_path", None),
+            "min_wavelength": _safe_float_text(self.min_wavelength_input.text() if hasattr(self, "min_wavelength_input") else ""),
+            "max_wavelength": _safe_float_text(self.max_wavelength_input.text() if hasattr(self, "max_wavelength_input") else ""),
+            "bragg_rows": bragg_rows,
+            "bragg_rows_text": bragg_rows_text,
+        }
+
     def setup_FittingTab(self):
         """
         Bragg edge fitting
@@ -121,6 +195,7 @@ class FittingMixin:
         self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
         self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
+        self.canvas.mpl_connect("scroll_event", self._on_canvas_scroll)
 
 
         # --- Lower left widget (contains all controls) ---
@@ -795,10 +870,12 @@ class FittingMixin:
         fix_eta = self.fix_eta_checkbox.isChecked()
 
         # Start the worker
+        fit_context = self._build_batch_fit_context()
         self.batch_fit_edges_worker = BatchFitEdgesWorker(
             parent=self,
             images=self.images,
             wavelengths=self.wavelengths,
+            fit_context=fit_context,
             min_x=min_x,
             max_x=max_x,
             min_y=min_y,
@@ -844,6 +921,10 @@ class FittingMixin:
         fix_eta=False,
         max_nfev=300,
         curve_fit_maxfev=None,
+        fit_context=None,
+        wavelengths=None,
+        intensities=None,
+        apply_lattice_update=True,
     ):
         """Core logic for full-pattern fitting supporting multiple crystal structures 
            and returning parameter uncertainties.
@@ -863,55 +944,77 @@ class FittingMixin:
         # -------------------------------
         # 1) Validate structure & params
         # -------------------------------
-        structure_type = getattr(self, "structure_type", "cubic")
+        ctx = fit_context or {}
+        structure_type = ctx.get("structure_type", getattr(self, "structure_type", "cubic"))
         if structure_type not in STRUCTURE_CONFIG:
             return None, f"Unsupported structure type: {structure_type}"
 
         required_params = STRUCTURE_CONFIG[structure_type]
-        if not hasattr(self, "lattice_params"):
+        lattice_params = dict(ctx.get("lattice_params", getattr(self, "lattice_params", {})))
+        if not lattice_params:
             return None, "Lattice parameters not initialized"
 
-        missing_params = [p for p in required_params if p not in self.lattice_params]
+        missing_params = [p for p in required_params if p not in lattice_params]
         if missing_params:
             return None, f"Missing parameters for {structure_type}: {missing_params}"
+
+        wavelengths_data = self.wavelengths if wavelengths is None else np.asarray(wavelengths)
+        intensities_data = self.intensities if intensities is None else np.asarray(intensities)
 
         # -------------------------------
         # 2) Collect valid Bragg edges w/ Region 3 data
         # -------------------------------
-        total_edges = self.bragg_table.rowCount()
+        if fit_context is not None:
+            source_rows = list(ctx.get("bragg_rows", []))
+            total_edges = len(source_rows)
+        else:
+            source_rows = None
+            total_edges = self.bragg_table.rowCount()
         if total_edges == 0:
             return None, "No Bragg edges to fit"
 
         bragg_edges = []
         for row in range(total_edges):
-            # Parse hkl
-            hkl_item = self.bragg_table.item(row, 0)
-            try:
-                hkl_str = hkl_item.text().strip('()') if hkl_item else "0,0,0"
-                h, k, l = map(int, hkl_str.split(','))
-                hkl = (h, k, l)
-            except ValueError:
-                return None, f"Invalid hkl format in row {row+1}"
-
-            # Validate region bounds
-            regions = []
-            for region_num in range(1, 4):
-                min_w_item = self.bragg_table.item(row, (region_num - 1)*2 + 2)
-                max_w_item = self.bragg_table.item(row, (region_num - 1)*2 + 3)
+            if source_rows is not None:
+                row_data = source_rows[row]
+                if not row_data.get("valid"):
+                    continue
+                hkl = row_data.get("hkl")
+                regions = row_data.get("regions")
+                s_val = row_data.get("s", 0.001)
+                t_val = row_data.get("t", 0.01)
+                eta_val = row_data.get("eta", 0.5)
+                if hkl is None or not regions:
+                    continue
+            else:
+                # Parse hkl
+                hkl_item = self.bragg_table.item(row, 0)
                 try:
-                    min_w = float(min_w_item.text())
-                    max_w = float(max_w_item.text())
-                    if min_w >= max_w:
-                        return None, f"Invalid region {region_num} bounds for hkl{hkl}"
-                    regions.append({'min_wavelength': min_w, 'max_wavelength': max_w})
-                except (ValueError, AttributeError):
-                    return None, f"Invalid region {region_num} data for hkl{hkl}"
+                    hkl_str = hkl_item.text().strip('()') if hkl_item else "0,0,0"
+                    h, k, l = map(int, hkl_str.split(','))
+                    hkl = (h, k, l)
+                except ValueError:
+                    return None, f"Invalid hkl format in row {row+1}"
+
+                # Validate region bounds
+                regions = []
+                for region_num in range(1, 4):
+                    min_w_item = self.bragg_table.item(row, (region_num - 1)*2 + 2)
+                    max_w_item = self.bragg_table.item(row, (region_num - 1)*2 + 3)
+                    try:
+                        min_w = float(min_w_item.text())
+                        max_w = float(max_w_item.text())
+                        if min_w >= max_w:
+                            return None, f"Invalid region {region_num} bounds for hkl{hkl}"
+                        regions.append({'min_wavelength': min_w, 'max_wavelength': max_w})
+                    except (ValueError, AttributeError):
+                        return None, f"Invalid region {region_num} data for hkl{hkl}"
 
             # Extract region 3 data
             r3_min, r3_max = regions[2]['min_wavelength'], regions[2]['max_wavelength']
-            mask_r3 = (self.wavelengths >= r3_min) & (self.wavelengths <= r3_max)
-            x_r3 = self.wavelengths[mask_r3]
-            y_r3 = self.intensities[mask_r3]
+            mask_r3 = (wavelengths_data >= r3_min) & (wavelengths_data <= r3_max)
+            x_r3 = wavelengths_data[mask_r3]
+            y_r3 = intensities_data[mask_r3]
             if len(x_r3) == 0:
                 # Skip edges that have no Region 3 coverage
                 continue
@@ -919,9 +1022,9 @@ class FittingMixin:
             # Fit Region 1 and 2
             try:
                 # Region 1
-                mask_r1 = (self.wavelengths >= regions[1]['min_wavelength']) & (self.wavelengths <= regions[1]['max_wavelength'])
-                x_r1 = self.wavelengths[mask_r1]
-                y_r1 = self.intensities[mask_r1]
+                mask_r1 = (wavelengths_data >= regions[1]['min_wavelength']) & (wavelengths_data <= regions[1]['max_wavelength'])
+                x_r1 = wavelengths_data[mask_r1]
+                y_r1 = intensities_data[mask_r1]
                 p0 = [0,0]
                 lower = [-10, -10]
                 upper = [10, 10]
@@ -941,9 +1044,9 @@ class FittingMixin:
                 a0, b0 = popt_r1
 
                 # Region 2
-                mask_r2 = (self.wavelengths >= regions[0]['min_wavelength']) & (self.wavelengths <= regions[0]['max_wavelength'])
-                x_r2 = self.wavelengths[mask_r2]
-                y_r2 = self.intensities[mask_r2]
+                mask_r2 = (wavelengths_data >= regions[0]['min_wavelength']) & (wavelengths_data <= regions[0]['max_wavelength'])
+                x_r2 = wavelengths_data[mask_r2]
+                y_r2 = intensities_data[mask_r2]
                 popt_r2, _ = curve_fit(
                     lambda xx, a, b: fitting_function_2(xx, a, b, a0, b0),
                     x_r2,
@@ -953,19 +1056,20 @@ class FittingMixin:
                 )
                 a_hkl, b_hkl = popt_r2
 
-            except Exception as e:
+            except (RuntimeError, ValueError, TypeError, FloatingPointError) as e:
                 return None, f"Fitting error for hkl{hkl}: {str(e)}"
 
-            # Grab s/t from the table
-            s_item = self.bragg_table.item(row, 8)
-            t_item = self.bragg_table.item(row, 9)
-            eta_item = self.bragg_table.item(row, 10)
-            try:
-                s_val = float(s_item.text()) if s_item else 0.001
-                t_val = float(t_item.text()) if t_item else 0.01
-                eta_val=float(eta_item.text()) if eta_item else 0.5
-            except ValueError:
-                return None, f"Invalid s/t values for hkl{hkl}"
+            if source_rows is None:
+                # Grab s/t from the table
+                s_item = self.bragg_table.item(row, 8)
+                t_item = self.bragg_table.item(row, 9)
+                eta_item = self.bragg_table.item(row, 10)
+                try:
+                    s_val = float(s_item.text()) if s_item else 0.001
+                    t_val = float(t_item.text()) if t_item else 0.01
+                    eta_val=float(eta_item.text()) if eta_item else 0.5
+                except ValueError:
+                    return None, f"Invalid s/t values for hkl{hkl}"
 
             # Store edge data
             bragg_edges.append({
@@ -989,7 +1093,7 @@ class FittingMixin:
         # 3) Prepare global fit params
         # -------------------------------
         # Lattice parameters
-        lattice_initial = [self.lattice_params[p] for p in required_params]
+        lattice_initial = [lattice_params[p] for p in required_params]
         lattice_lower = [v * 0.95 for v in lattice_initial]
         lattice_upper = [v * 1.05 for v in lattice_initial]
 
@@ -1185,58 +1289,13 @@ class FittingMixin:
 
 
         # Update our class lattice_params with the newly fitted ones
-        self.lattice_params.update(lattice_fit)
-
-        # -------------------------------
-        # 7) Compute parameter uncertainties from Jacobian
-        # -------------------------------
-        # residuals at the final solution:
-        final_res = residuals(final_params)
-        N = len(concatenated_y)
-        M = len(final_params)
-        RSS = np.sum(final_res**2)
-        # Basic variance estimate:
-        if N > M:
-            variance = RSS / (N - M)
-        else:
-            variance = RSS / N
-
-        try:
-            J = result.jac
-            JTJ = J.T @ J
-            cov = np.linalg.inv(JTJ) * variance
-            param_stderr = np.sqrt(np.diag(cov))  # std dev for each param
-        except np.linalg.LinAlgError:
-            # If singular, set uncertainties to inf
-            param_stderr = np.full(len(final_params), np.inf)
+        if apply_lattice_update and hasattr(self, "lattice_params"):
+            self.lattice_params.update(lattice_fit)
 
         # Lattice param uncertainties
         lattice_uncertainties = {}
         for i, p in enumerate(required_params):
             lattice_uncertainties[p] = param_stderr[i]
-
-        # s uncertainties
-        s_uncertainties_list = []
-        if not fix_s:
-            s_uncertainties_list = param_stderr[len(required_params) : len(required_params) + len(bragg_edges)]
-            idx_ = len(required_params) + len(bragg_edges)
-        else:
-            s_uncertainties_list = [0.0]*len(bragg_edges)
-            idx_ = len(required_params)
-
-        # t uncertainties
-        t_uncertainties_list = []
-        if not fix_t:
-            t_uncertainties_list = param_stderr[idx_ : idx_ + len(bragg_edges)]
-        else:
-            t_uncertainties_list = [0.0]*len(bragg_edges)
-
-        # eta uncertainties
-        eta_uncertainties_list = []
-        if not fix_eta:
-            eta_uncertainties_list = param_stderr[idx_ : idx_ + len(bragg_edges)]
-        else:
-            eta_uncertainties_list = [0.0]*len(bragg_edges)
 
         # Build dictionaries from hkl -> s/t uncertainty
         s_unc_dict = {}
@@ -1324,7 +1383,7 @@ class FittingMixin:
                     structure_type, lattice_fit
                 )
                 edge_height = yy_h.max() - yy_h.min() if yy_h.size else np.nan
-            except Exception:
+            except (ValueError, FloatingPointError, TypeError):
                 edge_height = np.nan
 
             # Width: FWHM of derivative around x_edge using Region3 model
@@ -1354,7 +1413,7 @@ class FittingMixin:
                 if indices.size == 0:
                     raise ValueError("No points above half maximum")
                 edge_width = xx[indices[-1]] - xx[indices[0]]
-            except Exception:
+            except (ValueError, FloatingPointError, TypeError):
                 edge_width = np.nan
 
             edge_widths[edge['hkl']] = edge_width
@@ -2016,7 +2075,7 @@ class FittingMixin:
                             existing_anchors[i].get("wavelength", preset_val)
                         )
                     )
-                except Exception:
+                except (TypeError, ValueError, AttributeError):
                     pass
             add_anchor_row(preset_index, preset_val)
 
@@ -2069,22 +2128,22 @@ class FittingMixin:
             def _set_float(spin, key):
                 try:
                     spin.setValue(float(metadata[key]))
-                except Exception:
+                except (KeyError, TypeError, ValueError):
                     pass
             def _set_line_float(line_edit, key):
                 try:
                     line_edit.setText(str(float(metadata[key])))
-                except Exception:
+                except (KeyError, TypeError, ValueError):
                     pass
             def _set_int(line_edit, key):
                 try:
                     line_edit.setText(str(int(float(metadata[key]))))
-                except Exception:
+                except (KeyError, TypeError, ValueError):
                     pass
             def _set_bool(checkbox, key):
                 try:
                     checkbox.setChecked(str(metadata[key]).strip().lower() in ("1","true","yes","y","on"))
-                except Exception:
+                except (KeyError, TypeError, ValueError):
                     pass
 
             _set_float(flight_spin, "flight_path")
@@ -2097,7 +2156,7 @@ class FittingMixin:
             try:
                 if "symbol_size" in metadata:
                     symbol_spin.setValue(int(float(metadata["symbol_size"])))
-            except Exception:
+            except (TypeError, ValueError):
                 pass
 
             # Batch ROI and grid parameters
@@ -2322,6 +2381,13 @@ class FittingMixin:
             )
 
 
+        # Preserve current zoom/pan view across redraws.
+        saved_xlim = None
+        saved_ylim = None
+        if self.canvas.axes.has_data():
+            saved_xlim = self.canvas.axes.get_xlim()
+            saved_ylim = self.canvas.axes.get_ylim()
+
         # Display the adjusted image on the Matplotlib canvas
         self.canvas.axes.clear()
         self.canvas.axes.imshow(current_image, cmap='gray', vmin=self.current_vmin, vmax=self.current_vmax)
@@ -2350,7 +2416,7 @@ class FittingMixin:
                     lw=1,
                 )
                 self.canvas.axes.add_patch(roi_rect)
-        except Exception:
+        except ValueError:
             pass
 
         # # Draw the batch fitting moving box, if available
@@ -2375,7 +2441,7 @@ class FittingMixin:
                     self.batch_box_patch.set_xy((ymin, xmin))
                     self.batch_box_patch.set_width(ymax - ymin)
                     self.batch_box_patch.set_height(xmax - xmin)
-                except Exception:
+                except (ValueError, RuntimeError, AttributeError):
                     # Fallback: recreate it cleanly
                     self.batch_box_patch.remove()
                     self.batch_box_patch = Rectangle(
@@ -2403,6 +2469,9 @@ class FittingMixin:
             f"Image {self.current_image_index + 1}/{len(self.images)}",
             fontsize=getattr(self, "plot_font_size", 12),
         )
+        if saved_xlim is not None and saved_ylim is not None:
+            self.canvas.axes.set_xlim(saved_xlim)
+            self.canvas.axes.set_ylim(saved_ylim)
         self.canvas.draw_idle()
 
     def update_display(self):
@@ -2559,6 +2628,70 @@ class FittingMixin:
             self._dragging_batch_mode = "move"
             self._batch_active_corner = None
 
+    def _is_fitting_navigation_active(self):
+        """Return True when matplotlib toolbar pan/zoom mode is active."""
+        mode = str(getattr(self.toolbar, "mode", "")).strip().lower()
+        if mode and mode not in ("none",):
+            return True
+        active = getattr(self.toolbar, "_active", None)
+        return bool(str(active).strip()) if active is not None else False
+
+    def _on_canvas_scroll(self, event):
+        """Zoom in/out around cursor with mouse wheel."""
+        if not self.images or event.inaxes != self.canvas.axes:
+            return
+        if self._is_fitting_navigation_active():
+            return
+        if self._dragging_roi or self._dragging_batch_roi:
+            return
+        if event.button not in ("up", "down"):
+            return
+
+        ax = self.canvas.axes
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        x_center = event.xdata if event.xdata is not None else (x0 + x1) / 2.0
+        y_center = event.ydata if event.ydata is not None else (y0 + y1) / 2.0
+        scale = 0.9 if event.button == "up" else 1.1
+
+        image_h, image_w = self.images[0].shape
+        x_bounds = (-0.5, image_w - 0.5)
+        y_bounds = (-0.5, image_h - 0.5)
+
+        def _zoom_axis(a0, a1, center, bounds):
+            inverted = a0 > a1
+            lo, hi = (a1, a0) if inverted else (a0, a1)
+            if hi <= lo:
+                return a0, a1
+
+            center = min(max(center, bounds[0]), bounds[1])
+            rel = (center - lo) / (hi - lo)
+            rel = min(max(rel, 0.0), 1.0)
+            span = (hi - lo) * scale
+            full_span = bounds[1] - bounds[0]
+
+            if span >= full_span:
+                new_lo, new_hi = bounds
+            else:
+                new_lo = center - span * rel
+                new_hi = center + span * (1.0 - rel)
+                if new_lo < bounds[0]:
+                    new_hi += (bounds[0] - new_lo)
+                    new_lo = bounds[0]
+                if new_hi > bounds[1]:
+                    new_lo -= (new_hi - bounds[1])
+                    new_hi = bounds[1]
+                new_lo = max(new_lo, bounds[0])
+                new_hi = min(new_hi, bounds[1])
+
+            return (new_hi, new_lo) if inverted else (new_lo, new_hi)
+
+        new_x0, new_x1 = _zoom_axis(x0, x1, x_center, x_bounds)
+        new_y0, new_y1 = _zoom_axis(y0, y1, y_center, y_bounds)
+        ax.set_xlim(new_x0, new_x1)
+        ax.set_ylim(new_y0, new_y1)
+        self.canvas.draw_idle()
+
     def _sync_selected_area_inputs(self):
         """Keep coordinate text boxes in sync with the current ROI."""
         if not self.selected_area:
@@ -2585,7 +2718,7 @@ class FittingMixin:
             ymax = int(self.ymax_input.text())
             if xmin < xmax and ymin < ymax:
                 return xmax - xmin, ymax - ymin
-        except Exception:
+        except ValueError:
             pass
         return None, None
 
@@ -2606,7 +2739,7 @@ class FittingMixin:
             (
                 f"Batch box size ({box_width} x {box_height}) differs from the picked "
                 f"macro-pixel size ({macro_w} x {macro_h}).\n"
-                "Start batch fitting using the current box size?"
+                f"Start batch fitting using the current batch box size ({box_width} x {box_height})?"
             ),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -2717,7 +2850,7 @@ class FittingMixin:
                 return
             self.selected_region_x = self.wavelengths[mask]  # Store as instance variable
             self.selected_region_y = self.intensities[mask]  # Store as instance variable
-        except Exception:
+        except (TypeError, ValueError, AttributeError):
             self.message_box.append("Select a Bragg Edge to display the regions")
 
         # Plot (a): Intensity vs Wavelength
@@ -2901,13 +3034,36 @@ class FittingMixin:
             self.bragg_table.setItem(row, col, item)
         item.setText(text)
 
-    def fit_region(self, row_number, skip_ui_updates=False):
+    def fit_region(
+        self,
+        row_number,
+        skip_ui_updates=False,
+        row_data=None,
+        wavelengths=None,
+        intensities=None,
+        fit_flags=None,
+        selected_phase=None,
+        structure_type=None,
+        lattice_params=None,
+    ):
 
-        fix_s = self.fix_s_checkbox.isChecked()
-        fix_t = self.fix_t_checkbox.isChecked()
-        fix_eta = self.fix_eta_checkbox.isChecked()
-        selected_phase = self.phase_dropdown.currentText()
+        if fit_flags is None:
+            fix_s = self.fix_s_checkbox.isChecked()
+            fix_t = self.fix_t_checkbox.isChecked()
+            fix_eta = self.fix_eta_checkbox.isChecked()
+        else:
+            fix_s, fix_t, fix_eta = fit_flags
+        selected_phase = selected_phase if selected_phase is not None else self.phase_dropdown.currentText()
         is_known_phase = selected_phase != "Unknown_Phase"
+        wavelengths_data = self.wavelengths if wavelengths is None else np.asarray(wavelengths)
+        intensities_data = self.intensities if intensities is None else np.asarray(intensities)
+        lattice_params_data = dict(lattice_params if lattice_params is not None else getattr(self, "lattice_params", {}))
+        structure_type_data = structure_type if structure_type is not None else getattr(self, "structure_type", "fcc" if is_known_phase else "unknown")
+        params_store = {}
+        if not skip_ui_updates:
+            if not hasattr(self, "params_unknown"):
+                self.params_unknown = {}
+            params_store = self.params_unknown
 
         try:
             # Validate structure type
@@ -2920,42 +3076,55 @@ class FittingMixin:
             # Get lattice parameter (cubic-specific logic)
             if is_known_phase:
                 # Cubic structure requires only 'a'
-                if "a" not in self.lattice_params:
+                if "a" not in lattice_params_data:
                     raise ValueError("Missing cubic lattice parameter 'a'")
-                a_guess = self.lattice_params["a"]
+                a_guess = lattice_params_data["a"]
             else:
                 # Unknown phase: use 'd' value from table as 'a' estimate
-                d_item = self.bragg_table.item(row_number, 1)
-                if not d_item or not d_item.text().strip():
-                    raise ValueError("Missing 'd' value for unknown phase")
-                a_guess = float(d_item.text())/2
+                if row_data is not None:
+                    d_val = row_data.get("d")
+                    if d_val is None:
+                        raise ValueError("Missing 'd' value for unknown phase")
+                    a_guess = float(d_val) / 2.0
+                else:
+                    d_item = self.bragg_table.item(row_number, 1)
+                    if not d_item or not d_item.text().strip():
+                        raise ValueError("Missing 'd' value for unknown phase")
+                    a_guess = float(d_item.text())/2
 
             # Get region boundaries and parameters
-            r1_min = float(self.bragg_table.item(row_number, 4).text())
-            r1_max = float(self.bragg_table.item(row_number, 5).text())
-            r2_min = float(self.bragg_table.item(row_number, 2).text())
-            r2_max = float(self.bragg_table.item(row_number, 3).text())
-            r3_min = float(self.bragg_table.item(row_number, 6).text())
-            r3_max = float(self.bragg_table.item(row_number, 7).text())
-            s_val = float(self.bragg_table.item(row_number, 8).text())
-            t_val = float(self.bragg_table.item(row_number, 9).text())
-            eta_val = float(self.bragg_table.item(row_number, 10).text())
+            if row_data is not None:
+                regions = row_data.get("regions") or []
+                if len(regions) != 3:
+                    raise ValueError("Invalid region bounds for selected edge")
+                r1_min, r1_max = regions[1]["min_wavelength"], regions[1]["max_wavelength"]
+                r2_min, r2_max = regions[0]["min_wavelength"], regions[0]["max_wavelength"]
+                r3_min, r3_max = regions[2]["min_wavelength"], regions[2]["max_wavelength"]
+                s_val = float(row_data.get("s"))
+                t_val = float(row_data.get("t"))
+                eta_val = float(row_data.get("eta"))
+            else:
+                r1_min = float(self.bragg_table.item(row_number, 4).text())
+                r1_max = float(self.bragg_table.item(row_number, 5).text())
+                r2_min = float(self.bragg_table.item(row_number, 2).text())
+                r2_max = float(self.bragg_table.item(row_number, 3).text())
+                r3_min = float(self.bragg_table.item(row_number, 6).text())
+                r3_max = float(self.bragg_table.item(row_number, 7).text())
+                s_val = float(self.bragg_table.item(row_number, 8).text())
+                t_val = float(self.bragg_table.item(row_number, 9).text())
+                eta_val = float(self.bragg_table.item(row_number, 10).text())
 
         except Exception as e:
             if not skip_ui_updates:
                 self.message_box.append(f"Edge {row_number+1} Error: {str(e)}")
             return
-        # Initialize parameter storage for this row if not already done
-        if not hasattr(self, 'params_unknown'):
-            self.params_unknown = {}
-
         # -------------------------------------------------
         #  Region 1 Fitting
         # -------------------------------------------------
         try:
-            mask_r1 = (self.wavelengths >= r1_min) & (self.wavelengths <= r1_max)
-            x_r1 = self.wavelengths[mask_r1]
-            y_r1 = self.intensities[mask_r1]
+            mask_r1 = (wavelengths_data >= r1_min) & (wavelengths_data <= r1_max)
+            x_r1 = wavelengths_data[mask_r1]
+            y_r1 = intensities_data[mask_r1]
 
             if x_r1.size == 0:
                 if not skip_ui_updates:
@@ -2977,7 +3146,7 @@ class FittingMixin:
             upper = [10, 10]
             popt_r1, _ = curve_fit(fitting_function_1, x_r1, y_r1, p0=p0, bounds=(lower, upper))
             a0, b0 = popt_r1
-            self.params_unknown[row_number, 1] = popt_r1  # (a0, b0)
+            params_store[row_number, 1] = popt_r1  # (a0, b0)
             fit_y1 = fitting_function_1(x_r1, *popt_r1)
 
             if not skip_ui_updates:
@@ -3000,14 +3169,14 @@ class FittingMixin:
         #  Region 2 Fitting
         # -------------------------------------------------
         try:
-            if (row_number, 1) not in self.params_unknown:
+            if (row_number, 1) not in params_store:
                 # Region 1 must be fitted first
                 return
-            a0, b0 = self.params_unknown[row_number, 1]
+            a0, b0 = params_store[row_number, 1]
 
-            mask_r2 = (self.wavelengths >= r2_min) & (self.wavelengths <= r2_max)
-            x_r2 = self.wavelengths[mask_r2]
-            y_r2 = self.intensities[mask_r2]
+            mask_r2 = (wavelengths_data >= r2_min) & (wavelengths_data <= r2_max)
+            x_r2 = wavelengths_data[mask_r2]
+            y_r2 = intensities_data[mask_r2]
 
             if x_r2.size == 0:
                 if not skip_ui_updates:
@@ -3030,7 +3199,7 @@ class FittingMixin:
                 x_r2, y_r2, p0=[0, 0]
             )
             a_hkl, b_hkl = popt_r2
-            self.params_unknown[row_number, 2] = popt_r2  # (a_hkl, b_hkl)
+            params_store[row_number, 2] = popt_r2  # (a_hkl, b_hkl)
             fit_y2 = fitting_function_2(x_r2, *popt_r2, a0, b0)
 
             if not skip_ui_updates:
@@ -3060,24 +3229,27 @@ class FittingMixin:
                 return x - d, x + d       # works for positives and negatives
 
             # 1. pull stage-1/2 estimates -----------------------------------------
-            a0_hat,  b0_hat  = self.params_unknown[row_number, 1]
-            a_hkl_hat, b_hkl_hat = self.params_unknown[row_number, 2]
+            a0_hat,  b0_hat  = params_store[row_number, 1]
+            a_hkl_hat, b_hkl_hat = params_store[row_number, 2]
 
             # 2. first four bounds ( ±50 % each ) ---------------------------------
             lb4, ub4 = zip(*(span50(p) for p in (a0_hat, b0_hat, a_hkl_hat, b_hkl_hat)))
 
             # ---------- hkl tuple ---------------------------------
             if is_known_phase:
-                hkl_item = self.bragg_table.item(row_number, 0)
-                h, k, l = map(int, hkl_item.text().strip("()").split(","))
+                if row_data is not None and row_data.get("hkl") is not None:
+                    h, k, l = row_data["hkl"]
+                else:
+                    hkl_item = self.bragg_table.item(row_number, 0)
+                    h, k, l = map(int, hkl_item.text().strip("()").split(","))
                 hkl = (h, k, l)
             else:
                 hkl = f"edge{row_number+1}"        # label for unknown
 
             # ---------- masks & data ------------------------------
-            mask_r3 = (self.wavelengths >= r3_min) & (self.wavelengths <= r3_max)
-            x_r3    = self.wavelengths[mask_r3]
-            y_r3    = self.intensities[mask_r3]
+            mask_r3 = (wavelengths_data >= r3_min) & (wavelengths_data <= r3_max)
+            x_r3    = wavelengths_data[mask_r3]
+            y_r3    = intensities_data[mask_r3]
 
             if not skip_ui_updates:
                 self.plot_canvas_d.axes.plot(
@@ -3168,12 +3340,18 @@ class FittingMixin:
             # Height: max-min of fitted Region3 curve over its span
             # Width : FWHM of derivative of Region3 model around the edge
             try:
-                # Compute d_hkl via general calculator
-                structure = getattr(self, "structure_type", "fcc" if is_known_phase else "unknown")
-                lat = getattr(self, "lattice_params", {}) or {"a": a_fit}
-                d_vals = calculate_x_hkl_general(structure, lat, [(h, k, l)]) if is_known_phase else [a_fit/2]
-                d_hkl = d_vals[0] / 2.0 if d_vals and not np.isnan(d_vals[0]) else np.nan
-            except Exception:
+                if is_known_phase:
+                    # Known phase: derive d-spacing from lattice + hkl.
+                    structure = structure_type_data
+                    lat = lattice_params_data or {"a": a_fit}
+                    d_vals = calculate_x_hkl_general(structure, lat, [(h, k, l)])
+                    d_hkl = d_vals[0] / 2.0 if d_vals and not np.isnan(d_vals[0]) else np.nan
+                else:
+                    # Unknown phase: a_fit is lambda_hkl, so d = lambda/2.
+                    structure = "cubic"
+                    d_hkl = a_fit / 2.0
+                    lat = {"a": d_hkl}
+            except (TypeError, ValueError, KeyError):
                 d_hkl = np.nan
 
             if np.isnan(d_hkl) or d_hkl <= 0:
@@ -3192,7 +3370,7 @@ class FittingMixin:
                         structure, lat
                     )
                     edge_height = yy_h.max() - yy_h.min() if yy_h.size else np.nan
-                except Exception:
+                except (ValueError, FloatingPointError):
                     edge_height = np.nan
 
                 try:
@@ -3219,16 +3397,16 @@ class FittingMixin:
                     if indices.size == 0:
                         raise ValueError("No points above half maximum")
                     edge_width = xx[indices[-1]] - xx[indices[0]]
-                except Exception:
+                except (ValueError, FloatingPointError):
                     edge_width = np.nan
 
-            self.params_unknown[row_number, 4] = edge_height
-            self.params_unknown[row_number, 5] = edge_width
+            params_store[row_number, 4] = edge_height
+            params_store[row_number, 5] = edge_width
 
             # <<< END NEW ----------------------------------------
 
             # ----- store everything for later use ----------------
-            self.params_unknown[row_number, 3] = (
+            params_store[row_number, 3] = (
                 d_fit, s_fit, t_fit, eta_fit,
                 d_unc, s_unc, t_unc, eta_unc
             )
@@ -3245,6 +3423,9 @@ class FittingMixin:
                     "s_fit":    s_fit,   "s_unc":  s_unc,
                     "t_fit":    t_fit,   "t_unc":  t_unc,
                     "eta_fit":  eta_fit, "eta_unc":eta_unc,
+                    "fit_params": (d_fit, s_fit, t_fit, eta_fit, d_unc, s_unc, t_unc, eta_unc),
+                    "edge_height": edge_height,
+                    "edge_width": edge_width,
                 }
 
             # ---------- live plotting / messages (GUI) -----------
@@ -3363,12 +3544,14 @@ class FittingMixin:
         fix_s = self.fix_s_checkbox.isChecked()
         fix_t = self.fix_t_checkbox.isChecked()
         fix_eta = self.fix_eta_checkbox.isChecked()
+        fit_context = self._build_batch_fit_context()
 
         # Start the batch fitting worker
         self.batch_fit_worker = BatchFitWorker(
             parent=self,
             images=self.images,
             wavelengths=self.wavelengths,
+            fit_context=fit_context,
             min_x=min_x,
             max_x=max_x,
             min_y=min_y,

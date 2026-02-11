@@ -4,7 +4,11 @@ import gc
 import glob
 import json
 import os
+import re
 import time
+from datetime import datetime, timedelta, timezone
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import matplotlib as mpl
 import numpy as np
@@ -41,15 +45,16 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QShortcut,
 )
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QKeySequence
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl
+from PyQt5.QtGui import QDesktopServices, QFont, QKeySequence
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.patches import Rectangle
 from scipy.optimize import curve_fit, least_squares
 
+from .. import __version__
 from ..core import (
     PHASE_DATA,
-    calculate_x_hkl_general,
+    calculate_theoretical_bragg_edges,
     fitting_function_1,
     fitting_function_2,
     fitting_function_3,
@@ -59,6 +64,60 @@ from .mixins.postprocessing import PostProcessingMixin
 from .mixins.preprocessing import PreprocessingMixin
 from .utils import update_all_widget_fonts
 
+
+UPDATE_API_URL = "https://api.github.com/repos/RayZhang2024/NEAT/releases/latest"
+UPDATE_RELEASES_URL = "https://github.com/RayZhang2024/NEAT/releases/latest"
+
+
+def _version_tuple(raw):
+    """Convert a version string to a numeric tuple for comparison."""
+    cleaned = str(raw or "").strip().lstrip("vV")
+    match = re.search(r"\d+(?:\.\d+)*", cleaned)
+    if not match:
+        return tuple()
+    return tuple(int(part) for part in match.group(0).split("."))
+
+
+class UpdateCheckWorker(QThread):
+    """Check GitHub releases in the background to avoid blocking the UI."""
+
+    check_finished = pyqtSignal(dict)
+
+    def __init__(self, current_version, api_url=UPDATE_API_URL, parent=None):
+        super().__init__(parent)
+        self.current_version = current_version
+        self.api_url = api_url
+
+    def run(self):
+        try:
+            request = Request(
+                self.api_url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "NEAT-UpdateChecker",
+                },
+            )
+            with urlopen(request, timeout=6) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            self.check_finished.emit({"ok": False, "error": str(exc)})
+            return
+
+        latest_raw = payload.get("tag_name") or payload.get("name") or ""
+        latest_version = str(latest_raw).strip()
+        result = {
+            "ok": True,
+            "latest_version": latest_version,
+            "latest_tuple": _version_tuple(latest_version),
+            "current_tuple": _version_tuple(self.current_version),
+            "html_url": payload.get("html_url") or UPDATE_RELEASES_URL,
+        }
+        result["update_available"] = bool(
+            result["latest_tuple"] and result["latest_tuple"] > result["current_tuple"]
+        )
+        self.check_finished.emit(result)
+
+
 class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMixin):
     def __init__(self):
         super().__init__()
@@ -66,10 +125,11 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.flight_path = 56.4
         self.delay = 0.0
         self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.app_version = str(__version__).strip()
         
         self.tof_array = None
         self.setMinimumSize(800, 600)
-        self.setWindowTitle("NEAT Neutron Bragg Edge Analysis Toolkit v4.6.0")
+        self.setWindowTitle(f"NEAT Neutron Bragg Edge Analysis Toolkit v{self.app_version}")
         # self.setGeometry(100, 100, window_width, window_height)  # Increased size to accommodate new layout
 
         # Phase storage (built-ins + user-defined)
@@ -192,6 +252,11 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self._expected_image_cnt  = None      # <-- NEW
         
         self.gui_font_size = 8
+        self.check_updates_on_startup = True
+        self.last_update_check_utc = ""
+        self.ignored_update_version = ""
+        self._update_check_worker = None
+        self._update_check_manual = False
 
         self.config_path = os.path.join(os.path.expanduser("~"), ".neat_gui_settings.json")
         self.load_user_settings()
@@ -205,6 +270,8 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         
         shortcutDecrease = QShortcut(QKeySequence("Shift+Down"), self)
         shortcutDecrease.activated.connect(self.decreaseFontSize)
+
+        QTimer.singleShot(1500, self.maybe_check_for_updates_on_startup)
 
     def setGlobalFont(self):
         # Update the global font for the QApplication
@@ -360,81 +427,31 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             # Parameter 'η' - Editable
             eta_item = QTableWidgetItem("")
             eta_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.bragg_table.setItem(row_position, 10, t_item)
+            self.bragg_table.setItem(row_position, 10, eta_item)
     
         self.message_box.append("Configured table for 'Unknown Phase'. Please input Bragg edge values.")
    
     def compute_theoretical_bragg_edges(self):
         """
-        Compute theoretical Bragg edge positions (x_hkl) based on the selected phase's 
-        structure, lattice parameters, and hkl_list.  Each x_hkl is paired with its 
+        Compute theoretical Bragg edge positions (x_hkl) based on the selected phase's
+        structure, lattice parameters, and hkl_list. Each x_hkl is paired with its
         corresponding (h, k, l) index.
         """
         if not self.hkl_list or not self.lattice_params:
             self.message_box.append("Incomplete phase data. Cannot compute Bragg edges.")
             self.theoretical_bragg_edges = []
             return
-    
-        # Example: Suppose you store the currently selected phase in self.current_phase
-        # and retrieve its data from PHASE_DATA. Then:
-        structure_type = self.structure_type
-        lattice_params = self.lattice_params
-        # hkl_list = self.hkl_list
-    
-        # For convenience, define a small helper function to get d(hkl):
-        def d_spacing(h, k, l, structure, lat):
-            """
-            Return the d-spacing (in Å) for the given hkl and structure.
-            lat is a dict with the needed lattice parameters, e.g. lat["a"], lat["b"], etc.
-            """
-            if structure in ("cubic", "fcc", "bcc"):
-                # Requires lat["a"]
-                a = lat["a"]
-                return a / np.sqrt(h**2 + k**2 + l**2)
-    
-            elif structure == "tetragonal":
-                # Requires lat["a"], lat["c"]
-                a = lat["a"]
-                c = lat["c"]
-                # d_{hkl} = 1 / sqrt( (h^2+k^2)/a^2 + l^2/c^2 )
-                return 1.0 / np.sqrt((h**2 + k**2)/(a**2) + (l**2)/(c**2))
-    
-            elif structure == "hexagonal":
-                # Requires lat["a"], lat["c"]
-                a = lat["a"]
-                c = lat["c"]
-                # d_{hkl} = 1 / sqrt( (4/3)*((h^2 + h*k + k^2)/a^2) + l^2/c^2 )
-                # For standard HCP formula:
-                return 1.0 / np.sqrt((4.0/3.0) * ((h**2 + h*k + k**2)/(a**2)) + (l**2)/(c**2))
-    
-            elif structure == "orthorhombic":
-                # Requires lat["a"], lat["b"], lat["c"]
-                a = lat["a"]
-                b = lat["b"]
-                c = lat["c"]
-                return 1.0 / np.sqrt((h**2)/(a**2) + (k**2)/(b**2) + (l**2)/(c**2))
-    
-            # You could add "monoclinic", "triclinic", etc. as needed.
-            # For anything else, default to a 'cubic' or return NaN:
-            return np.nan
-    
-        # Now calculate Bragg edges
-        self.theoretical_bragg_edges = []
-        for (h, k, l) in self.hkl_list:
-            d_hkl = d_spacing(h, k, l, structure_type, lattice_params)
-    
-            if np.isnan(d_hkl) or d_hkl <= 0:
-                self.theoretical_bragg_edges.append(((h, k, l), np.nan))
-                self.message_box.append(
-                    f"Skipping hkl{(h, k, l)}: invalid or undefined d-spacing.")
-                continue
-    
-            # Bragg edge (assuming sinθ=1 => λ = 2*d)
-            x_hkl = 2.0 * d_hkl
-            self.theoretical_bragg_edges.append(((h, k, l), x_hkl))
-            self.message_box.append(
-                f"Theoretical Bragg edge for hkl{(h, k, l)}: {x_hkl:.4f} Å"
-            )
+
+        self.theoretical_bragg_edges = calculate_theoretical_bragg_edges(
+            self.structure_type,
+            self.lattice_params,
+            self.hkl_list,
+        )
+        for hkl, x_hkl in self.theoretical_bragg_edges:
+            if np.isnan(x_hkl) or x_hkl <= 0:
+                self.message_box.append(f"Skipping hkl{hkl}: invalid or undefined d-spacing.")
+            else:
+                self.message_box.append(f"Theoretical Bragg edge for hkl{hkl}: {x_hkl:.4f} A")
 
 
     def update_bragg_edge_table(self):
@@ -512,7 +529,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             #           d = x_hkl / 2, so let's store that.
             # ---------------------------------------------
             if x_hkl is not None and not np.isnan(x_hkl):
-                d_val = x_hkl
+                d_val = x_hkl / 2.0
                 d_item = QTableWidgetItem(f"{d_val:.4f}")
             else:
                 d_item = QTableWidgetItem("N/A")
@@ -571,7 +588,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             
             # eta parameter
             eta = 0.5
-            eta_item = QTableWidgetItem(f"{t:.3f}")
+            eta_item = QTableWidgetItem(f"{eta:.3f}")
             eta_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 10, eta_item)
     
@@ -763,6 +780,124 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
                 self.message_box.append(f"No phase named '{name}' to delete.")
         return removed_any
 
+    def _parse_utc_timestamp(self, value):
+        """Parse ISO-8601 timestamp and return UTC datetime, or None."""
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(text)
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _checked_for_updates_recently(self, hours=24):
+        """Return True if update check was performed within the last window."""
+        last_check = self._parse_utc_timestamp(self.last_update_check_utc)
+        if last_check is None:
+            return False
+        return (datetime.now(timezone.utc) - last_check) < timedelta(hours=hours)
+
+    def maybe_check_for_updates_on_startup(self):
+        """Startup hook for passive update checks."""
+        if not self.check_updates_on_startup:
+            return
+        if self._checked_for_updates_recently(hours=24):
+            return
+        self.start_update_check(manual=False)
+
+    def on_update_check_startup_toggled(self, checked):
+        """Apply preference from About tab checkbox."""
+        self.check_updates_on_startup = bool(checked)
+        self.save_user_settings()
+
+    def check_for_updates_now(self):
+        """Manual update-check action from UI."""
+        self.start_update_check(manual=True)
+
+    def start_update_check(self, manual=False):
+        """Run a background check against GitHub latest release."""
+        if self._update_check_worker is not None and self._update_check_worker.isRunning():
+            if manual and hasattr(self, "message_box"):
+                self.message_box.append("Update check is already running.")
+            return
+
+        self._update_check_manual = bool(manual)
+        if manual and hasattr(self, "message_box"):
+            self.message_box.append("Checking for updates...")
+
+        worker = UpdateCheckWorker(current_version=self.app_version, parent=self)
+        worker.check_finished.connect(self._on_update_check_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._update_check_worker = worker
+        worker.start()
+
+    def _show_update_available_dialog(self, latest_version, release_url):
+        """Show update prompt with open/skip/later actions."""
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setWindowTitle("Update Available")
+        dialog.setText(f"A newer NEAT version is available: {latest_version}")
+        dialog.setInformativeText(
+            f"Current version: {self.app_version}\nOpen the release download page now?"
+        )
+
+        open_btn = dialog.addButton("Open Download Page", QMessageBox.AcceptRole)
+        skip_btn = dialog.addButton("Skip This Version", QMessageBox.RejectRole)
+        dialog.addButton("Later", QMessageBox.ActionRole)
+        dialog.setDefaultButton(open_btn)
+        dialog.exec_()
+
+        clicked = dialog.clickedButton()
+        if clicked is open_btn:
+            QDesktopServices.openUrl(QUrl(release_url))
+            self.ignored_update_version = ""
+        elif clicked is skip_btn:
+            self.ignored_update_version = str(latest_version).strip()
+
+    def _on_update_check_finished(self, result):
+        """Handle completion of background update check."""
+        manual = self._update_check_manual
+        self._update_check_manual = False
+        self._update_check_worker = None
+        self.last_update_check_utc = datetime.now(timezone.utc).isoformat()
+
+        if not result.get("ok"):
+            error_text = result.get("error", "Unknown update-check error")
+            if manual:
+                QMessageBox.warning(self, "Update Check Failed", error_text)
+            if hasattr(self, "message_box"):
+                self.message_box.append(f"Update check failed: {error_text}")
+            self.save_user_settings()
+            return
+
+        latest_version = str(result.get("latest_version", "")).strip()
+        release_url = result.get("html_url") or UPDATE_RELEASES_URL
+        update_available = bool(result.get("update_available"))
+
+        if not update_available:
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "No Updates",
+                    f"NEAT is up to date (v{self.app_version}).",
+                )
+                if hasattr(self, "message_box"):
+                    self.message_box.append("No updates available.")
+            self.save_user_settings()
+            return
+
+        if (not manual) and latest_version and latest_version == self.ignored_update_version:
+            self.save_user_settings()
+            return
+
+        self._show_update_available_dialog(latest_version, release_url)
+        self.save_user_settings()
+
     def load_user_settings(self):
         """Load persisted GUI settings if available."""
         if not os.path.exists(self.config_path):
@@ -826,6 +961,21 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.min_y_input.setText(str(batch_roi.get("ymin", self.min_y_input.text())))
         self.max_y_input.setText(str(batch_roi.get("ymax", self.max_y_input.text())))
 
+        updates = data.get("updates", {})
+        self.check_updates_on_startup = bool(
+            updates.get("check_on_startup", self.check_updates_on_startup)
+        )
+        self.last_update_check_utc = str(
+            updates.get("last_check_utc", self.last_update_check_utc)
+        )
+        self.ignored_update_version = str(
+            updates.get("ignored_version", self.ignored_update_version)
+        )
+        if hasattr(self, "update_check_startup_checkbox"):
+            self.update_check_startup_checkbox.blockSignals(True)
+            self.update_check_startup_checkbox.setChecked(self.check_updates_on_startup)
+            self.update_check_startup_checkbox.blockSignals(False)
+
     def save_user_settings(self):
         """Persist key GUI parameters to disk."""
         data = {
@@ -864,6 +1014,11 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
                     "ymin": self.min_y_input.text(),
                     "ymax": self.max_y_input.text(),
                 },
+            },
+            "updates": {
+                "check_on_startup": bool(self.check_updates_on_startup),
+                "last_check_utc": self.last_update_check_utc,
+                "ignored_version": self.ignored_update_version,
             },
         }
         try:
@@ -968,3 +1123,4 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
     # **Handler for Open Beam Data Loaded**
 
 __all__ = ["FitsViewer"]
+

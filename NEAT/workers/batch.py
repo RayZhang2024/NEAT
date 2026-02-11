@@ -48,7 +48,7 @@ class BatchFitEdgesWorker(QThread):
     message = pyqtSignal(str)
     current_box_changed = pyqtSignal(int, int, int, int)
 
-    def __init__(self, parent, images, wavelengths,
+    def __init__(self, parent, images, wavelengths, fit_context,
                  min_x, max_x, min_y, max_y,
                  box_width, box_height, step_x, step_y,
                  total_boxes, interpolation_enabled, work_directory,
@@ -57,6 +57,7 @@ class BatchFitEdgesWorker(QThread):
         self.parent = parent
         self.images = images
         self.wavelengths = wavelengths
+        self.fit_context = fit_context or {}
         self.min_x = min_x
         self.max_x = max_x
         self.min_y = min_y
@@ -79,32 +80,28 @@ class BatchFitEdgesWorker(QThread):
         # Dimensions of the first image
         self.image_height, self.image_width = self.images[0].shape
 
-        # We'll only look at up to 5 rows (or however many your table allows)
-        max_rows = min(5, self.parent.bragg_table.rowCount())
-
-        # Collect only the row indices that are "valid" (fully filled)
-        self.valid_rows = []
-        for row_idx in range(max_rows):
-            if self.is_row_filled(row_idx):
-                self.valid_rows.append(row_idx)
-
-        self.num_edges = len(self.valid_rows)
+        all_rows = list(self.fit_context.get("bragg_rows", []))
+        self.valid_row_configs = [row for row in all_rows[:5] if row.get("valid")]
+        self.num_edges = len(self.valid_row_configs)
         if self.num_edges == 0:
-            self.message.emit("No edges in the bragg_table with valid data. Aborting.")
+            self.message.emit("No valid edge rows available. Aborting.")
             return
 
-        # Build a local hkl_list from the valid rows
         self.hkl_list = []
-        for row_idx in self.valid_rows:
-            hkl_item = self.parent.bragg_table.item(row_idx, 0)
-            hkl_text = hkl_item.text().strip("()") if hkl_item else "0,0,0"
-            try:
-                h, k, l = map(int, hkl_text.split(","))
-                self.hkl_list.append((h, k, l))
-            except ValueError:
-                # If user typed something invalid, skip or set default
-                self.hkl_list.append((0, 0, 0))
-        self.parent.hkl_list = self.hkl_list.copy()
+        for idx, row_cfg in enumerate(self.valid_row_configs):
+            hkl = row_cfg.get("hkl")
+            if hkl is None:
+                self.hkl_list.append(("edge", idx + 1, 0))
+            else:
+                self.hkl_list.append(hkl)
+
+        self.metadata_snapshot = {
+            "flight_path": self.fit_context.get("flight_path"),
+            "min_wavelength": self.fit_context.get("min_wavelength"),
+            "max_wavelength": self.fit_context.get("max_wavelength"),
+            "selected_phase": self.fit_context.get("selected_phase"),
+            "bragg_rows_text": list(self.fit_context.get("bragg_rows_text", [])),
+        }
 
         # Initialize arrays for storing final (Region 3) fit parameters
         # shape = (height, width, num_edges)
@@ -123,18 +120,6 @@ class BatchFitEdgesWorker(QThread):
         self.width_array = None
 
         self.initialize_arrays()
-
-    def is_row_filled(self, row_idx):
-        """
-        Returns True if this row has non-empty data in the essential columns.
-        """
-        required_cols = [0, 2, 3, 4, 5, 6, 7, 8, 9,10]
-        table = self.parent.bragg_table
-        for col in required_cols:
-            item = table.item(row_idx, col)
-            if (not item) or (not item.text().strip()):
-                return False
-        return True
 
     def initialize_arrays(self):
         shape_3d = (self.image_height, self.image_width, self.num_edges)
@@ -195,29 +180,36 @@ class BatchFitEdgesWorker(QThread):
                 for img in self.images:
                     sub_img = img[row_min:row_max, col_min:col_max]
                     intensities.append(sub_img.sum())
-                self.parent.intensities = np.array(intensities)
+                intensities = np.array(intensities)
 
                 # We'll store the final fit at the center pixel
                 center_row = row_min + self.box_height // 2
                 center_col = col_min + self.box_width // 2
 
                 # For each valid row => do fit_region
-                self.parent.params_unknown = {}  # reset for each sub-area
+                for i, row_cfg in enumerate(self.valid_row_configs):
+                    fit_result = self.parent.fit_region(
+                        row_cfg["row"],
+                        skip_ui_updates=True,
+                        row_data=row_cfg,
+                        wavelengths=self.wavelengths,
+                        intensities=intensities,
+                        fit_flags=(self.fix_s, self.fix_t, self.fix_eta),
+                        selected_phase=self.fit_context.get("selected_phase"),
+                        structure_type=self.fit_context.get("structure_type"),
+                        lattice_params=self.fit_context.get("lattice_params"),
+                    )
+                    fit_params = fit_result.get("fit_params") if isinstance(fit_result, dict) else None
+                    edge_height = fit_result.get("edge_height", np.nan) if isinstance(fit_result, dict) else np.nan
+                    width = fit_result.get("edge_width", np.nan) if isinstance(fit_result, dict) else np.nan
 
-                for i, row_idx in enumerate(self.valid_rows):
-                    
-                    self.parent.fit_region(row_idx, skip_ui_updates=True)
-                    popt_3 = self.parent.params_unknown.get((row_idx, 3))
-                    edge_height = self.parent.params_unknown.get((row_idx, 4), np.nan)
-                    width = self.parent.params_unknown.get((row_idx, 5), np.nan)
-
-                    if popt_3 is None:
+                    if fit_params is None:
                         # Region 3 fit failed => store NaNs
                         self.assign_nan_to_pixel(center_row, center_col, i)
                     else:
                         # popt_3 = (a_fit, s_fit, t_fit)
                         (a_fit, s_fit, t_fit, eta_fit,
-                         a_unc, s_unc, t_unc, eta_unc) = popt_3
+                         a_unc, s_unc, t_unc, eta_unc) = fit_params
                         self.a_array[center_row, center_col, i] = a_fit
                         self.s_array[center_row, center_col, i] = s_fit
                         self.t_array[center_row, center_col, i] = t_fit
@@ -315,13 +307,13 @@ class BatchFitEdgesWorker(QThread):
         X_flat = xx.flatten()
         Y_flat = yy.flatten()
 
-        if not hasattr(self.parent, 'hkl_list') or len(self.parent.hkl_list) != e:
-            self.parent.hkl_list = [("edge", i + 1) for i in range(e)]
+        if len(self.hkl_list) != e:
+            self.hkl_list = [("edge", i + 1, 0) for i in range(e)]
 
         data_dict = {"x": X_flat, "y": Y_flat}
 
         for i in range(e):
-            (h_val, k_val, *rest) = self.parent.hkl_list[i]
+            (h_val, k_val, *rest) = self.hkl_list[i]
             # Flatten out a, s, t
             a_i = flat_a[:, i]
             s_i = flat_s[:, i]
@@ -376,23 +368,13 @@ class BatchFitEdgesWorker(QThread):
             ("fix_s", self.fix_s),
             ("fix_t", self.fix_t),
             ("fix_eta", self.fix_eta),
-            ("flight_path", self.parent.flight_path),
-            ("min_wavelength", self._safe_float(getattr(self.parent, "min_wavelength_input", None))),
-            ("max_wavelength", self._safe_float(getattr(self.parent, "max_wavelength_input", None))),
-            ("selected_phase", self.parent.phase_dropdown.currentText()),
+            ("flight_path", self.metadata_snapshot.get("flight_path")),
+            ("min_wavelength", self.metadata_snapshot.get("min_wavelength")),
+            ("max_wavelength", self.metadata_snapshot.get("max_wavelength")),
+            ("selected_phase", self.metadata_snapshot.get("selected_phase")),
         ]
 
-        table = self.parent.bragg_table
-        for row_idx in range(table.rowCount()):
-            row_items = []
-            for col_idx in range(table.columnCount()):
-                cell_item = table.item(row_idx, col_idx)
-                if cell_item is not None:
-                    text_val = cell_item.text().replace(",", ";")
-                else:
-                    text_val = ""
-                row_items.append(text_val)
-            row_text = "|".join(row_items)
+        for row_idx, row_text in enumerate(self.metadata_snapshot.get("bragg_rows_text", [])):
             metadata.append((f"bragg_table_row_{row_idx+1}", row_text))
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -464,7 +446,7 @@ class BatchFitEdgesWorker(QThread):
             
 
         # for i in range(e):
-            (h_val, k_val, *rest) = self.parent.hkl_list[i]
+            (h_val, k_val, *rest) = self.hkl_list[i]
             a_i = flat_a[:, i]
             s_i = flat_s[:, i]
             t_i = flat_t[:, i]
@@ -505,25 +487,15 @@ class BatchFitEdgesWorker(QThread):
             ("fix_s", self.fix_s),
             ("fix_t", self.fix_t),
             ("fix_eta", self.fix_eta),
-            ("flight_path", self.parent.flight_path),
-            ("min_wavelength", self._safe_float(getattr(self.parent, "min_wavelength_input", None))),
-            ("max_wavelength", self._safe_float(getattr(self.parent, "max_wavelength_input", None))),
-            ("selected_phase", self.parent.phase_dropdown.currentText()),
+            ("flight_path", self.metadata_snapshot.get("flight_path")),
+            ("min_wavelength", self.metadata_snapshot.get("min_wavelength")),
+            ("max_wavelength", self.metadata_snapshot.get("max_wavelength")),
+            ("selected_phase", self.metadata_snapshot.get("selected_phase")),
         ]
         if self.num_edges is not None:
             metadata.append(("number_of_edges", self.num_edges))
 
-        table = self.parent.bragg_table
-        for row_idx in range(table.rowCount()):
-            row_items = []
-            for col_idx in range(table.columnCount()):
-                cell_item = table.item(row_idx, col_idx)
-                if cell_item is not None:
-                    text_val = cell_item.text().replace(",", ";")
-                else:
-                    text_val = ""
-                row_items.append(text_val)
-            row_text = "|".join(row_items)
+        for row_idx, row_text in enumerate(self.metadata_snapshot.get("bragg_rows_text", [])):
             metadata.append((f"bragg_table_row_{row_idx+1}", row_text))
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -636,6 +608,7 @@ class BatchFitWorker(QThread):
         parent,
         images,
         wavelengths,
+        fit_context,
         min_x,
         max_x,
         min_y,
@@ -655,6 +628,7 @@ class BatchFitWorker(QThread):
         self.parent = parent
         self.images = images
         self.wavelengths = wavelengths
+        self.fit_context = fit_context or {}
         self.min_x = min_x
         self.max_x = max_x
         self.min_y = min_y
@@ -670,6 +644,15 @@ class BatchFitWorker(QThread):
         self.fix_s = fix_s
         self.fix_t = fix_t
         self.fix_eta = fix_eta
+        self.structure_type = self.fit_context.get("structure_type", "cubic")
+        self.hkl_list = []
+        self.metadata_snapshot = {
+            "flight_path": self.fit_context.get("flight_path"),
+            "min_wavelength": self.fit_context.get("min_wavelength"),
+            "max_wavelength": self.fit_context.get("max_wavelength"),
+            "selected_phase": self.fit_context.get("selected_phase"),
+            "bragg_rows_text": list(self.fit_context.get("bragg_rows_text", [])),
+        }
 
         # All images same shape
         self.image_height, self.image_width = self.images[0].shape
@@ -730,7 +713,7 @@ class BatchFitWorker(QThread):
                 for img in self.images:
                     sub_img = img[row_min:row_max, col_min:col_max]
                     intensities.append(sub_img.sum())
-                self.parent.intensities = np.array(intensities)
+                intensities = np.array(intensities)
 
                 center_row = row_min + self.box_height // 2
                 center_col = col_min + self.box_width // 2
@@ -742,7 +725,11 @@ class BatchFitWorker(QThread):
                         fix_t=self.fix_t,
                         fix_eta=self.fix_eta,
                         max_nfev=300,
-                        curve_fit_maxfev=300
+                        curve_fit_maxfev=300,
+                        fit_context=self.fit_context,
+                        wavelengths=self.wavelengths,
+                        intensities=intensities,
+                        apply_lattice_update=False,
                     )
                 except Exception as e:
                     error_msg = f"Unexpected error during fitting: {e}"
@@ -774,12 +761,12 @@ class BatchFitWorker(QThread):
                 bragg_edges    = result_dict.get("bragg_edges", [])
                 ab_fits = result_dict['ab_fits']
 
-                # Update parent's hkl_list
+                # Update local hkl list
                 if bragg_edges:
                     hkl_list = [edge["hkl"] for edge in bragg_edges]
-                    self.parent.hkl_list = hkl_list
                 else:
-                    self.parent.hkl_list = sorted(fitted_s_dict.keys())
+                    hkl_list = sorted(fitted_s_dict.keys())
+                self.hkl_list = hkl_list
 
                 # If first success => allocate arrays
                 if not params_initialized:
@@ -801,7 +788,6 @@ class BatchFitWorker(QThread):
                     self.param_unc_arrays[p_name][center_row, center_col] = p_unc_val
 
                 # 2) Store s,t in arrays
-                hkl_list = self.parent.hkl_list
                 for i, hkl in enumerate(hkl_list):
                     s_val = fitted_s_dict.get(hkl, np.nan)
                     t_val = fitted_t_dict.get(hkl, np.nan)
@@ -890,7 +876,7 @@ class BatchFitWorker(QThread):
         if not bragg_edges or not self.num_edges:
             return
 
-        # We'll assume the order in bragg_edges matches self.parent.hkl_list
+        # We'll assume the order in bragg_edges matches self.hkl_list
         # or at least that i lines up with each edge
         def d_spacing(h, k, l, structure, lat):
             x_vals = calculate_x_hkl_general(structure, lat, [(h, k, l)])
@@ -898,7 +884,7 @@ class BatchFitWorker(QThread):
                 return float("nan")
             return x_vals[0] / 2.0  # lambda = 2d -> d = lambda/2
 
-        structure_type = getattr(self.parent, "structure_type", "cubic")
+        structure_type = self.structure_type
 
         for i, edge in enumerate(bragg_edges):
             (h, k, l) = edge["hkl"]
@@ -943,7 +929,7 @@ class BatchFitWorker(QThread):
                 right = xx[dy >= half][-1]
                 edge_width = right - left
                 edge_height = yy.max() - yy.min()
-            except:
+            except (IndexError, ValueError, FloatingPointError):
                 edge_width = np.nan
                 edge_height = np.nan
             
@@ -990,7 +976,7 @@ class BatchFitWorker(QThread):
             flat_height = self.height_array.reshape(N, self.num_edges)
 
         # Build columns
-        hkl_list = getattr(self.parent, "hkl_list", [])
+        hkl_list = self.hkl_list
         if len(hkl_list) != self.num_edges:
             # fallback
             hkl_list = [("edge", i+1, 0) for i in range(self.num_edges)]
@@ -1027,22 +1013,15 @@ class BatchFitWorker(QThread):
             ("fix_s", self.fix_s),
             ("fix_t", self.fix_t),
             ("fix_eta", self.fix_eta),
-            ("flight_path", self.parent.flight_path),
-            ("min_wavelength", self._safe_float(getattr(self.parent, "min_wavelength_input", None))),
-            ("max_wavelength", self._safe_float(getattr(self.parent, "max_wavelength_input", None))),
-            ("selected_phase", self.parent.phase_dropdown.currentText()),
+            ("flight_path", self.metadata_snapshot.get("flight_path")),
+            ("min_wavelength", self.metadata_snapshot.get("min_wavelength")),
+            ("max_wavelength", self.metadata_snapshot.get("max_wavelength")),
+            ("selected_phase", self.metadata_snapshot.get("selected_phase")),
             ("number_of_edges", self.num_edges),
         ]
 
         # Bragg table rows
-        table = self.parent.bragg_table
-        for row_idx in range(table.rowCount()):
-            row_items = []
-            for col_idx in range(table.columnCount()):
-                cell_item = table.item(row_idx, col_idx)
-                val = cell_item.text().replace(",",";") if cell_item else ""
-                row_items.append(val)
-            row_text = "|".join(row_items)
+        for row_idx, row_text in enumerate(self.metadata_snapshot.get("bragg_rows_text", [])):
             metadata.append((f"bragg_table_row_{row_idx+1}", row_text))
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1095,7 +1074,7 @@ class BatchFitWorker(QThread):
             flat_height = self.height_array.reshape(N, self.num_edges)
 
         # columns
-        hkl_list = getattr(self.parent, "hkl_list", [])
+        hkl_list = self.hkl_list
         if len(hkl_list) != self.num_edges:
             hkl_list = [("edge", i+1, 0) for i in range(self.num_edges)]
 
@@ -1131,21 +1110,14 @@ class BatchFitWorker(QThread):
             ("fix_s", self.fix_s),
             ("fix_t", self.fix_t),
             ("fix_eta", self.fix_eta),
-            ("flight_path", self.parent.flight_path),
-            ("min_wavelength", self._safe_float(getattr(self.parent, "min_wavelength_input", None))),
-            ("max_wavelength", self._safe_float(getattr(self.parent, "max_wavelength_input", None))),
-            ("selected_phase", self.parent.phase_dropdown.currentText()),
+            ("flight_path", self.metadata_snapshot.get("flight_path")),
+            ("min_wavelength", self.metadata_snapshot.get("min_wavelength")),
+            ("max_wavelength", self.metadata_snapshot.get("max_wavelength")),
+            ("selected_phase", self.metadata_snapshot.get("selected_phase")),
             ("number_of_edges", self.num_edges),
         ]
 
-        table = self.parent.bragg_table
-        for row_idx in range(table.rowCount()):
-            row_items = []
-            for col_idx in range(table.columnCount()):
-                cell_item = table.item(row_idx, col_idx)
-                val = cell_item.text().replace(",",";") if cell_item else ""
-                row_items.append(val)
-            row_text = "|".join(row_items)
+        for row_idx, row_text in enumerate(self.metadata_snapshot.get("bragg_rows_text", [])):
             metadata.append((f"bragg_table_row_{row_idx+1}", row_text))
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
