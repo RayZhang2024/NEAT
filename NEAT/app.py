@@ -158,7 +158,12 @@ def main():
     viewer = FitsViewer()
     viewer.show()
     splash.finish(viewer)
-    sys.exit(app.exec_())
+    try:
+        exit_code = app.exec_()
+    except KeyboardInterrupt:
+        # Allow Ctrl+C in console-launched sessions without a traceback.
+        exit_code = 130
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -1538,11 +1538,13 @@ class FittingMixin:
             # Fitted model
             x_fit = result_dict['x_data']
             y_fit = result_dict['y_data']
-            ax_main_a.plot(
+            self._plot_line(
+                ax_main_a,
                 x_fit,
                 y_fit,
-                'r-',
-                # label='Fitted Model'
+                split_on_gaps=True,
+                color='red',
+                linestyle='-',
             )
 
             # Plot theoretical edges in [min_wavelength, max_wavelength]
@@ -1560,11 +1562,17 @@ class FittingMixin:
                         color='red',
                         fontsize=getattr(self, "plot_font_size", 12),
                     )
+
+            # Keep top-left x-range bound to the current global wavelength range,
+            # independent of prior pan/zoom or wide region-3 model extents.
+            if np.isfinite(min_wavelength) and np.isfinite(max_wavelength) and min_wavelength < max_wavelength:
+                ax_main_a.set_xlim(min_wavelength, max_wavelength)
+
             x_obs = result_dict.get("x_exp_sorted", x_fit)
             y_obs = result_dict.get("y_exp_sorted")
             if y_obs is None:
                 y_obs = np.interp(x_fit, self.selected_region_x, self.selected_region_y)
-            self._plot_residual_line(self.plot_canvas_a, x_obs, y_obs, y_fit)
+            self._plot_residual_line(self.plot_canvas_a, x_obs, y_obs, y_fit, split_on_gaps=True)
             self.plot_canvas_a.draw()
 
         # 9) Re-enable UI elements
@@ -1882,9 +1890,14 @@ class FittingMixin:
 
     def _cancel_fits_loading(self):
         """Stop the worker if the user cancels loading."""
-        if getattr(self, "fits_image_load_worker", None) is not None:
-            self.fits_image_load_worker.requestInterruption()
-            self.fits_image_load_worker.stop()
+        worker = getattr(self, "fits_image_load_worker", None)
+        if worker is not None:
+            worker.requestInterruption()
+            worker.stop()
+            worker.wait(3000)
+            if worker.isRunning():
+                self.message_box.append("Stopping image loader...")
+                return
             self.fits_image_load_worker = None
             self.images = []
             self.image_slider.setEnabled(False)
@@ -1909,12 +1922,18 @@ class FittingMixin:
         Handle the completion of the image loading process.
         Reset the progress bar and re-enable the load button.
         """
-        if hasattr(self, 'fits_image_load_worker'):
-            self.fits_image_load_worker = None  # Cleanup
-            if getattr(self, "_fits_progress_dialog", None) is not None:
-                self._fits_progress_dialog.hide()
-                self._fits_progress_dialog.close()
-            self.load_button.setEnabled(True)        # Re-enable the load button
+        worker = getattr(self, "fits_image_load_worker", None)
+        if worker is not None:
+            if worker.isRunning():
+                worker.wait(3000)
+            if worker.isRunning():
+                self.message_box.append("Image loader is still running; cleanup deferred.")
+                return
+            self.fits_image_load_worker = None
+        if getattr(self, "_fits_progress_dialog", None) is not None:
+            self._fits_progress_dialog.hide()
+            self._fits_progress_dialog.close()
+        self.load_button.setEnabled(True)        # Re-enable the load button
 
     def open_batch_settings_dialog(self):
         """Dialog to edit batch fitting parameters and ROI."""
@@ -2266,6 +2285,11 @@ class FittingMixin:
             self, "Select Folder Containing FITS Images", ""
         )
         if folder_path:
+            existing_worker = getattr(self, "fits_image_load_worker", None)
+            if existing_worker is not None and existing_worker.isRunning():
+                self.message_box.append("Image loading is already in progress.")
+                return
+            self.fits_image_load_worker = None
 
             self.folder_path = folder_path
             # Set the working directory to the parent directory of the selected folder
@@ -2989,11 +3013,90 @@ class FittingMixin:
             return ""
         return "Wavelength (A)"
 
+    @staticmethod
+    def _valid_region_bounds(r1_min, r1_max, r2_min, r2_max, r3_min, r3_max):
+        """Validate that region bounds are finite and strictly increasing."""
+        values = (r1_min, r1_max, r2_min, r2_max, r3_min, r3_max)
+        if any(v is None for v in values):
+            return False
+        try:
+            vals = [float(v) for v in values]
+        except (TypeError, ValueError):
+            return False
+        if any(not np.isfinite(v) for v in vals):
+            return False
+        return vals[0] < vals[1] and vals[2] < vals[3] and vals[4] < vals[5]
+
+    def _active_region_bounds(self):
+        """
+        Return active region bounds as (r1_min, r1_max, r2_min, r2_max, r3_min, r3_max).
+        Prefer cached current_* values, then fall back to the selected/first table row.
+        """
+        cached = (
+            getattr(self, "current_r1_min", None),
+            getattr(self, "current_r1_max", None),
+            getattr(self, "current_r2_min", None),
+            getattr(self, "current_r2_max", None),
+            getattr(self, "current_r3_min", None),
+            getattr(self, "current_r3_max", None),
+        )
+        if self._valid_region_bounds(*cached):
+            return tuple(float(v) for v in cached)
+
+        table = getattr(self, "bragg_table", None)
+        if table is None or table.rowCount() == 0:
+            return None
+
+        row = table.currentRow()
+        if row < 0:
+            row = 0
+
+        try:
+            bounds = (
+                float(table.item(row, 4).text()),
+                float(table.item(row, 5).text()),
+                float(table.item(row, 2).text()),
+                float(table.item(row, 3).text()),
+                float(table.item(row, 6).text()),
+                float(table.item(row, 7).text()),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+        if not self._valid_region_bounds(*bounds):
+            return None
+
+        self.current_r1_min, self.current_r1_max = bounds[0], bounds[1]
+        self.current_r2_min, self.current_r2_max = bounds[2], bounds[3]
+        self.current_r3_min, self.current_r3_max = bounds[4], bounds[5]
+        return bounds
+
+    @staticmethod
+    def _xlim_with_margin(xmin, xmax, fraction=0.02):
+        """Return x-limits padded by a fraction of the span on both sides."""
+        try:
+            xmin = float(xmin)
+            xmax = float(xmax)
+        except (TypeError, ValueError):
+            return None
+        if not (np.isfinite(xmin) and np.isfinite(xmax) and xmin < xmax):
+            return None
+
+        span = xmax - xmin
+        # Keep a tiny absolute fallback for near-zero spans.
+        pad = max(span * fraction, 1e-6)
+        return xmin - pad, xmax + pad
+
     def _initialize_fit_canvas(self, canvas, title=None):
         """Clear and initialize a fit canvas with an empty residual panel."""
         main_ax, residual_ax = self._ensure_fit_canvas_axes(canvas)
         main_ax.clear()
         residual_ax.clear()
+        # Clear removes artists but we also force autoscale back on after manual pan/zoom.
+        main_ax.set_autoscalex_on(True)
+        main_ax.set_autoscaley_on(True)
+        residual_ax.set_autoscalex_on(True)
+        residual_ax.set_autoscaley_on(True)
 
         font_size = getattr(self, "plot_font_size", 12)
         residual_font_size = font_size
@@ -3027,7 +3130,60 @@ class FittingMixin:
 
         return main_ax, residual_ax
 
-    def _plot_residual_line(self, canvas, x_data, y_data, y_fit):
+    @staticmethod
+    def _segment_bounds_from_x(x_arr, gap_factor=8.0):
+        """Return (start, end) segment bounds, splitting where x has large gaps."""
+        if x_arr.size < 2:
+            return [(0, x_arr.size)]
+
+        dx = np.diff(x_arr)
+        if np.any(dx < 0):
+            return [(0, x_arr.size)]
+
+        positive_dx = dx[(dx > 0) & np.isfinite(dx)]
+        if positive_dx.size == 0:
+            return [(0, x_arr.size)]
+
+        base_step = np.median(positive_dx)
+        if not np.isfinite(base_step) or base_step <= 0:
+            return [(0, x_arr.size)]
+
+        gap_threshold = base_step * gap_factor
+        gap_indices = np.where(dx > gap_threshold)[0]
+        if gap_indices.size == 0:
+            return [(0, x_arr.size)]
+
+        bounds = []
+        start = 0
+        for idx in gap_indices:
+            end = idx + 1
+            if end > start:
+                bounds.append((start, end))
+            start = end
+        if start < x_arr.size:
+            bounds.append((start, x_arr.size))
+        return bounds
+
+    def _plot_line(self, ax, x_data, y_data, split_on_gaps=False, **plot_kwargs):
+        """Plot line data, optionally breaking segments across large wavelength gaps."""
+        x_arr = np.asarray(x_data)
+        y_arr = np.asarray(y_data)
+        n_points = min(x_arr.size, y_arr.size)
+        if n_points == 0:
+            return
+
+        x_arr = x_arr[:n_points]
+        y_arr = y_arr[:n_points]
+        if not split_on_gaps:
+            ax.plot(x_arr, y_arr, **plot_kwargs)
+            return
+
+        for start, end in self._segment_bounds_from_x(x_arr):
+            if end - start < 1:
+                continue
+            ax.plot(x_arr[start:end], y_arr[start:end], **plot_kwargs)
+
+    def _plot_residual_line(self, canvas, x_data, y_data, y_fit, split_on_gaps=False):
         """Plot residual line (data - fit) on the residual axis of a fit canvas."""
         _, residual_ax = self._ensure_fit_canvas_axes(canvas)
         x_arr = np.asarray(x_data)
@@ -3050,7 +3206,15 @@ class FittingMixin:
             zero_line.set_gid("residual_zero")
 
         residual = y_arr - y_fit_arr
-        residual_ax.plot(x_arr, residual, color="#444444", linewidth=0.5, alpha=0.95)
+        self._plot_line(
+            residual_ax,
+            x_arr,
+            residual,
+            split_on_gaps=split_on_gaps,
+            color="#444444",
+            linewidth=0.5,
+            alpha=0.95,
+        )
 
     def update_plots(self):
         if not self.images or not self.selected_area:
@@ -3085,12 +3249,6 @@ class FittingMixin:
         try:
             min_wavelength = float(self.min_wavelength_input.text())
             max_wavelength = float(self.max_wavelength_input.text())
-            r1_min = self.current_r1_min
-            r1_max = self.current_r1_max
-            r2_min = self.current_r2_min
-            r2_max = self.current_r2_max
-            r3_min = self.current_r3_min
-            r3_max = self.current_r3_max
         except ValueError:
             # If inputs are empty or invalid, use full range
             min_wavelength = self.wavelengths[0]
@@ -3145,6 +3303,10 @@ class FittingMixin:
                 fontsize=getattr(self, "plot_font_size", 12),
             )
 
+        # Keep top-left x-range tied to the current global wavelength window.
+        if np.isfinite(min_wavelength) and np.isfinite(max_wavelength) and min_wavelength < max_wavelength:
+            ax_a.set_xlim(min_wavelength, max_wavelength)
+
         # **Handle Legend to Avoid Duplicate Labels**
         handles, labels = ax_a.get_legend_handles_labels()
         unique_labels = []
@@ -3157,41 +3319,14 @@ class FittingMixin:
 
         self.plot_canvas_a.draw()
 
-        try:    
-            regions = [
-                ('Region 1',  r2_min, r2_max, self.plot_canvas_b),
-                ('Region 2',  r1_min, r1_max, self.plot_canvas_c),
-                ('Region 3',  r3_min, r3_max, self.plot_canvas_d),
-            ]
-        # try:    
-        #     regions = [
-        #         (r2_min, r2_max, self.plot_canvas_b),
-        #         (r1_min, r1_max, self.plot_canvas_c),
-        #         (r3_min, r3_max, self.plot_canvas_d),
-        #     ]
-        except ValueError:
-            self.message_box.append("Please enter valid min and max wavelengths.")
-            return
-
-
-
-        for name, region_min_wavelength, region_max_wavelength, canvas in regions:
-
-            try:
-                # Filter data for this region
-                region_mask = (self.wavelengths >= region_min_wavelength) & (self.wavelengths <= region_max_wavelength)
-                region_x = self.wavelengths[region_mask]
-                region_y = self.intensities[region_mask]
-
-
+        active_bounds = self._active_region_bounds()
+        if active_bounds is None:
+            for name, canvas in (
+                ("Region 1", self.plot_canvas_b),
+                ("Region 2", self.plot_canvas_c),
+                ("Region 3", self.plot_canvas_d),
+            ):
                 ax_main, _ = self._initialize_fit_canvas(canvas)
-                ax_main.plot(
-                    region_x,
-                    region_y,
-                    'o',
-                    markersize=getattr(self, "symbol_size", 4),
-                    # label=name
-                )
                 ax_main.text(
                     0.98,
                     0.98,
@@ -3201,11 +3336,58 @@ class FittingMixin:
                     va="top",
                     fontsize=getattr(self, "plot_font_size", 12),
                 )
+                canvas.draw()
+            return
+
+        r1_min, r1_max, r2_min, r2_max, r3_min, r3_max = active_bounds
+        regions = [
+            ("Region 1", r2_min, r2_max, self.plot_canvas_b),
+            ("Region 2", r1_min, r1_max, self.plot_canvas_c),
+            ("Region 3", r3_min, r3_max, self.plot_canvas_d),
+        ]
+
+
+        for name, region_min_wavelength, region_max_wavelength, canvas in regions:
+            ax_main, _ = self._initialize_fit_canvas(canvas)
+            ax_main.text(
+                0.98,
+                0.98,
+                name,
+                transform=ax_main.transAxes,
+                ha="right",
+                va="top",
+                fontsize=getattr(self, "plot_font_size", 12),
+            )
+
+            try:
+                # Filter data for this region
+                region_mask = (self.wavelengths >= region_min_wavelength) & (self.wavelengths <= region_max_wavelength)
+                region_x = self.wavelengths[region_mask]
+                region_y = self.intensities[region_mask]
+
+
+                ax_main.plot(
+                    region_x,
+                    region_y,
+                    'o',
+                    markersize=getattr(self, "symbol_size", 4),
+                    # label=name
+                )
+                # Force region x-range to follow the active table bounds.
+                if (
+                    np.isfinite(region_min_wavelength)
+                    and np.isfinite(region_max_wavelength)
+                    and region_min_wavelength < region_max_wavelength
+                ):
+                    xlim = self._xlim_with_margin(region_min_wavelength, region_max_wavelength)
+                    if xlim is not None:
+                        ax_main.set_xlim(*xlim)
                 # canvas.axes.legend()
                 canvas.draw()
             except Exception:
                 # self.message_box.append("Select a Bragg Edge to display the regions")
-                return
+                canvas.draw()
+                continue
 
     def export_data(self):
         """
@@ -3239,13 +3421,42 @@ class FittingMixin:
         """
         self.message_box.append("---------- Starting individual edges fitting ----------")
 
+        def _range_from_rows(min_col, max_col, row_limit):
+            xmins = []
+            xmaxs = []
+            for idx in range(row_limit):
+                if not self.is_row_complete(idx):
+                    continue
+                try:
+                    lo = float(self.bragg_table.item(idx, min_col).text())
+                    hi = float(self.bragg_table.item(idx, max_col).text())
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if np.isfinite(lo) and np.isfinite(hi) and lo < hi:
+                    xmins.append(lo)
+                    xmaxs.append(hi)
+            if not xmins or not xmaxs:
+                return None
+            return min(xmins), max(xmaxs)
+
         # Start each run from clean region canvases so previous fits do not accumulate.
+        max_rows = min(5, self.bragg_table.rowCount())
+        region_ranges = {
+            "Region 1": _range_from_rows(2, 3, max_rows),  # plotted on canvas_b
+            "Region 2": _range_from_rows(4, 5, max_rows),  # plotted on canvas_c
+            "Region 3": _range_from_rows(6, 7, max_rows),  # plotted on canvas_d
+        }
         for region_name, canvas in (
             ("Region 1", self.plot_canvas_b),
             ("Region 2", self.plot_canvas_c),
             ("Region 3", self.plot_canvas_d),
         ):
             ax_main, _ = self._initialize_fit_canvas(canvas)
+            x_range = region_ranges.get(region_name)
+            if x_range is not None:
+                xlim = self._xlim_with_margin(x_range[0], x_range[1])
+                if xlim is not None:
+                    ax_main.set_xlim(*xlim)
             ax_main.text(
                 0.98,
                 0.98,
@@ -3256,9 +3467,6 @@ class FittingMixin:
                 fontsize=getattr(self, "plot_font_size", 12),
             )
             canvas.draw()
-
-        # We'll limit to at most 5 rows, as in your original code:
-        max_rows = min(5, self.bragg_table.rowCount())
 
         for row in range(max_rows):
             # Check whether this row has all required inputs

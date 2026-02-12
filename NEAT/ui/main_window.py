@@ -454,24 +454,84 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
                 self.message_box.append(f"Theoretical Bragg edge for hkl{hkl}: {x_hkl:.4f} A")
 
 
+    def _reset_current_bragg_edge_state(self):
+        """Clear cached values for the currently active Bragg edge row."""
+        self.current_d = None
+        self.current_r1_min = None
+        self.current_r1_max = None
+        self.current_r2_min = None
+        self.current_r2_max = None
+        self.current_r3_min = None
+        self.current_r3_max = None
+        self.current_s = None
+        self.current_t = None
+        self.current_eta = None
+
+    def _sync_current_bragg_edge_from_row(self, row_index):
+        """
+        Copy Bragg-edge values from a table row into cached current_* attributes.
+        Returns True when the row can be parsed, otherwise False.
+        """
+        if row_index < 0 or row_index >= self.bragg_table.rowCount():
+            return False
+
+        try:
+            d_item = self.bragg_table.item(row_index, 1)
+            d_text = d_item.text().strip() if d_item else ""
+            d = float(d_text) if d_text and d_text not in ("N/A", "") else None
+
+            r1_min = float(self.bragg_table.item(row_index, 4).text())
+            r1_max = float(self.bragg_table.item(row_index, 5).text())
+            r2_min = float(self.bragg_table.item(row_index, 2).text())
+            r2_max = float(self.bragg_table.item(row_index, 3).text())
+            r3_min = float(self.bragg_table.item(row_index, 6).text())
+            r3_max = float(self.bragg_table.item(row_index, 7).text())
+            s = float(self.bragg_table.item(row_index, 8).text())
+            t = float(self.bragg_table.item(row_index, 9).text())
+            eta = float(self.bragg_table.item(row_index, 10).text())
+        except (ValueError, AttributeError, TypeError):
+            return False
+
+        self.current_d = d
+        self.current_r1_min = r1_min
+        self.current_r1_max = r1_max
+        self.current_r2_min = r2_min
+        self.current_r2_max = r2_max
+        self.current_r3_min = r3_min
+        self.current_r3_max = r3_max
+        self.current_s = s
+        self.current_t = t
+        self.current_eta = eta
+        return True
+
     def update_bragg_edge_table(self):
         """
         Updates the Bragg edges table based on the selected phase and wavelength range.
         For 'Unknown_Phase', allows manual input up to 5 rows.
         Otherwise, computes theoretical edges (including non-cubic) and populates the table.
         """
+        prev_hkl_text = None
+        selected_row = self.bragg_table.currentRow()
+        if selected_row >= 0:
+            selected_hkl_item = self.bragg_table.item(selected_row, 0)
+            if selected_hkl_item is not None:
+                prev_hkl_text = selected_hkl_item.text().strip()
+
         # Only populate after user explicitly picks a region.
         if not getattr(self, "_bragg_table_ready", False):
+            self._reset_current_bragg_edge_state()
             self.bragg_table.setRowCount(0)
             return
 
         selected_phase = self.phase_dropdown.currentText()
         if selected_phase == "Unknown_Phase":
+            self._reset_current_bragg_edge_state()
             self.setup_unknown_phase_table()
             return  # Exit early as manual input is handled separately
     
         if selected_phase not in self.phase_data:
             self.message_box.append("Please select a valid phase.")
+            self._reset_current_bragg_edge_state()
             self.bragg_table.setRowCount(0)  # Clear table if invalid phase
             return
     
@@ -482,10 +542,12 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             if min_wavelength >= max_wavelength:
                 QMessageBox.warning(self, "Invalid Wavelength Range",
                                     "Minimum wavelength must be less than Maximum wavelength.")
+                self._reset_current_bragg_edge_state()
                 self.bragg_table.setRowCount(0)
                 return
         except ValueError:
             self.message_box.append("Please enter valid min and max wavelengths.")
+            self._reset_current_bragg_edge_state()
             self.bragg_table.setRowCount(0)
             return
     
@@ -511,6 +573,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.bragg_table.setRowCount(0)  # Clear existing rows
     
         if not edges_in_range:
+            self._reset_current_bragg_edge_state()
             self.message_box.append("No Bragg edges found within the specified wavelength range.")
             return
     
@@ -593,6 +656,22 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             self.bragg_table.setItem(row_position, 10, eta_item)
     
         # If we got here, we successfully populated the table.
+        target_row = 0
+        if prev_hkl_text:
+            for row in range(self.bragg_table.rowCount()):
+                item = self.bragg_table.item(row, 0)
+                if item and item.text().strip() == prev_hkl_text:
+                    target_row = row
+                    break
+
+        self.bragg_table.blockSignals(True)
+        self.bragg_table.clearSelection()
+        self.bragg_table.setCurrentCell(target_row, 0)
+        self.bragg_table.selectRow(target_row)
+        self.bragg_table.blockSignals(False)
+        if not self._sync_current_bragg_edge_from_row(target_row):
+            self._reset_current_bragg_edge_state()
+
         self.message_box.append(
             f"Updated Bragg edges table with {self.bragg_table.rowCount()} edge(s)."
         )
@@ -603,44 +682,16 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         Handler called when a Bragg edge row is selected in the table.
         Updates the region min/max wavelength inputs, 'd', s, t, etc.
         """
-        selected_items = self.bragg_table.selectedItems()
-        if not selected_items:
-            return  # No selection
-    
-        selected_row = selected_items[0].row()
-    
-        try:
-            # Column 1 is 'd'
-            d_text = self.bragg_table.item(selected_row, 1).text()
-            if d_text and d_text not in ("N/A", ""):
-                d = float(d_text)
-            else:
-                d = None
-    
-            r1_min = float(self.bragg_table.item(selected_row, 4).text())
-            r1_max = float(self.bragg_table.item(selected_row, 5).text())
-            r2_min = float(self.bragg_table.item(selected_row, 2).text())
-            r2_max = float(self.bragg_table.item(selected_row, 3).text())
-            r3_min = float(self.bragg_table.item(selected_row, 6).text())
-            r3_max = float(self.bragg_table.item(selected_row, 7).text())
-            s = float(self.bragg_table.item(selected_row, 8).text())
-            t = float(self.bragg_table.item(selected_row, 9).text())
-            eta = float(self.bragg_table.item(selected_row, 10).text())
-    
-        except (ValueError, AttributeError) as e:
-            self.message_box.append(f"Error reading values from selected row: {e}")
+        selected_row = self.bragg_table.currentRow()
+        if selected_row < 0:
+            selected_items = self.bragg_table.selectedItems()
+            if not selected_items:
+                return  # No selection
+            selected_row = selected_items[0].row()
+
+        if not self._sync_current_bragg_edge_from_row(selected_row):
+            self.message_box.append("Error reading values from selected row.")
             return
-    
-        self.current_d = d
-        self.current_r1_min = r1_min
-        self.current_r1_max = r1_max
-        self.current_r2_min = r2_min
-        self.current_r2_max = r2_max
-        self.current_r3_min = r3_min
-        self.current_r3_max = r3_max
-        self.current_s = s
-        self.current_t = t
-        self.current_eta = eta
 
         # Refresh plots immediately when a row is selected (if data is available)
         if getattr(self, "images", None) is not None and getattr(self, "selected_area", None):

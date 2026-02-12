@@ -277,7 +277,6 @@ class PreprocessingMixin:
         self.normalisation_adjacent_input = QLineEdit("0")
         self.normalisation_adjacent_input.setToolTip('Set moving frame window size, i.e. "m", size will be (2m+1)x(2m+1)')
         window_layout.addWidget(self.normalisation_adjacent_input)
-        normalisation_layout.addLayout(window_layout)
 
         # # Base name input box
         # self.normalisation_basename_input = QLineEdit()
