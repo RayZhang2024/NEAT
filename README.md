@@ -31,7 +31,7 @@ All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil,
 ## 🚀 Run the GUI
 
 ### Standalone executable
-You can download the Windows standalone executable from the [NEAT v4.7.1 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.7.1/NEAT_v4.7.1.zip).
+You can download the Windows standalone executable from the [NEAT v4.7.1 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.7.1/NEATv4.7.1.zip).
 No installation is needed, just run the executable by doule clicking.
 
 ### 🚀 Example data
