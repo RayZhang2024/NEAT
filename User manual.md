@@ -21,15 +21,15 @@
   - [3.4 Normalisation](#34-normalisation)
   - [3.5 Filtering](#35-filtering)
   - [3.6 Full Process](#36-full-process)
-- [4 Bragg Edge Fitting — step-by-step](#4-bragg-edge-fitting-step-by-step)
-  - [4.2 Load data & set experiment info](#42-load-data-set-experiment-info)
+- [4 Bragg Edge Fitting Step-by-step](#4-bragg-edge-fitting-step-by-step)
+  - [4.1 Load data and set experiment info](#41-load-data-and-set-experiment-info)
   - [4.2 Establish a spectrum (coarse macro-pixel)](#42-establish-a-spectrum-coarse-macro-pixel)
-  - [4.3 Configure fitting windows & model parameters](#43-configure-fitting-windows-model-parameters)
+  - [4.3 Configure fitting windows and model parameters](#43-configure-fitting-windows-and-model-parameters)
   - [4.4 Test fit on the macro-pixel](#44-test-fit-on-the-macro-pixel)
   - [4.5 Set up full-field (map) fitting](#45-set-up-full-field-map-fitting)
   - [4.6 Run batch fitting over ROI](#46-run-batch-fitting-over-roi)
-- [5 **Data Post-Processing**](#5-data-post-processing)
-  - [5.1 Layout & live elements](#51-layout-live-elements)
+- [5 Data Post-Processing](#5-data-post-processing)
+  - [5.1 Layout and live elements](#51-layout-and-live-elements)
   - [5.2 Controls (top bar)](#52-controls-top-bar)
 - [Appendix A: Fitting Functions and Logic](#appendix-a-fitting-functions-and-logic)
   - [A.1 Fitting functions](#a1-fitting-functions)
@@ -55,7 +55,7 @@
 [![Watch the video](https://img.youtube.com/vi/TB_vlNWM744/hqdefault.jpg)](https://www.youtube.com/watch?v=TB_vlNWM744)
 
 ## Example dataset for Bragg edge fitting
-An example dataset is available for Bragg edge fitting tutorial, click to download [Example_dataset](https://github.com/RayZhang2024/NEAT/releases/download/v4.7.1/5_Ubend_normalised.zip). The dataset has been pre-processed and is ready for Bragg edge fitting, go and have a try!
+An example dataset is available for Bragg edge fitting tutorial, click to download [Example_dataset](https://github.com/RayZhang2024/NEAT/releases/download/v4.6/5_Ubend_normalised.zip). The dataset has been pre-processed and is ready for Bragg edge fitting, go and have a try!
 
 **Credit:** The samples shown in this user manual were provided by the *European Union’s Horizon 2020 research and innovation programme under grant agreement No. 953219 (EASI-STRESS)*, and the example dataset was obtained from measurements on these samples.
 
@@ -829,9 +829,9 @@ Runs the **entire preprocessing pipeline** in one go:
 
 ---
 
-# 4 Bragg Edge Fitting — step-by-step
+# 4 Bragg Edge Fitting Step-by-step
 
-## 4.2 Load data & set experiment info
+## 4.1 Load data and set experiment info
 
 1. **Load normalised or filtered dataset**.
 2. Enter **flight path** (it's default to 56.4 m which is an often used filght path at IMAT, ask scientist if you don't know the filght path of your experiment).
@@ -864,7 +864,7 @@ How NEAT uses anchors:
 
 > Tip: Use a stable, representative region (avoid strong gradients) for this first pass.
 
-## 4.3 Configure fitting windows & model parameters
+## 4.3 Configure fitting windows and model parameters
 
 1. In the **Edge Table** (per hkl edge):
 
@@ -908,7 +908,7 @@ How NEAT uses anchors:
 
 ---
 
-# 5 **Data Post-Processing**
+# 5 Data Post-Processing
 
 * Click **Load csv** to load a csv file that stores the results obtained from a batch fitting.
 * Then select a metric to visualise any fitted **parameter map** (`Z`) on a 2D grid.
@@ -917,7 +917,7 @@ How NEAT uses anchors:
 * Interactively pick **line profiles** (multiple pairs), view, and export them.
 * Apply a **FITS mask** to filter the map, and **save** the map to **FITS**.
 
-## 5.1 Layout & live elements
+## 5.1 Layout and live elements
 
 * **Left pane:** read-only **Metadata** (includes the loaded CSV filename and key–value metadata).
 * **Right pane:**
