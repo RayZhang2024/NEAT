@@ -50,7 +50,7 @@ from ...workers.preprocessing import (
     OverlapCorrectionWorker,
     SummationWorker,
 )
-from ..dialogs import MaskGeneratorDialog
+from ..dialogs import MaskGeneratorDialog, OpenBeamPlotDialog
 
 
 class PreprocessingMixin:
