@@ -31,11 +31,11 @@ All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil,
 ## 🚀 Run the GUI
 
 ### Standalone executable
-You can download the Windows standalone executable from the [NEAT v4.7.1 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.7.1/NEATv4.7.1.zip).
+You can download the Windows standalone executable from the [NEAT v4.7.2 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.7.2/NEATv4.7.2.zip).
 No installation is needed, just run the executable by doule clicking.
 
 ### 🚀 Example data
-An example dataset is available for Bragg edge fitting tutorial, click to download [Example_dataset](https://github.com/RayZhang2024/NEAT/releases/download/v4.7.1/5_Ubend_normalised.zip). The dataset has been pre-processed and is ready for Bragg edge fitting, go and have a try!
+An example dataset is available for Bragg edge fitting tutorial, click to download [Example_dataset](https://github.com/RayZhang2024/NEAT/releases/download/v4.6/5_Ubend_normalised.zip). The dataset has been pre-processed and is ready for Bragg edge fitting, go and have a try!
 
 ### If you would like to run the script:
 
@@ -83,7 +83,7 @@ python -m NEAT.app
 ```
 
 ✅ The main window titled
-**“NEAT Neutron Bragg Edge Analysis Toolkit v4.7.1”**
+**“NEAT Neutron Bragg Edge Analysis Toolkit v4.7.2”**
 will appear, with tabs for:
 
 * **Data Preprocessing**

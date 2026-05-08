@@ -11,6 +11,8 @@ import psutil
 from astropy.io import fits
 from PyQt5.QtCore import Qt, QEventLoop, QThread, pyqtSignal
 
+from .batch import load_image_file
+
 class OutlierFilteringWorker(QThread):
     progress_updated = pyqtSignal(int)
     finished = pyqtSignal()
@@ -1114,7 +1116,7 @@ class FullProcessWorker(QThread):
                 runs.append(r)
     
         if not runs:
-            self.message.emit(f"0_sumation_{label}: No valid FITS images in subfolders of '\\{short_path}'. Summation skipped.")
+            self.message.emit(f"0_sumation_{label}: No valid FITS/TIFF images in subfolders of '\\{short_path}'. Summation skipped.")
             return folder
     
         # Create a modified base name for image naming (e.g., "summed_sample_data")
@@ -1330,7 +1332,7 @@ class FullProcessWorker(QThread):
   
     def load_run_dict(self, folder: str) -> dict:
         """
-        Scans the folder for FITS files with a 5-digit suffix and returns a dictionary:
+        Scans the folder for FITS/TIFF files with a 5-digit suffix and returns a dictionary:
             { 'folder_path': folder, 'images': {suffix: data} }.
         Also emits loading progress via load_progress_updated.
         """
@@ -1343,13 +1345,16 @@ class FullProcessWorker(QThread):
         short_path = self.get_short_path(folder, levels=2)
 
         try:
-            fits_files = [f for f in os.listdir(folder) if f.lower().endswith((".fits", ".fit"))]
+            image_files = [
+                f for f in os.listdir(folder)
+                if f.lower().endswith((".fits", ".fit", ".tiff", ".tif"))
+            ]
             # Filter only files with the proper 5-digit suffix format:
-            pattern = re.compile(r'^.+_(\d{5})\.(fits|fit)$', re.IGNORECASE)
-            total_files = len(fits_files)
+            pattern = re.compile(r'^.+_(\d{5})\.(fits|fit|tiff|tif)$', re.IGNORECASE)
+            total_files = len(image_files)
             processed_files = 0
 
-            for f in fits_files:
+            for f in image_files:
                 processed_files += 1
                 match = pattern.match(f)
                 if not match:
@@ -1362,7 +1367,7 @@ class FullProcessWorker(QThread):
                 suffix = match.group(1)
                 try:
                     path = os.path.join(folder, f)
-                    data = fits.getdata(path)
+                    data = load_image_file(path)
                     run["images"][suffix] = data.astype(np.float32)
                 except Exception as e:
                     self.message.emit(f"Error loading file {f} in \\{short_path}: {e}")

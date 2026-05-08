@@ -850,7 +850,7 @@ class PreprocessingMixin:
 
             # self.preproc_message_box.append(f"Successfully loaded Overlap Correction from '{folder_path}' with {len(run_dict)} images.")
         else:
-            self.preproc_message_box.append("No valid FITS images were loaded from the selected folder.")
+            self.preproc_message_box.append("No valid FITS/TIFF images were loaded from the selected folder.")
 
     def overlap_correction_image_loading_finished(self):
         if self.overlap_correction_image_load_worker:

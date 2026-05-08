@@ -174,6 +174,10 @@ class FittingMixin:
         # Matplotlib canvas
         self.canvas = MplCanvas(self, width=4, height=4, dpi=100)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setToolTip(
+            "Drag inside a box to move it. Ctrl+drag a corner to resize it. "
+            "Drag outside boxes to pan the image."
+        )
 
         # Create and add Navigation toolbar
         self.toolbar = NavigationToolbar(self.canvas, self)
@@ -193,6 +197,11 @@ class FittingMixin:
         self._batch_drag_offset = (0.0, 0.0)
         self._dragging_batch_mode = "move"
         self._batch_active_corner = None
+        self._dragging_image_pan = False
+        self._image_pan_start_xpixel = None
+        self._image_pan_start_ypixel = None
+        self._image_pan_start_xlim = None
+        self._image_pan_start_ylim = None
         self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
         self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
@@ -261,17 +270,26 @@ class FittingMixin:
         self.show_theoretical_checkbox.stateChanged.connect(self.update_plots)  # Trigger plot update on toggle
         slider_layout.addWidget(self.show_theoretical_checkbox)
         self.fix_s_checkbox = QCheckBox("Fix s")
-        self.fix_s_checkbox.setToolTip('Fix "s" during fitting')
+        self.fix_s_checkbox.setToolTip(
+            "Keep the Bragg-edge broadening parameter s fixed at the value in the table. "
+            "Uncheck to fit s for each selected edge."
+        )
         self.fix_s_checkbox.setChecked(True)
         slider_layout.addWidget(self.fix_s_checkbox)
 
         self.fix_t_checkbox = QCheckBox("Fix t")
-        self.fix_t_checkbox.setToolTip('Fix "t" during fitting')
+        self.fix_t_checkbox.setToolTip(
+            "Keep the moderator decay parameter t fixed at the value in the table. "
+            "Uncheck to fit t for each selected edge."
+        )
         self.fix_t_checkbox.setChecked(True)
         slider_layout.addWidget(self.fix_t_checkbox)
 
         self.fix_eta_checkbox = QCheckBox("Fix eta")
-        self.fix_eta_checkbox.setToolTip('Fix "eta" during fitting')
+        self.fix_eta_checkbox.setToolTip(
+            "Keep the pseudo-Voigt mixing parameter eta fixed at the value in the table. "
+            "Uncheck to fit eta; eta=0 is Gaussian-like and eta=1 is Lorentzian-like."
+        )
         self.fix_eta_checkbox.setChecked(True)
         slider_layout.addWidget(self.fix_eta_checkbox)
 
@@ -279,15 +297,19 @@ class FittingMixin:
         lower_left_layout.addWidget(self.image_slider)
 
         # Rectangle selection inputs
+        roi_bounds_tooltip = self._roi_bounds_tooltip(
+            "Initial fitting ROI",
+            "x[0, 1), y[0, 1) includes only pixel (0, 0).",
+        )
         selection_layout = QGridLayout()
         self.xmin_input = QLineEdit("300")
-        self.xmin_input.setToolTip('Set x_min coordinate of the ROI for initial edge fitting')
+        self.xmin_input.setToolTip(roi_bounds_tooltip)
         self.xmax_input = QLineEdit("320")
-        self.xmax_input.setToolTip('Set x_max coordinate of the ROI for initial edge fitting')
+        self.xmax_input.setToolTip(roi_bounds_tooltip)
         self.ymin_input = QLineEdit("300")
-        self.ymin_input.setToolTip('Set y_min coordinate of the ROI for initial edge fitting')
+        self.ymin_input.setToolTip(roi_bounds_tooltip)
         self.ymax_input = QLineEdit("320")
-        self.ymax_input.setToolTip('Set y_max coordinate of the ROI for initial edge fitting')
+        self.ymax_input.setToolTip(roi_bounds_tooltip)
 
         selection_layout.addWidget(QLabel("X Min:"), 0, 0)
         selection_layout.addWidget(self.xmin_input, 0, 1)
@@ -359,17 +381,17 @@ class FittingMixin:
 
         # 1) Define the tooltip text, in the same order as the columns
         header_tips = [
-            "Miller indices (h k l)",
-            "d-spacing (Å)",
-            "lower bound of region 1 (the linear part to the left of the edge)",
-            "upper bound of region 1 (the linear part to the left of the edge)",
-            "lower bound of region 2 (the linear part to the right of the edge)",
-            "upper bound of region 2 (the linear part to the right of the edge)",
-            "lower bound of region 3 (the whole region of the edge to be fitted)",
-            "upper bound of region 3 (the whole region of the edge to be fitted)",
-            "fitting parameter s (broadening)",
-            "moderator decay constant t",
-            "pseudo-Voigt shape parameter, 0 => pure Gaussian, 1=> pure Lorentzian"
+            "Miller indices of the Bragg edge, written as (h, k, l).",
+            "Theoretical d-spacing for this hkl, in Angstrom.",
+            "Region 1 lower wavelength bound. Region 1 is the pre-edge baseline used in edge fitting.",
+            "Region 1 upper wavelength bound. Region 1 is the pre-edge baseline used in edge fitting.",
+            "Region 2 lower wavelength bound. Region 2 is the post-edge baseline used in edge fitting.",
+            "Region 2 upper wavelength bound. Region 2 is the post-edge baseline used in edge fitting.",
+            "Region 3 lower wavelength bound. Region 3 is the full edge window used for the fit.",
+            "Region 3 upper wavelength bound. Region 3 is the full edge window used for the fit.",
+            "Initial/fixed value for s, the edge broadening parameter. Controlled by the Fix s checkbox.",
+            "Initial/fixed value for t, the moderator decay parameter. Controlled by the Fix t checkbox.",
+            "Initial/fixed value for eta, the pseudo-Voigt mixing parameter. 0 is Gaussian-like, 1 is Lorentzian-like."
         ]
 
         # 2) Attach each tooltip
@@ -1618,7 +1640,9 @@ class FittingMixin:
             return
 
         self.selected_area = (self.min_x, self.max_x, self.min_y, self.max_y)
-        self.message_box.append(f"Selected area: x({self.min_x}, {self.max_x}), y({self.min_y}, {self.max_y})")
+        self.message_box.append(
+            f"Selected area: x[{self.min_x}, {self.max_x}), y[{self.min_y}, {self.max_y})"
+        )
 
         # Now update the image to show the selected area with a rectangle
         self.display_image()
@@ -1962,6 +1986,12 @@ class FittingMixin:
         max_x_edit = QLineEdit(self.max_x_input.text())
         min_y_edit = QLineEdit(self.min_y_input.text())
         max_y_edit = QLineEdit(self.max_y_input.text())
+        batch_roi_tooltip = self._roi_bounds_tooltip(
+            "Batch fitting ROI",
+            "x[10, 12), y[20, 23) includes x pixels 10-11 and y pixels 20-22.",
+        )
+        for roi_edit in (min_x_edit, max_x_edit, min_y_edit, max_y_edit):
+            roi_edit.setToolTip(batch_roi_tooltip)
         roi_layout.addRow("ROI X Min:", min_x_edit)
         roi_layout.addRow("ROI X Max:", max_x_edit)
         roi_layout.addRow("ROI Y Min:", min_y_edit)
@@ -2424,9 +2454,8 @@ class FittingMixin:
         # Draw the selected area, if available (initial fitting ROI)
         if self.selected_area:
             xmin, xmax, ymin, ymax = self.selected_area
-            width = xmax - xmin
-            height = ymax - ymin
-            rect = Rectangle((xmin, ymin), width, height, edgecolor='yellow', facecolor='none', lw=1)
+            xy, width, height = self._slice_box_patch_args(xmin, xmax, ymin, ymax)
+            rect = Rectangle(xy, width, height, edgecolor='yellow', facecolor='none', lw=1)
             self.canvas.axes.add_patch(rect)
 
         # Draw the static batch ROI from min/max inputs (orange)
@@ -2436,10 +2465,16 @@ class FittingMixin:
             roi_min_y = int(self.min_y_input.text())
             roi_max_y = int(self.max_y_input.text())
             if roi_min_x < roi_max_x and roi_min_y < roi_max_y:
+                xy, width, height = self._slice_box_patch_args(
+                    roi_min_x,
+                    roi_max_x,
+                    roi_min_y,
+                    roi_max_y,
+                )
                 roi_rect = Rectangle(
-                    (roi_min_x, roi_min_y),
-                    roi_max_x - roi_min_x,
-                    roi_max_y - roi_min_y,
+                    xy,
+                    width,
+                    height,
                     edgecolor="orange",
                     facecolor="none",
                     lw=1,
@@ -2461,22 +2496,23 @@ class FittingMixin:
 
         # Draw the batch fitting moving box, if available
         if self.current_batch_box:
-            xmin, xmax, ymin, ymax = self.current_batch_box
+            row_min, row_max, col_min, col_max = self.current_batch_box
+            xy, width, height = self._slice_box_patch_args(col_min, col_max, row_min, row_max)
 
             # If a rectangle already exists, update it
             if self.batch_box_patch is not None and self.batch_box_patch.axes is not None:
                 try:
                     # Update position and size instead of removing/re-adding
-                    self.batch_box_patch.set_xy((ymin, xmin))
-                    self.batch_box_patch.set_width(ymax - ymin)
-                    self.batch_box_patch.set_height(xmax - xmin)
+                    self.batch_box_patch.set_xy(xy)
+                    self.batch_box_patch.set_width(width)
+                    self.batch_box_patch.set_height(height)
                 except (ValueError, RuntimeError, AttributeError):
                     # Fallback: recreate it cleanly
                     self.batch_box_patch.remove()
                     self.batch_box_patch = Rectangle(
-                        (ymin, xmin),
-                        ymax - ymin,
-                        xmax - xmin,
+                        xy,
+                        width,
+                        height,
                         edgecolor="red",
                         facecolor="none",
                         lw=1,
@@ -2485,9 +2521,9 @@ class FittingMixin:
             else:
                 # No existing patch – create a new one
                 self.batch_box_patch = Rectangle(
-                    (ymin, xmin),
-                    ymax - ymin,
-                    xmax - xmin,
+                    xy,
+                    width,
+                    height,
                     edgecolor="red",
                     facecolor="none",
                     lw=1,
@@ -2540,37 +2576,58 @@ class FittingMixin:
         if not self.images or event.xdata is None or event.ydata is None:
             return
 
-        # Priority: yellow macro-pixel box (corner resize takes precedence)
+        resize_requested = self._is_resize_modifier_pressed(event)
+
+        # Priority: yellow macro-pixel box. Corner resize requires Ctrl to avoid
+        # conflicting with move gestures on very small boxes.
         if self.selected_area:
-            corner = self._hit_corner(self.selected_area, event.xdata, event.ydata)
-            if corner:
+            corner = (
+                self._hit_corner(self.selected_area, event.xdata, event.ydata)
+                if resize_requested else None
+            )
+            if corner is not None:
                 self._dragging_roi = True
                 self._dragging_roi_mode = "resize"
                 self._roi_active_corner = corner
                 return
 
-            xmin, xmax, ymin, ymax = self.selected_area
-            if xmin <= event.xdata <= xmax and ymin <= event.ydata <= ymax:
+            if self._point_in_slice_box(self.selected_area, event.xdata, event.ydata):
+                xmin, xmax, ymin, ymax = self.selected_area
+                left, top, _, _ = self._slice_box_edges(xmin, xmax, ymin, ymax)
                 self._dragging_roi = True
                 self._dragging_roi_mode = "move"
-                self._roi_drag_offset = (event.xdata - xmin, event.ydata - ymin)
+                self._roi_drag_offset = (event.xdata - left, event.ydata - top)
                 return
 
-        # Otherwise check orange batch ROI (corner resize takes precedence)
+        # Otherwise check orange batch ROI, with the same Ctrl+corner resize rule.
         batch_roi = self._get_batch_roi()
         if batch_roi:
-            corner = self._hit_corner(batch_roi, event.xdata, event.ydata)
-            if corner:
+            corner = (
+                self._hit_corner(batch_roi, event.xdata, event.ydata)
+                if resize_requested else None
+            )
+            if corner is not None:
                 self._dragging_batch_roi = True
                 self._dragging_batch_mode = "resize"
                 self._batch_active_corner = corner
                 return
 
-            bxmin, bxmax, bymin, bymax = batch_roi
-            if bxmin <= event.xdata <= bxmax and bymin <= event.ydata <= bymax:
+            if self._point_in_slice_box(batch_roi, event.xdata, event.ydata):
+                bxmin, bxmax, bymin, bymax = batch_roi
+                left, top, _, _ = self._slice_box_edges(bxmin, bxmax, bymin, bymax)
                 self._dragging_batch_roi = True
                 self._dragging_batch_mode = "move"
-                self._batch_drag_offset = (event.xdata - bxmin, event.ydata - bymin)
+                self._batch_drag_offset = (event.xdata - left, event.ydata - top)
+                return
+
+        if self._is_fitting_navigation_active():
+            return
+
+        self._dragging_image_pan = True
+        self._image_pan_start_xpixel = getattr(event, "x", None)
+        self._image_pan_start_ypixel = getattr(event, "y", None)
+        self._image_pan_start_xlim = self.canvas.axes.get_xlim()
+        self._image_pan_start_ylim = self.canvas.axes.get_ylim()
 
     def _on_canvas_motion(self, event):
         if event.inaxes != self.canvas.axes or event.xdata is None or event.ydata is None or not self.images:
@@ -2585,8 +2642,8 @@ class FittingMixin:
                 box_h = ymax - ymin
                 offset_x, offset_y = self._roi_drag_offset
 
-                new_xmin = int(round(event.xdata - offset_x))
-                new_ymin = int(round(event.ydata - offset_y))
+                new_xmin = self._pixel_edge_to_index(event.xdata - offset_x)
+                new_ymin = self._pixel_edge_to_index(event.ydata - offset_y)
 
                 new_xmin = max(0, min(new_xmin, img_w - box_w))
                 new_ymin = max(0, min(new_ymin, img_h - box_h))
@@ -2618,8 +2675,8 @@ class FittingMixin:
                 box_h = bymax - bymin
                 offset_x, offset_y = self._batch_drag_offset
 
-                new_xmin = int(round(event.xdata - offset_x))
-                new_ymin = int(round(event.ydata - offset_y))
+                new_xmin = self._pixel_edge_to_index(event.xdata - offset_x)
+                new_ymin = self._pixel_edge_to_index(event.ydata - offset_y)
 
                 new_xmin = max(0, min(new_xmin, img_w - box_w))
                 new_ymin = max(0, min(new_ymin, img_h - box_h))
@@ -2642,6 +2699,10 @@ class FittingMixin:
             self.min_y_input.setText(str(new_ymin))
             self.max_y_input.setText(str(new_ymax))
             self.display_image()
+            return
+
+        if self._dragging_image_pan:
+            self._pan_image_view(event, img_w, img_h)
 
     def _on_canvas_release(self, event):
         if self._dragging_roi:
@@ -2656,6 +2717,84 @@ class FittingMixin:
             self._batch_drag_offset = (0.0, 0.0)
             self._dragging_batch_mode = "move"
             self._batch_active_corner = None
+        if self._dragging_image_pan:
+            self._reset_image_pan_state()
+
+    def _pan_image_view(self, event, img_w, img_h):
+        """Pan the image viewer by shifting axis limits from the drag start."""
+        if (
+            self._image_pan_start_xpixel is None
+            or self._image_pan_start_ypixel is None
+            or self._image_pan_start_xlim is None
+            or self._image_pan_start_ylim is None
+        ):
+            return
+
+        ax = self.canvas.axes
+        bbox = ax.bbox
+        if bbox.width <= 0 or bbox.height <= 0:
+            return
+
+        event_x = getattr(event, "x", None)
+        event_y = getattr(event, "y", None)
+        if event_x is None or event_y is None:
+            return
+
+        dx_pixels = event_x - self._image_pan_start_xpixel
+        dy_pixels = event_y - self._image_pan_start_ypixel
+        x0, x1 = self._image_pan_start_xlim
+        y0, y1 = self._image_pan_start_ylim
+        dx = dx_pixels * ((x1 - x0) / bbox.width)
+        dy = dy_pixels * ((y1 - y0) / bbox.height)
+        x_bounds = (-0.5, img_w - 0.5)
+        y_bounds = (-0.5, img_h - 0.5)
+
+        new_xlim = self._shift_image_axis_limits(
+            self._image_pan_start_xlim,
+            dx,
+            x_bounds,
+        )
+        new_ylim = self._shift_image_axis_limits(
+            self._image_pan_start_ylim,
+            dy,
+            y_bounds,
+        )
+        self.canvas.axes.set_xlim(*new_xlim)
+        self.canvas.axes.set_ylim(*new_ylim)
+        self.canvas.draw_idle()
+
+    def _reset_image_pan_state(self):
+        """Clear image viewer drag-pan state."""
+        self._dragging_image_pan = False
+        self._image_pan_start_xpixel = None
+        self._image_pan_start_ypixel = None
+        self._image_pan_start_xlim = None
+        self._image_pan_start_ylim = None
+
+    @staticmethod
+    def _shift_image_axis_limits(limits, delta, bounds):
+        """Shift axis limits by a drag delta while preserving direction and bounds."""
+        a0, a1 = limits
+        inverted = a0 > a1
+        lo, hi = (a1, a0) if inverted else (a0, a1)
+        span = hi - lo
+        full_span = bounds[1] - bounds[0]
+        if span <= 0:
+            return limits
+        if span >= full_span:
+            new_lo, new_hi = bounds
+        else:
+            new_lo = lo - delta
+            new_hi = hi - delta
+            if new_lo < bounds[0]:
+                new_hi += bounds[0] - new_lo
+                new_lo = bounds[0]
+            if new_hi > bounds[1]:
+                new_lo -= new_hi - bounds[1]
+                new_hi = bounds[1]
+            new_lo = max(new_lo, bounds[0])
+            new_hi = min(new_hi, bounds[1])
+        return (new_hi, new_lo) if inverted else (new_lo, new_hi)
 
     def _is_fitting_navigation_active(self):
         """Return True when matplotlib toolbar pan/zoom mode is active."""
@@ -2671,7 +2810,7 @@ class FittingMixin:
             return
         if self._is_fitting_navigation_active():
             return
-        if self._dragging_roi or self._dragging_batch_roi:
+        if self._dragging_roi or self._dragging_batch_roi or self._dragging_image_pan:
             return
         if event.button not in ("up", "down"):
             return
@@ -2949,16 +3088,59 @@ class FittingMixin:
             return None
         return (xmin, xmax, ymin, ymax)
 
+    @staticmethod
+    def _roi_bounds_tooltip(label, example):
+        return (
+            f"{label} bounds use half-open pixel ranges: "
+            "Min is included, Max is excluded. "
+            "Pixels included are x_min <= x < x_max and y_min <= y < y_max. "
+            f"{example}"
+        )
+
+    def _is_resize_modifier_pressed(self, event):
+        """Return True when the Ctrl modifier is active for an ROI resize gesture."""
+        key = str(getattr(event, "key", "") or "").lower()
+        if "control" in key or "ctrl" in key:
+            return True
+        try:
+            modifiers = QApplication.keyboardModifiers()
+        except RuntimeError:
+            return False
+        return bool(modifiers & Qt.ControlModifier)
+
+    @staticmethod
+    def _pixel_edge_to_index(value):
+        """Convert a displayed pixel edge coordinate back to an integer slice bound."""
+        return int(np.floor(value + 0.5))
+
+    @staticmethod
+    def _slice_box_edges(xmin, xmax, ymin, ymax):
+        """Return displayed pixel-edge bounds for a half-open ROI slice."""
+        return xmin - 0.5, ymin - 0.5, xmax - 0.5, ymax - 0.5
+
+    @classmethod
+    def _slice_box_patch_args(cls, xmin, xmax, ymin, ymax):
+        """Return Rectangle args that outline the pixels covered by a slice ROI."""
+        left, top, right, bottom = cls._slice_box_edges(xmin, xmax, ymin, ymax)
+        return (left, top), right - left, bottom - top
+
+    def _point_in_slice_box(self, box, x, y):
+        """Return True when a point is inside the displayed bounds of a slice ROI."""
+        if x is None or y is None or not box:
+            return False
+        left, top, right, bottom = self._slice_box_edges(*box)
+        return left <= x <= right and top <= y <= bottom
+
     def _hit_corner(self, box, x, y, threshold=8):
         """Return corner label if (x,y) is near a corner of the box."""
         if x is None or y is None or not box:
             return None
-        xmin, xmax, ymin, ymax = box
+        left, top, right, bottom = self._slice_box_edges(*box)
         corners = {
-            "tl": (xmin, ymin),
-            "tr": (xmax, ymin),
-            "bl": (xmin, ymax),
-            "br": (xmax, ymax),
+            "tl": (left, top),
+            "tr": (right, top),
+            "bl": (left, bottom),
+            "br": (right, bottom),
         }
         for label, (cx, cy) in corners.items():
             if abs(x - cx) <= threshold and abs(y - cy) <= threshold:
@@ -2971,13 +3153,13 @@ class FittingMixin:
         if corner is None:
             return box
         if "l" in corner:
-            xmin = max(0, min(int(round(x)), xmax - min_w))
+            xmin = max(0, min(self._pixel_edge_to_index(x), xmax - min_w))
         if "r" in corner:
-            xmax = min(img_w, max(int(round(x)), xmin + min_w))
+            xmax = min(img_w, max(self._pixel_edge_to_index(x), xmin + min_w))
         if "t" in corner:
-            ymin = max(0, min(int(round(y)), ymax - min_h))
+            ymin = max(0, min(self._pixel_edge_to_index(y), ymax - min_h))
         if "b" in corner:
-            ymax = min(img_h, max(int(round(y)), ymin + min_h))
+            ymax = min(img_h, max(self._pixel_edge_to_index(y), ymin + min_h))
         return (xmin, xmax, ymin, ymax)
 
     def _ensure_fit_canvas_axes(self, canvas):

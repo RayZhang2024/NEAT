@@ -52,6 +52,50 @@ class _DummyDropdown:
         return self._value
 
 
+class _DummyCanvas:
+    def __init__(self):
+        self.axes = _DummyAxes()
+        self.drawn = False
+
+    def draw_idle(self):
+        self.drawn = True
+
+
+class _DummyAxes:
+    def __init__(self):
+        self._xlim = (0.0, 1.0)
+        self._ylim = (1.0, 0.0)
+        self.bbox = _DummyBbox()
+
+    def get_xlim(self):
+        return self._xlim
+
+    def get_ylim(self):
+        return self._ylim
+
+    def set_xlim(self, *limits):
+        self._xlim = tuple(limits)
+
+    def set_ylim(self, *limits):
+        self._ylim = tuple(limits)
+
+
+class _DummyMouseEvent:
+    def __init__(self, axes, xdata, ydata, key=None, x=0.0, y=0.0):
+        self.button = 1
+        self.inaxes = axes
+        self.xdata = xdata
+        self.ydata = ydata
+        self.key = key
+        self.x = x
+        self.y = y
+
+
+class _DummyBbox:
+    width = 100.0
+    height = 100.0
+
+
 class _HeadlessFitting(FittingMixin):
     pass
 
@@ -298,6 +342,104 @@ class TestFittingHeadless(unittest.TestCase):
         self.assertIn(hkl, result["edge_widths"])
         self.assertTrue(np.isfinite(result["edge_heights"][hkl]))
         self.assertTrue(np.isfinite(result["edge_widths"][hkl]))
+
+    def test_canvas_corner_press_without_ctrl_moves_small_roi(self):
+        obj = _HeadlessFitting()
+        obj.canvas = _DummyCanvas()
+        obj.images = [np.zeros((20, 20), dtype=np.float32)]
+        obj.selected_area = (10, 12, 10, 12)
+        obj._dragging_roi = False
+        obj._roi_drag_offset = (0.0, 0.0)
+        obj._dragging_roi_mode = "move"
+        obj._roi_active_corner = None
+
+        event = _DummyMouseEvent(obj.canvas.axes, 10, 10)
+        obj._on_canvas_press(event)
+
+        self.assertTrue(obj._dragging_roi)
+        self.assertEqual(obj._dragging_roi_mode, "move")
+        self.assertIsNone(obj._roi_active_corner)
+
+    def test_canvas_corner_press_with_ctrl_resizes_small_roi(self):
+        obj = _HeadlessFitting()
+        obj.canvas = _DummyCanvas()
+        obj.images = [np.zeros((20, 20), dtype=np.float32)]
+        obj.selected_area = (10, 12, 10, 12)
+        obj._dragging_roi = False
+        obj._roi_drag_offset = (0.0, 0.0)
+        obj._dragging_roi_mode = "move"
+        obj._roi_active_corner = None
+
+        event = _DummyMouseEvent(obj.canvas.axes, 10, 10, key="control")
+        obj._on_canvas_press(event)
+
+        self.assertTrue(obj._dragging_roi)
+        self.assertEqual(obj._dragging_roi_mode, "resize")
+        self.assertEqual(obj._roi_active_corner, "tl")
+
+    def test_canvas_drag_outside_rois_pans_image_view(self):
+        obj = _HeadlessFitting()
+        obj.canvas = _DummyCanvas()
+        obj.canvas.axes.set_xlim(20.0, 40.0)
+        obj.canvas.axes.set_ylim(50.0, 30.0)
+        obj.toolbar = object()
+        obj.images = [np.zeros((100, 100), dtype=np.float32)]
+        obj.selected_area = (10, 12, 10, 12)
+        obj.min_x_input = _DummyTextInput("")
+        obj.max_x_input = _DummyTextInput("")
+        obj.min_y_input = _DummyTextInput("")
+        obj.max_y_input = _DummyTextInput("")
+        obj._dragging_roi = False
+        obj._dragging_batch_roi = False
+        obj._dragging_image_pan = False
+        obj._image_pan_start_xpixel = None
+        obj._image_pan_start_ypixel = None
+        obj._image_pan_start_xlim = None
+        obj._image_pan_start_ylim = None
+
+        press = _DummyMouseEvent(obj.canvas.axes, 30.0, 40.0, x=50.0, y=50.0)
+        obj._on_canvas_press(press)
+        self.assertTrue(obj._dragging_image_pan)
+
+        motion = _DummyMouseEvent(obj.canvas.axes, 35.0, 45.0, x=75.0, y=75.0)
+        obj._on_canvas_motion(motion)
+        self.assertEqual(obj.canvas.axes.get_xlim(), (15.0, 35.0))
+        self.assertEqual(obj.canvas.axes.get_ylim(), (55.0, 35.0))
+        self.assertTrue(obj.canvas.drawn)
+
+        obj._on_canvas_motion(motion)
+        self.assertEqual(obj.canvas.axes.get_xlim(), (15.0, 35.0))
+        self.assertEqual(obj.canvas.axes.get_ylim(), (55.0, 35.0))
+
+        obj._on_canvas_release(motion)
+        self.assertFalse(obj._dragging_image_pan)
+
+    def test_shift_image_axis_limits_clamps_to_image_bounds(self):
+        shifted = _HeadlessFitting._shift_image_axis_limits((5.0, 25.0), 20.0, (-0.5, 99.5))
+        self.assertEqual(shifted, (-0.5, 19.5))
+
+        inverted = _HeadlessFitting._shift_image_axis_limits((25.0, 5.0), -90.0, (-0.5, 99.5))
+        self.assertEqual(inverted, (99.5, 79.5))
+
+    def test_slice_box_patch_args_outlines_covered_pixel_edges(self):
+        xy, width, height = _HeadlessFitting._slice_box_patch_args(0, 1, 0, 1)
+        self.assertEqual(xy, (-0.5, -0.5))
+        self.assertEqual(width, 1.0)
+        self.assertEqual(height, 1.0)
+
+        xy, width, height = _HeadlessFitting._slice_box_patch_args(10, 12, 20, 23)
+        self.assertEqual(xy, (9.5, 19.5))
+        self.assertEqual(width, 2.0)
+        self.assertEqual(height, 3.0)
+
+    def test_resize_box_uses_pixel_edge_bounds(self):
+        obj = _HeadlessFitting()
+
+        expanded = obj._resize_box((0, 1, 0, 1), "br", 1.5, 1.5, 10, 10, min_w=1, min_h=1)
+        self.assertEqual(expanded, (0, 2, 0, 2))
+
+        shifted_left = obj._resize_box((2, 5, 2, 5), "tl", 0.5, 0.5, 10, 10, min_w=1, min_h=1)
+        self.assertEqual(shifted_left, (1, 5, 1, 5))
 
 
 if __name__ == "__main__":

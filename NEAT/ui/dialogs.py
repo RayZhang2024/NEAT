@@ -1715,12 +1715,15 @@ class ParameterPlotDialog(QDialog):
                 self.selection_rectangle.remove()
     
 
-            rect_x = x_min
-            rect_y = y_min
-            rect_width = x_max - x_min
-            rect_height = y_max - y_min
+            unit_factor = 0.055 if self.unit_in_mm else 1.0
+            x_edges = self.calculate_edges(self.X_unique * unit_factor)
+            y_edges = self.calculate_edges(self.Y_unique * unit_factor)
+            rect_x = x_edges[ixmin]
+            rect_y = y_edges[iymin]
+            rect_width = x_edges[ixmax] - x_edges[ixmin]
+            rect_height = y_edges[iymax] - y_edges[iymin]
 
-    
+
             self.selection_rectangle = Rectangle(
                 (rect_x, rect_y),
                 rect_width,
