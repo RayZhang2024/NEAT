@@ -2,16 +2,18 @@
 
 import gc
 import glob
+import csv
 import os
 import time
+from html import escape
 
 import matplotlib as mpl
 import numpy as np
 import pandas as pd
 from astropy.io import fits
 from PyQt5 import QtWidgets
-from PyQt5.QtCore import Qt, QTimer, QSize
-from PyQt5.QtGui import QFont, QKeySequence
+from PyQt5.QtCore import QPoint, Qt, QTimer, QSize, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygon
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -43,9 +45,9 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QAbstractItemView,
     QSizePolicy,
-    QShortcut,
     QDialog,
     QDialogButtonBox,
+    QButtonGroup,
     QFormLayout,
 )
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -66,10 +68,121 @@ from ...workers.batch import (
 )
 from ..dialogs import (
     AdjustmentsDialog,
-    FitVisualizationDialog,
     MplCanvas,
     OpenBeamPlotDialog,
 )
+
+
+class CheckableBraggHeader(QHeaderView):
+    """Horizontal table header with checkbox states for selected columns."""
+
+    state_changed = pyqtSignal(int, bool)
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._checkable_columns = {}
+        self._checkbox_widgets = {}
+        self.setSectionsClickable(True)
+        self.setDefaultAlignment(Qt.AlignCenter)
+        self.sectionResized.connect(self._update_checkbox_positions)
+        self.sectionMoved.connect(self._update_checkbox_positions)
+        self.geometriesChanged.connect(self._update_checkbox_positions)
+
+    def set_checkable_column(self, column, checked=True):
+        self._checkable_columns[column] = bool(checked)
+        checkbox = self._checkbox_widgets.get(column)
+        if checkbox is None:
+            checkbox = QCheckBox(self.viewport())
+            checkbox.setFocusPolicy(Qt.NoFocus)
+            checkbox.setStyleSheet("QCheckBox::indicator { width: 10px; height: 10px; }")
+            checkbox.setToolTip("Checked = fixed during fitting; unchecked = fitted.")
+            checkbox.toggled.connect(
+                lambda state, col=column: self._on_checkbox_toggled(col, state)
+            )
+            self._checkbox_widgets[column] = checkbox
+        checkbox.blockSignals(True)
+        checkbox.setChecked(bool(checked))
+        checkbox.blockSignals(False)
+        checkbox.show()
+        self._update_checkbox_positions()
+        self.viewport().update()
+
+    def set_column_checked(self, column, checked):
+        if column not in self._checkable_columns:
+            return
+        self._checkable_columns[column] = bool(checked)
+        checkbox = self._checkbox_widgets.get(column)
+        if checkbox is not None:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(bool(checked))
+            checkbox.blockSignals(False)
+        self.viewport().update()
+
+    def is_column_checked(self, column):
+        checkbox = self._checkbox_widgets.get(column)
+        if checkbox is not None:
+            return checkbox.isChecked()
+        return bool(self._checkable_columns.get(column, False))
+
+    def sizeHint(self):
+        size = super().sizeHint()
+        size.setHeight(max(size.height(), 30))
+        return size
+
+    def _on_checkbox_toggled(self, column, checked):
+        self._checkable_columns[column] = bool(checked)
+        self.state_changed.emit(column, bool(checked))
+        self.viewport().update()
+
+    def paintSection(self, painter, rect, logicalIndex):
+        super().paintSection(painter, rect, logicalIndex)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._update_checkbox_positions)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._update_checkbox_positions)
+
+    def _update_checkbox_positions(self, *args):
+        for column, checkbox in self._checkbox_widgets.items():
+            if self.isSectionHidden(column):
+                checkbox.hide()
+                continue
+            section_x = self.sectionViewportPosition(column)
+            section_width = self.sectionSize(column)
+            label = str(self.model().headerData(column, self.orientation(), Qt.DisplayRole)).strip()
+            label_width = self.fontMetrics().horizontalAdvance(label)
+            indicator_size = 12
+            gap = 4
+            label_left = section_x + max(0, (section_width - label_width) // 2) + self._label_x_shift()
+            checkbox_x = max(section_x + 3, label_left - indicator_size - gap)
+            checkbox.setGeometry(
+                checkbox_x,
+                max(1, (self.height() - indicator_size) // 2),
+                indicator_size,
+                indicator_size,
+            )
+            checkbox.show()
+
+    @staticmethod
+    def _label_x_shift():
+        return 8
+
+    def mousePressEvent(self, event):
+        column = self.logicalIndexAt(event.pos())
+        if column in self._checkable_columns and event.button() == Qt.LeftButton:
+            checkbox = self._checkbox_widgets.get(column)
+            if checkbox is not None:
+                checkbox.setChecked(not checkbox.isChecked())
+            else:
+                checked = not self._checkable_columns[column]
+                self._checkable_columns[column] = checked
+                self.state_changed.emit(column, checked)
+                self.viewport().update()
+            return
+        super().mousePressEvent(event)
 
 
 class FittingMixin:
@@ -153,6 +266,10 @@ class FittingMixin:
         """
         self.plot_font_size = getattr(self, "plot_font_size", 12)
         self.symbol_size = getattr(self, "symbol_size", 4)
+        self.show_edge_line = getattr(self, "show_edge_line", True)
+        self.fitting_plot_layout_mode = self._normalize_fitting_plot_layout_mode(
+            getattr(self, "fitting_plot_layout_mode", "single")
+        )
         self._fit_canvas_nav_state = {}
 
         main_layout = QHBoxLayout(self.FittingTab)  # Main horizontal layout
@@ -184,7 +301,38 @@ class FittingMixin:
         self.toolbar.setIconSize(QSize(16, 16))
         upper_left_layout.addWidget(self.toolbar) 
 
-        upper_left_layout.addWidget(self.canvas)
+        self.image_slider = QSlider(Qt.Vertical)
+        self.image_slider.setEnabled(False)  # Disabled until images are loaded
+        self.image_slider.setInvertedAppearance(True)
+        self.image_slider.setInvertedControls(True)
+        self.image_slider.setToolTip("Select image in the loaded stack")
+        self.image_slider.setFixedWidth(12)
+        self.image_slider.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.image_slider.setStyleSheet(
+            """
+            QSlider::groove:vertical {
+                width: 4px;
+                background: #d9d9d9;
+                border: 1px solid #cfcfcf;
+                border-radius: 2px;
+            }
+            QSlider::handle:vertical {
+                background: #1976d2;
+                width: 10px;
+                height: 6px;
+                margin: 0 -3px;
+                border-radius: 1px;
+            }
+            """
+        )
+        self.image_slider.valueChanged.connect(self.update_image)
+
+        image_view_layout = QHBoxLayout()
+        image_view_layout.setContentsMargins(0, 0, 0, 0)
+        image_view_layout.setSpacing(4)
+        image_view_layout.addWidget(self.canvas, 1)
+        image_view_layout.addWidget(self.image_slider)
+        upper_left_layout.addLayout(image_view_layout)
         upper_left_widget.setMinimumSize(200, 200)
 
         # Enable dragging of the yellow macro‑pixel ROI directly on the canvas
@@ -194,6 +342,7 @@ class FittingMixin:
         self._roi_active_corner = None
         # Enable dragging of the orange batch ROI as well
         self._dragging_batch_roi = False
+        self.batch_roi_visible = False
         self._batch_drag_offset = (0.0, 0.0)
         self._dragging_batch_mode = "move"
         self._batch_active_corner = None
@@ -202,6 +351,9 @@ class FittingMixin:
         self._image_pan_start_ypixel = None
         self._image_pan_start_xlim = None
         self._image_pan_start_ylim = None
+        self.live_fit_enabled = False
+        self.live_fit_mode = None
+        self.live_fit_preview_enabled = getattr(self, "live_fit_preview_enabled", True)
         self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
         self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
@@ -227,19 +379,16 @@ class FittingMixin:
 
         # ============== Controls in Lower Left Layout ==============
         button_layout = QHBoxLayout()
-        self.load_button = QPushButton("Load")
+        self.load_button = self.create_fitting_icon_button("load", "Load images")
         self.load_button.clicked.connect(self.load_fits_images)
-        self.load_button.setToolTip('Select a folder to load fits images')
+        self.load_button.setToolTip("Select a folder to load image files")
         button_layout.addWidget(self.load_button)
 
-        self.config_button = QPushButton("Config")
-        self.config_button.setToolTip('Configure fitting display and metadata settings')
-        self.config_button.clicked.connect(self.open_general_settings_dialog)
-        button_layout.addWidget(self.config_button)
-
-        self.smooth_checkbox = QCheckBox("Smooth")
-        self.smooth_checkbox.setChecked(False)
-        button_layout.addWidget(self.smooth_checkbox)
+        self.clear_load_button = self.create_fitting_icon_button("clear", "Clear images")
+        self.clear_load_button.clicked.connect(self.clear_loaded_fits_images)
+        self.clear_load_button.setToolTip("Clear loaded images, plots, table, and messages")
+        self.clear_load_button.setEnabled(False)
+        button_layout.addWidget(self.clear_load_button)
 
         self.phase_dropdown = QComboBox()
         self.phase_placeholder = "Select Phase"
@@ -249,52 +398,7 @@ class FittingMixin:
         self.phase_dropdown.currentIndexChanged.connect(self.phase_selection_changed)  # Connect to handler
         button_layout.addWidget(self.phase_dropdown)
 
-        self.add_phase_button = QPushButton("Manage")
-        self.add_phase_button.setToolTip("Add, edit, or delete phases")
-        self.add_phase_button.clicked.connect(self.open_add_phase_dialog)
-        button_layout.addWidget(self.add_phase_button)
-
         lower_left_layout.addLayout(button_layout)
-
-        # Slider
-        self.image_slider = QSlider(Qt.Horizontal)
-        self.image_slider.setEnabled(False)  # Disabled until images are loaded
-        self.image_slider.setMinimumWidth(300)
-        self.image_slider.valueChanged.connect(self.update_image)
-        slider_layout = QHBoxLayout()
-        slider_layout.addWidget(QLabel("Image Selection"))
-
-        self.show_theoretical_checkbox = QCheckBox("Show")
-        self.show_theoretical_checkbox.setToolTip('Check to show the theorectical edges of a selected phase')
-        self.show_theoretical_checkbox.setChecked(True)  # Default to shown
-        self.show_theoretical_checkbox.stateChanged.connect(self.update_plots)  # Trigger plot update on toggle
-        slider_layout.addWidget(self.show_theoretical_checkbox)
-        self.fix_s_checkbox = QCheckBox("Fix s")
-        self.fix_s_checkbox.setToolTip(
-            "Keep the Bragg-edge broadening parameter s fixed at the value in the table. "
-            "Uncheck to fit s for each selected edge."
-        )
-        self.fix_s_checkbox.setChecked(True)
-        slider_layout.addWidget(self.fix_s_checkbox)
-
-        self.fix_t_checkbox = QCheckBox("Fix t")
-        self.fix_t_checkbox.setToolTip(
-            "Keep the moderator decay parameter t fixed at the value in the table. "
-            "Uncheck to fit t for each selected edge."
-        )
-        self.fix_t_checkbox.setChecked(True)
-        slider_layout.addWidget(self.fix_t_checkbox)
-
-        self.fix_eta_checkbox = QCheckBox("Fix eta")
-        self.fix_eta_checkbox.setToolTip(
-            "Keep the pseudo-Voigt mixing parameter eta fixed at the value in the table. "
-            "Uncheck to fit eta; eta=0 is Gaussian-like and eta=1 is Lorentzian-like."
-        )
-        self.fix_eta_checkbox.setChecked(True)
-        slider_layout.addWidget(self.fix_eta_checkbox)
-
-        lower_left_layout.addLayout(slider_layout)
-        lower_left_layout.addWidget(self.image_slider)
 
         # Rectangle selection inputs
         roi_bounds_tooltip = self._roi_bounds_tooltip(
@@ -320,7 +424,7 @@ class FittingMixin:
         selection_layout.addWidget(QLabel("Y Max:"), 0, 6)
         selection_layout.addWidget(self.ymax_input, 0, 7)
 
-        self.select_area_button = QPushButton("Pick")
+        self.select_area_button = self.create_fitting_icon_button("pick", "Pick ROI")
         self.select_area_button.clicked.connect(self.select_area)
         # self.select_area_button.setStyleSheet("""
         #     QPushButton {
@@ -337,7 +441,7 @@ class FittingMixin:
         self.select_area_button.setToolTip('Click to display intensity vs wavelength from the selected area')
         selection_layout.addWidget(self.select_area_button, 0, 8)
 
-        self.export_data_button = QPushButton("Export")
+        self.export_data_button = self.create_fitting_icon_button("export", "Export intensity profile")
         self.export_data_button.setToolTip('Click to export intensity vs wavelength profile')
         self.export_data_button.clicked.connect(self.export_data)
         selection_layout.addWidget(self.export_data_button, 0, 9)
@@ -364,15 +468,23 @@ class FittingMixin:
         self._bragg_table_ready = False
         self.bragg_table.setRowCount(0)
 
+        self.fix_s = getattr(self, "fix_s", True)
+        self.fix_t = getattr(self, "fix_t", True)
+        self.fix_eta = getattr(self, "fix_eta", True)
+        self.bragg_header = CheckableBraggHeader(Qt.Horizontal, self.bragg_table)
+        self.bragg_table.setHorizontalHeader(self.bragg_header)
         self.bragg_table.setHorizontalHeaderLabels([
             "hkl", "d",
             "1 Min", "1 Max",
             "2 Min", "2 Max",
             "3 Min", "3 Max",
-            "s", "t", "eta"
+            "  s", "  t", "  eta"
         ])
-
-        self.bragg_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.bragg_header.setSectionResizeMode(QHeaderView.Stretch)
+        self.bragg_header.set_checkable_column(8, self.fix_s)
+        self.bragg_header.set_checkable_column(9, self.fix_t)
+        self.bragg_header.set_checkable_column(10, self.fix_eta)
+        self.bragg_header.state_changed.connect(self.on_bragg_header_fix_state_changed)
         self.bragg_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed)
         self.bragg_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.bragg_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -389,9 +501,9 @@ class FittingMixin:
             "Region 2 upper wavelength bound. Region 2 is the post-edge baseline used in edge fitting.",
             "Region 3 lower wavelength bound. Region 3 is the full edge window used for the fit.",
             "Region 3 upper wavelength bound. Region 3 is the full edge window used for the fit.",
-            "Initial/fixed value for s, the edge broadening parameter. Controlled by the Fix s checkbox.",
-            "Initial/fixed value for t, the moderator decay parameter. Controlled by the Fix t checkbox.",
-            "Initial/fixed value for eta, the pseudo-Voigt mixing parameter. 0 is Gaussian-like, 1 is Lorentzian-like."
+            "Initial/fixed value for s, the edge broadening parameter. Header checkbox checked = fixed, unchecked = fitted.",
+            "Initial/fixed value for t, the moderator decay parameter. Header checkbox checked = fixed, unchecked = fitted.",
+            "Initial/fixed value for eta, the pseudo-Voigt mixing parameter. Header checkbox checked = fixed, unchecked = fitted; eta=0 is Gaussian-like and eta=1 is Lorentzian-like."
         ]
 
         # 2) Attach each tooltip
@@ -407,40 +519,45 @@ class FittingMixin:
 
         # Fitting Buttons
         fit_buttons_layout = QHBoxLayout()
-        self.fit_all_regions_button = QPushButton("Fit edges")
-        self.fit_all_regions_button.setToolTip('Perform individual edge fitting')
-        self.fit_all_regions_button.clicked.connect(self.fit_all_regions)
-        fit_buttons_layout.addWidget(self.fit_all_regions_button)
+        fit_buttons_layout.setSpacing(4)
+        self.fit_mode_button_group = QButtonGroup(self)
+        self.fit_mode_button_group.setExclusive(True)
+        self.individual_edges_mode_button = self.create_fitting_mode_button("edge", "Individual Edges")
+        self.individual_edges_mode_button.setCheckable(True)
+        self.individual_edges_mode_button.setChecked(True)
+        self.individual_edges_mode_button.setToolTip("Fit each Bragg edge independently.")
+        self.edge_pattern_mode_button = self.create_fitting_mode_button("edge_pattern", "Edge Pattern")
+        self.edge_pattern_mode_button.setCheckable(True)
+        self.edge_pattern_mode_button.setToolTip("Fit multiple edges together with shared lattice parameters.")
+        self.fit_mode_button_group.addButton(self.individual_edges_mode_button, 0)
+        self.fit_mode_button_group.addButton(self.edge_pattern_mode_button, 1)
+        self.fit_mode_button_group.idClicked.connect(self.set_fitting_mode)
+        self.fitting_mode = "individual"
+        self.update_fitting_mode_button_styles()
 
-        self.batch_fit_edges_button = QPushButton("Batch Edges")
-        self.batch_fit_edges_button.setToolTip('Start batch fitting of individual edge across the selected ROI')
-        self.batch_fit_edges_button.clicked.connect(self.batch_fit_edges)
-        fit_buttons_layout.addWidget(self.batch_fit_edges_button)
+        fit_buttons_layout.addWidget(self.individual_edges_mode_button)
+        fit_buttons_layout.addWidget(self.edge_pattern_mode_button)
+        fit_buttons_layout.addSpacing(12)
 
-        self.fit_full_pattern_button = QPushButton("Fit Pattern")
-        self.fit_full_pattern_button.setToolTip('Perform Bragg edge pattern fitting')
-        self.fit_full_pattern_button.clicked.connect(self.fit_full_pattern)
-        fit_buttons_layout.addWidget(self.fit_full_pattern_button)
+        self.fit_roi_button = self.create_fitting_icon_button("play", "Fit ROI")
+        self.fit_roi_button.setToolTip("Fit the current yellow ROI using the selected fitting mode.")
+        self.fit_roi_button.clicked.connect(self.run_selected_fit)
+        fit_buttons_layout.addWidget(self.fit_roi_button)
 
-        self.batch_fit_button = QPushButton("Batch Pattern")
-        self.batch_fit_button.setToolTip('Start batch fitting of edge pattern across the selected ROI')
-        self.batch_fit_button.clicked.connect(self.batch_fit)
-        fit_buttons_layout.addWidget(self.batch_fit_button)
+        self.batch_map_button = self.create_fitting_icon_button("batch_play", "Batch Map")
+        self.batch_map_button.setToolTip("Map the orange ROI using the selected fitting mode.")
+        self.batch_map_button.clicked.connect(self.run_selected_batch_fit)
+        fit_buttons_layout.addWidget(self.batch_map_button)
 
-        self.batch_settings_button = QPushButton("Set")
+        self.batch_settings_button = self.create_fitting_icon_button("gear", "Set")
         self.batch_settings_button.setToolTip("Configure batch fitting parameters")
         self.batch_settings_button.clicked.connect(self.open_batch_settings_dialog)
         fit_buttons_layout.addWidget(self.batch_settings_button)
 
-        self.stop_batch_fit_button = QPushButton("Stop")
+        self.stop_batch_fit_button = self.create_fitting_icon_button("stop", "Stop")
         self.stop_batch_fit_button.setToolTip('Stop batch fitting')
         self.stop_batch_fit_button.clicked.connect(self.stop_batch_fit)
         fit_buttons_layout.addWidget(self.stop_batch_fit_button)
-
-        self.visualize_button = QPushButton("Fit Check")
-        self.visualize_button.setToolTip('Illustrate fitting at specific locations')
-        self.visualize_button.clicked.connect(self.visualize_region3_fits)
-        fit_buttons_layout.addWidget(self.visualize_button)
 
         lower_left_layout.addLayout(fit_buttons_layout)
 
@@ -468,11 +585,6 @@ class FittingMixin:
         ]:
             widget.hide()
 
-        # Shortcuts for plot font adjustments
-        shortcut_increase_plot = QShortcut(QKeySequence("Ctrl+Up"), self)
-        shortcut_increase_plot.activated.connect(self.increase_plot_font_size)
-        shortcut_decrease_plot = QShortcut(QKeySequence("Ctrl+Down"), self)
-        shortcut_decrease_plot.activated.connect(self.decrease_plot_font_size)
         self.update_plot_font_size(self.plot_font_size)
 
         # Progress dialog for batch operations
@@ -505,6 +617,13 @@ class FittingMixin:
 
         # Plots layout
         plots_layout = QGridLayout()
+        plots_layout.setContentsMargins(2, 2, 2, 2)
+        plots_layout.setSpacing(6)
+        plots_layout.setColumnStretch(0, 1)
+        plots_layout.setColumnStretch(1, 1)
+        plots_layout.setRowStretch(0, 1)
+        plots_layout.setRowStretch(1, 1)
+        self.fit_plots_layout = plots_layout
 
         self.plot_canvas_a = MplCanvas(self, width=4, height=4, dpi=100)
         self.plot_canvas_b = MplCanvas(self, width=4, height=4, dpi=100)
@@ -523,44 +642,29 @@ class FittingMixin:
         self.plot_canvas_c.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.plot_canvas_d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        plots_layout.addWidget(self.plot_canvas_a, 0, 0)
-        plots_layout.addWidget(self.plot_canvas_b, 0, 1)
-        plots_layout.addWidget(self.plot_canvas_c, 1, 0)
-        plots_layout.addWidget(self.plot_canvas_d, 1, 1)
+        self._apply_fitting_plot_layout_mode()
         self._connect_fit_canvas_interactions()
 
         upper_right_layout.addLayout(plots_layout)
         upper_right_widget.setMinimumSize(200, 200)
 
-        # Lower right widget for positions + message box
+        # Lower right widget for message box
         lower_right_widget = QWidget()
         lower_right_layout = QVBoxLayout(lower_right_widget)
-
-        # Positions + Message area
-        positions_message_layout = QHBoxLayout()
-
-        positions_layout = QVBoxLayout()
-        position_label = QLabel("Fit Check (x,y):")
-        self.positions_input = QTextEdit()
-        self.positions_input.setMaximumWidth(200)
-        self.positions_input.setPlaceholderText(
-            "Enter coordinates as x,y pairs (one per line), then use 'Fit Check' to see fits."
-        )
-        positions_layout.addWidget(position_label)
-        positions_layout.addWidget(self.positions_input)
-        positions_message_layout.addLayout(positions_layout)
 
         message_layout = QVBoxLayout()
         message_label = QLabel("Messages:")
         self.message_box = QTextEdit()
         self.message_box.setReadOnly(True)
+        self.message_box.setFont(QFont("Arial", getattr(self, "gui_font_size", 8)))
+        self.message_box.setStyleSheet(
+            "QTextEdit { font-family: Arial; font-size: %dpt; }"
+            % int(getattr(self, "gui_font_size", 8))
+        )
         message_layout.addWidget(message_label)
         message_layout.addWidget(self.message_box)
-        positions_message_layout.addLayout(message_layout)
 
-        # right_layout.addLayout(positions_message_layout)
-
-        lower_right_layout.addLayout(positions_message_layout)
+        lower_right_layout.addLayout(message_layout)
         lower_right_widget.setMinimumSize(200, 150)
 
         # Add top/bottom widgets to the right splitter
@@ -587,6 +691,447 @@ class FittingMixin:
         # Connect wavelength input changes to update plots
         self.min_wavelength_input.editingFinished.connect(self.update_plots)
         self.max_wavelength_input.editingFinished.connect(self.update_plots)
+
+    def _normalize_fitting_plot_layout_mode(self, mode):
+        """Return the canonical fitting plot layout mode."""
+        mode_text = str(mode or "").strip().lower()
+        if mode_text in ("quad", "four", "four_canvas", "4", "4-canvas"):
+            return "quad"
+        return "single"
+
+    def is_single_fit_canvas_mode(self):
+        return self._normalize_fitting_plot_layout_mode(
+            getattr(self, "fitting_plot_layout_mode", "single")
+        ) == "single"
+
+    def set_fitting_plot_layout_mode(self, mode, refresh_plots=True):
+        """Switch fitting result plots between one-canvas and four-canvas layouts."""
+        self.fitting_plot_layout_mode = self._normalize_fitting_plot_layout_mode(mode)
+        self._apply_fitting_plot_layout_mode()
+        if hasattr(self, "sync_fitting_plot_layout_controls"):
+            self.sync_fitting_plot_layout_controls()
+        if refresh_plots and hasattr(self, "update_plots"):
+            self.update_plots()
+
+    def _final_fit_canvas(self):
+        """Return the canvas used for final fit results in the active layout."""
+        if self.is_single_fit_canvas_mode():
+            return getattr(self, "plot_canvas_a", None)
+        return getattr(self, "plot_canvas_d", None)
+
+    def _apply_fitting_plot_layout_mode(self):
+        """Apply widget visibility and grid placement for the active plot layout."""
+        layout = getattr(self, "fit_plots_layout", None)
+        canvases = [
+            getattr(self, "plot_canvas_a", None),
+            getattr(self, "plot_canvas_b", None),
+            getattr(self, "plot_canvas_c", None),
+            getattr(self, "plot_canvas_d", None),
+        ]
+        if layout is None or any(canvas is None for canvas in canvases):
+            return
+
+        for canvas in canvases:
+            layout.removeWidget(canvas)
+
+        for index in range(2):
+            layout.setColumnMinimumWidth(index, 0)
+            layout.setRowMinimumHeight(index, 0)
+
+        if self.is_single_fit_canvas_mode():
+            layout.setColumnStretch(0, 1)
+            layout.setColumnStretch(1, 0)
+            layout.setRowStretch(0, 1)
+            layout.setRowStretch(1, 0)
+            layout.addWidget(self.plot_canvas_a, 0, 0)
+            self.plot_canvas_a.show()
+            for canvas in (self.plot_canvas_b, self.plot_canvas_c, self.plot_canvas_d):
+                canvas.hide()
+        else:
+            layout.setColumnStretch(0, 1)
+            layout.setColumnStretch(1, 1)
+            layout.setRowStretch(0, 1)
+            layout.setRowStretch(1, 1)
+            layout.addWidget(self.plot_canvas_a, 0, 0)
+            layout.addWidget(self.plot_canvas_b, 0, 1)
+            layout.addWidget(self.plot_canvas_c, 1, 0)
+            layout.addWidget(self.plot_canvas_d, 1, 1)
+            for canvas in canvases:
+                canvas.show()
+
+        self._clear_fitting_canvases()
+
+    def create_fitting_icon_button(self, icon_name, accessible_name):
+        button = QPushButton()
+        button.setAccessibleName(accessible_name)
+        button.setIcon(self.create_fitting_action_icon(icon_name))
+        button.setIconSize(QSize(24, 18))
+        button.setFixedSize(30, 21)
+        button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        return button
+
+    def create_fitting_mode_button(self, icon_name, accessible_name):
+        button = QPushButton()
+        button.setAccessibleName(accessible_name)
+        button.setIcon(self.create_fitting_action_icon(icon_name))
+        button.setIconSize(QSize(24, 18))
+        button.setFixedSize(30, 21)
+        button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        return button
+
+    def create_fitting_action_icon(self, icon_name):
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor(45, 45, 45), 2)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(QColor(45, 45, 45)))
+
+        if icon_name == "edge":
+            painter.setBrush(Qt.NoBrush)
+            self.draw_independent_edge_mode_icon(painter)
+        elif icon_name == "edge_pattern":
+            painter.setBrush(Qt.NoBrush)
+            self.draw_multi_edge_mode_icon(painter)
+        elif icon_name == "play":
+            painter.drawPolygon(QPolygon([QPoint(11, 8), QPoint(24, 16), QPoint(11, 24)]))
+        elif icon_name == "batch_play":
+            painter.drawPolygon(QPolygon([QPoint(7, 8), QPoint(18, 16), QPoint(7, 24)]))
+            painter.drawPolygon(QPolygon([QPoint(16, 8), QPoint(27, 16), QPoint(16, 24)]))
+        elif icon_name == "stop":
+            painter.drawRect(10, 10, 12, 12)
+        elif icon_name == "gear":
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(11, 11, 10, 10)
+            painter.drawEllipse(14, 14, 4, 4)
+            for start, end in (
+                ((16, 5), (16, 9)),
+                ((16, 23), (16, 27)),
+                ((5, 16), (9, 16)),
+                ((23, 16), (27, 16)),
+                ((8, 8), (11, 11)),
+                ((24, 8), (21, 11)),
+                ((8, 24), (11, 21)),
+                ((24, 24), (21, 21)),
+            ):
+                painter.drawLine(QPoint(*start), QPoint(*end))
+        elif icon_name == "load":
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(6, 11, 20, 13)
+            painter.drawLine(QPoint(6, 11), QPoint(12, 7))
+            painter.drawLine(QPoint(12, 7), QPoint(18, 7))
+            painter.drawLine(QPoint(18, 7), QPoint(21, 11))
+        elif icon_name == "clear":
+            painter.setBrush(Qt.NoBrush)
+            painter.drawLine(QPoint(10, 10), QPoint(22, 22))
+            painter.drawLine(QPoint(22, 10), QPoint(10, 22))
+        elif icon_name == "pick":
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(9, 9, 14, 14)
+            painter.drawLine(QPoint(16, 6), QPoint(16, 12))
+            painter.drawLine(QPoint(16, 20), QPoint(16, 26))
+            painter.drawLine(QPoint(6, 16), QPoint(12, 16))
+            painter.drawLine(QPoint(20, 16), QPoint(26, 16))
+        elif icon_name == "export":
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(7, 18, 18, 6)
+            painter.drawLine(QPoint(16, 7), QPoint(16, 17))
+            painter.drawLine(QPoint(16, 7), QPoint(11, 12))
+            painter.drawLine(QPoint(16, 7), QPoint(21, 12))
+
+        painter.end()
+        return QIcon(pixmap)
+
+    def draw_edge_icon_path(self, painter, x, baseline_y):
+        painter.drawLine(QPoint(x, baseline_y), QPoint(x + 5, baseline_y))
+        painter.drawLine(QPoint(x + 5, baseline_y), QPoint(x + 8, baseline_y - 18))
+        painter.drawLine(QPoint(x + 8, baseline_y - 18), QPoint(x + 16, baseline_y - 17))
+
+    def draw_independent_edge_mode_icon(self, painter):
+        pen = QPen(QColor(0, 0, 0))
+        pen.setWidthF(2.4)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+
+        path = QPainterPath()
+        path.moveTo(3, 13)
+        path.lineTo(13, 22)
+        path.cubicTo(15, 24, 16, 23, 17, 19)
+        path.cubicTo(18, 14, 18, 8, 21, 7)
+        path.cubicTo(23, 6, 25, 8, 27, 9)
+        path.lineTo(30, 12)
+        painter.drawPath(path)
+
+    def draw_multi_edge_mode_icon(self, painter):
+        pen = QPen(QColor(0, 0, 0))
+        pen.setWidthF(2.4)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+
+        path = QPainterPath()
+        path.moveTo(2, 14)
+        path.lineTo(7, 20)
+        path.cubicTo(8, 21, 9, 20, 9, 17)
+        path.cubicTo(10, 12, 10, 9, 12, 8)
+        path.cubicTo(14, 8, 15, 10, 16, 12)
+        path.lineTo(21, 22)
+        path.cubicTo(22, 24, 23, 23, 24, 18)
+        path.cubicTo(24, 12, 25, 6, 27, 5)
+        path.cubicTo(29, 5, 30, 7, 31, 8)
+        painter.drawPath(path)
+
+    def _set_fits_image_button_states(self, is_loading=False):
+        has_images = bool(getattr(self, "images", []))
+        self.load_button.setEnabled(not is_loading)
+        clear_button = getattr(self, "clear_load_button", None)
+        if clear_button is not None:
+            clear_button.setEnabled((not is_loading) and has_images)
+
+    def update_fitting_mode_button_styles(self):
+        selected_style = (
+            "QPushButton { background-color: #b9ddf6; border: 1px solid #2b7dbc; "
+            "border-radius: 2px; padding: 0px; }"
+            "QPushButton:hover { background-color: #c8e6fb; }"
+        )
+        normal_style = (
+            "QPushButton { background-color: #f7f7f7; border: 1px solid #b8b8b8; "
+            "border-radius: 2px; padding: 0px; }"
+            "QPushButton:hover { background-color: #eeeeee; }"
+        )
+        for button in (
+            getattr(self, "individual_edges_mode_button", None),
+            getattr(self, "edge_pattern_mode_button", None),
+        ):
+            if button is not None:
+                button.setStyleSheet(selected_style if button.isChecked() else normal_style)
+
+    def set_fitting_mode(self, mode_id):
+        self.fitting_mode = "pattern" if mode_id == 1 else "individual"
+        self.update_fitting_mode_button_styles()
+        if hasattr(self, "fit_roi_button"):
+            self.fit_roi_button.setToolTip(
+                "Fit the current yellow ROI using edge pattern fitting."
+                if self.fitting_mode == "pattern"
+                else "Fit the current yellow ROI using individual edge fitting."
+            )
+        if hasattr(self, "batch_map_button"):
+            self.batch_map_button.setToolTip(
+                "Map the orange ROI using edge pattern fitting."
+                if self.fitting_mode == "pattern"
+                else "Map the orange ROI using individual edge fitting."
+            )
+
+    def run_selected_fit(self):
+        if getattr(self, "fitting_mode", "individual") == "pattern":
+            fitted = self.fit_full_pattern()
+            mode = "pattern"
+        else:
+            fitted = self.fit_all_regions()
+            mode = "individual"
+        if fitted:
+            self.live_fit_enabled = True
+            self.live_fit_mode = mode
+
+    def run_selected_batch_fit(self):
+        if getattr(self, "fitting_mode", "individual") == "pattern":
+            self.batch_fit()
+        else:
+            self.batch_fit_edges()
+
+    def run_live_fit_preview(self):
+        if not getattr(self, "live_fit_preview_enabled", True):
+            return
+        if not getattr(self, "live_fit_enabled", False):
+            return
+        if not getattr(self, "selected_area", None):
+            return
+        mode = getattr(self, "live_fit_mode", None)
+        try:
+            if mode == "individual":
+                fit_results = self.fit_all_regions(
+                    emit_messages=False,
+                    update_table=True,
+                    only_update_unfixed=True,
+                )
+                self.annotate_live_individual_fit(fit_results)
+            elif mode == "pattern":
+                self.run_live_pattern_fit_preview()
+        except Exception:
+            # Live preview should never interrupt ROI movement.
+            return
+
+    def run_live_pattern_fit_preview(self):
+        fix_s = self.fix_s_enabled()
+        fix_t = self.fix_t_enabled()
+        fix_eta = self.fix_eta_enabled()
+        result_dict, error_msg = self.fit_full_pattern_core(
+            fix_s=fix_s,
+            fix_t=fix_t,
+            fix_eta=fix_eta,
+            apply_lattice_update=False,
+        )
+        if error_msg or not result_dict:
+            return
+
+        self._update_pattern_fit_parameter_cells(result_dict, only_update_unfixed=True)
+        try:
+            min_wavelength = float(self.min_wavelength_input.text())
+            max_wavelength = float(self.max_wavelength_input.text())
+        except ValueError:
+            min_wavelength = self.wavelengths[0]
+            max_wavelength = self.wavelengths[-1]
+
+        ax_main_a, _ = self._initialize_fit_canvas(self.plot_canvas_a)
+        ax_main_a.plot(
+            self.selected_region_x,
+            self.selected_region_y,
+            "o",
+            markersize=getattr(self, "symbol_size", 4),
+            markerfacecolor="blue",
+            markeredgecolor="none",
+        )
+        x_fit = result_dict["x_data"]
+        y_fit = result_dict["y_data"]
+        self._plot_line(
+            ax_main_a,
+            x_fit,
+            y_fit,
+            split_on_gaps=True,
+            color="red",
+            linestyle="-",
+        )
+        if self.show_edge_lines_enabled():
+            for hkl, x_hkl in self.get_edges_in_range(min_wavelength, max_wavelength):
+                ax_main_a.axvline(x=x_hkl, color="red", linestyle="--")
+                y_max = ax_main_a.get_ylim()[1]
+                ax_main_a.text(
+                    x_hkl * 1.02,
+                    y_max * 0.95,
+                    f"hkl{hkl}",
+                    rotation=90,
+                    verticalalignment="top",
+                    color="red",
+                    fontsize=getattr(self, "plot_font_size", 12),
+                )
+        if np.isfinite(min_wavelength) and np.isfinite(max_wavelength) and min_wavelength < max_wavelength:
+            ax_main_a.set_xlim(min_wavelength, max_wavelength)
+        self.annotate_live_pattern_fit(ax_main_a, result_dict, x_fit, y_fit)
+        x_obs = result_dict.get("x_exp_sorted", x_fit)
+        y_obs = result_dict.get("y_exp_sorted")
+        if y_obs is None:
+            y_obs = np.interp(x_fit, self.selected_region_x, self.selected_region_y)
+        self._plot_residual_line(self.plot_canvas_a, x_obs, y_obs, y_fit, split_on_gaps=True)
+        self.plot_canvas_a.draw()
+
+    def annotate_live_pattern_fit(self, ax, result_dict, x_fit=None, y_fit=None):
+        structure_map = {
+            "cubic": ["a"],
+            "fcc": ["a"],
+            "bcc": ["a"],
+            "tetragonal": ["a", "c"],
+            "hexagonal": ["a", "c"],
+            "orthorhombic": ["a", "b", "c"],
+        }
+        names = structure_map.get(result_dict.get("structure_type"), [])
+        lattice = result_dict.get("lattice_params", {})
+        parts = []
+        for name in names:
+            value = lattice.get(name)
+            if value is not None and np.isfinite(value):
+                parts.append(f"{name}={value:.6f} A")
+        if parts:
+            self._add_live_fit_annotation(
+                ax,
+                "\n".join(parts),
+                self.selected_region_x,
+                self.selected_region_y,
+                fit_x=x_fit,
+                fit_y=y_fit,
+            )
+
+    def annotate_live_individual_fit(self, fit_results):
+        if not fit_results:
+            return
+        lines = []
+        x_values = []
+        y_values = []
+        fit_x_values = []
+        fit_y_values = []
+        for result in fit_results:
+            try:
+                hkl = result["hkl"]
+                d_fit = float(result["fit_params"][0])
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            if np.isfinite(d_fit):
+                lines.append(f"d{hkl}={d_fit:.6f} A")
+            x = np.asarray(result.get("x", []), dtype=float)
+            y = np.asarray(result.get("y", []), dtype=float)
+            y_fit = np.asarray(result.get("fit", []), dtype=float)
+            if x.size and y.size:
+                n = min(x.size, y.size)
+                x_values.append(x[:n])
+                y_values.append(y[:n])
+            if x.size and y_fit.size:
+                n = min(x.size, y_fit.size)
+                fit_x_values.append(x[:n])
+                fit_y_values.append(y_fit[:n])
+        if lines:
+            final_canvas = self._final_fit_canvas()
+            ax_main, _ = self._ensure_fit_canvas_axes(final_canvas)
+            data_x = np.concatenate(x_values) if x_values else None
+            data_y = np.concatenate(y_values) if y_values else None
+            fit_x = np.concatenate(fit_x_values) if fit_x_values else None
+            fit_y = np.concatenate(fit_y_values) if fit_y_values else None
+            self._add_live_fit_annotation(
+                ax_main,
+                "\n".join(lines),
+                data_x,
+                data_y,
+                fit_x=fit_x,
+                fit_y=fit_y,
+            )
+            final_canvas.draw()
+
+    def set_fit_action_buttons_enabled(self, enabled):
+        for button_name in ("fit_roi_button", "batch_map_button"):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.setEnabled(enabled)
+
+    def on_bragg_header_fix_state_changed(self, column, checked):
+        if column == 8:
+            self.fix_s = bool(checked)
+        elif column == 9:
+            self.fix_t = bool(checked)
+        elif column == 10:
+            self.fix_eta = bool(checked)
+        if hasattr(self, "save_user_settings"):
+            self.save_user_settings()
+
+    def set_fix_parameter_state(self, name, checked):
+        attr_map = {"s": ("fix_s", 8), "t": ("fix_t", 9), "eta": ("fix_eta", 10)}
+        attr, column = attr_map[name]
+        setattr(self, attr, bool(checked))
+        header = getattr(self, "bragg_header", None)
+        if header is not None:
+            header.set_column_checked(column, checked)
+
+    def fix_s_enabled(self):
+        header = getattr(self, "bragg_header", None)
+        return header.is_column_checked(8) if header is not None else bool(getattr(self, "fix_s", True))
+
+    def fix_t_enabled(self):
+        header = getattr(self, "bragg_header", None)
+        return header.is_column_checked(9) if header is not None else bool(getattr(self, "fix_t", True))
+
+    def fix_eta_enabled(self):
+        header = getattr(self, "bragg_header", None)
+        return header.is_column_checked(10) if header is not None else bool(getattr(self, "fix_eta", True))
 
     def refresh_phase_dropdown(self, select=None):
         """Rebuild the phase dropdown with current phase data."""
@@ -886,12 +1431,13 @@ class FittingMixin:
         self.remaining_time_timer.start(5000)
 
         if not hasattr(self, 'work_directory'):
-            self.message_box.append("Working directory is not set. Please load FITS images first.")
+            self.message_box.append("Working directory is not set. Please load images first.")
             return
-        # Get the state of the fix_s and fix_t checkboxes
-        fix_s = self.fix_s_checkbox.isChecked()
-        fix_t = self.fix_t_checkbox.isChecked()
-        fix_eta = self.fix_eta_checkbox.isChecked()
+        # Get the state of the fix flags from the Bragg table header.
+        fix_s = self.fix_s_enabled()
+        fix_t = self.fix_t_enabled()
+        fix_eta = self.fix_eta_enabled()
+        interpolation_enabled = self.interpolation_checkbox.isChecked()
 
         # Start the worker
         fit_context = self._build_batch_fit_context()
@@ -910,7 +1456,7 @@ class FittingMixin:
             step_y=step_y,
             total_boxes=total_boxes,
             work_directory=self.work_directory,
-            interpolation_enabled = True,
+            interpolation_enabled=interpolation_enabled,
             fix_s=fix_s,
             fix_t=fix_t,
             fix_eta=fix_eta
@@ -929,9 +1475,9 @@ class FittingMixin:
         Called when BatchFitEdgesWorker finishes. 'filename' can be an output CSV or empty if there's an error.
         """
         if filename:
-            self.message_box.append(f"Batch fitting (edges) completed. Results saved to {filename}")
+            self._append_fit_message(f"[Batch edges] Completed\n  Results saved to {filename}")
         else:
-            self.message_box.append("Batch fitting (edges) completed (possibly with errors).")
+            self._append_fit_message("[Batch edges] Completed with errors")
 
         self.update_timer.stop()
         self.batch_progress_bar.setValue(100)
@@ -1459,9 +2005,9 @@ class FittingMixin:
     def fit_full_pattern(self, skip_plot=False):
         """High-level method that calls fit_full_pattern_core and updates GUI elements."""
         # 1) Check if user wants to fix_s/fix_t
-        fix_s = self.fix_s_checkbox.isChecked()
-        fix_t = self.fix_t_checkbox.isChecked()
-        fix_eta = self.fix_eta_checkbox.isChecked()
+        fix_s = self.fix_s_enabled()
+        fix_t = self.fix_t_enabled()
+        fix_eta = self.fix_eta_enabled()
 
         # 2) Call core fitting
         result_dict, error_msg = self.fit_full_pattern_core(fix_s=fix_s, fix_t=fix_t, fix_eta=fix_eta)
@@ -1475,20 +2021,19 @@ class FittingMixin:
             max_wavelength = self.wavelengths[-1]
 
         if error_msg:
-            self.message_box.append(f"Fit failed: {error_msg}")
-            self.fit_full_pattern_button.setEnabled(True)
-            self.fit_all_regions_button.setEnabled(True)
-            return
+            self._append_fit_message(f"[Pattern fit] Failed\n  {error_msg}")
+            self.set_fit_action_buttons_enabled(True)
+            return False
 
         # 4) If we got results, display success
-        self.message_box.append("---------- Start pattern fitting ----------")
+        # Successful pattern fit output is appended once after plotting.
 
         # 5) Display lattice parameters + uncertainties
         structure_type = result_dict['structure_type']
         lattice_params = result_dict['lattice_params']
         lattice_unc = result_dict['lattice_uncertainties']
 
-        # For convenience in printing:
+        # Detailed pattern output is summarized after plotting.
         structure_map = {
             "cubic": ["a"],
             "fcc": ["a"],
@@ -1497,7 +2042,7 @@ class FittingMixin:
             "hexagonal": ["a", "c"],
             "orthorhombic": ["a", "b", "c"]
         }
-        param_names = structure_map.get(structure_type, [])
+        param_names = []
 
         for param in param_names:
             val = lattice_params.get(param, np.nan)
@@ -1516,8 +2061,9 @@ class FittingMixin:
         s_unc = result_dict['s_uncertainties']
         t_unc = result_dict['t_uncertainties']
         eta_unc = result_dict['eta_uncertainties']
+        self._update_pattern_fit_parameter_cells(result_dict)
 
-        for row, edge in enumerate(result_dict['bragg_edges']):
+        for row, edge in enumerate([]):
             hkl = edge['hkl']
             s_val = result_dict['fitted_s'].get(hkl, np.nan)
             t_val = result_dict['fitted_t'].get(hkl, np.nan)
@@ -1525,11 +2071,6 @@ class FittingMixin:
             s_err = s_unc.get(hkl, np.nan)
             t_err = t_unc.get(hkl, np.nan)
             eta_err = eta_unc.get(hkl, np.nan)
-
-            if row < self.bragg_table.rowCount():
-                self.bragg_table.item(row, 8).setText(f"{s_val:.6f}")
-                self.bragg_table.item(row, 9).setText(f"{t_val:.6f}")
-                self.bragg_table.item(row, 10).setText(f"{eta_val:.3f}")
 
             # Also display in the message box
             self.message_box.append(
@@ -1540,7 +2081,7 @@ class FittingMixin:
             )
 
         # 4) If we got results, display success
-        self.message_box.append("---------- Pattern fitting completed ----------")
+        # Summary is appended after plots and table updates are complete.
 
 
         # 8) Plot if not skipping
@@ -1570,7 +2111,7 @@ class FittingMixin:
             )
 
             # Plot theoretical edges in [min_wavelength, max_wavelength]
-            if self.show_theoretical_checkbox.isChecked():
+            if self.show_edge_lines_enabled():
                 edges_in_range = self.get_edges_in_range(min_wavelength, max_wavelength)
                 for (hkl, x_hkl) in edges_in_range:
                     ax_main_a.axvline(x=x_hkl, color='red', linestyle='--')
@@ -1598,30 +2139,25 @@ class FittingMixin:
             self.plot_canvas_a.draw()
 
         # 9) Re-enable UI elements
-        self.fit_full_pattern_button.setEnabled(True)
-        self.fit_all_regions_button.setEnabled(True)
+        self.set_fit_action_buttons_enabled(True)
 
-        # 10b) Display edge heights
-        if "edge_heights" in result_dict:
-            edge_heights = result_dict["edge_heights"]
-            self.message_box.append("Edge Heights (Region1 - Region2):")
-            for row, edge_info in enumerate(result_dict["bragg_edges"]):
-                hkl = edge_info["hkl"]
-                height_val = edge_heights.get(hkl, np.nan)
-                self.message_box.append(
-                    f"  hkl{hkl}: {height_val:.6f}"
-                )
+        self._append_pattern_fit_summary(result_dict, min_wavelength, max_wavelength)
+        return True
 
-        # 10b) Display edge heights
-        if "edge_widths" in result_dict:
-            edge_widths = result_dict["edge_widths"]
-            self.message_box.append("Edge widths:")
-            for row, edge_info in enumerate(result_dict["bragg_edges"]):
-                hkl = edge_info["hkl"]
-                width_val = edge_widths.get(hkl, np.nan)
-                self.message_box.append(
-                    f"  hkl{hkl}: {width_val:.6f}"
-                )
+    def _update_pattern_fit_parameter_cells(self, result_dict, only_update_unfixed=False):
+        fix_s = self.fix_s_enabled()
+        fix_t = self.fix_t_enabled()
+        fix_eta = self.fix_eta_enabled()
+        for row, edge in enumerate(result_dict.get("bragg_edges", [])):
+            if row >= self.bragg_table.rowCount():
+                continue
+            hkl = edge["hkl"]
+            if not only_update_unfixed or not fix_s:
+                self.bragg_table.item(row, 8).setText(f"{result_dict['fitted_s'].get(hkl, np.nan):.4f}")
+            if not only_update_unfixed or not fix_t:
+                self.bragg_table.item(row, 9).setText(f"{result_dict['fitted_t'].get(hkl, np.nan):.4f}")
+            if not only_update_unfixed or not fix_eta:
+                self.bragg_table.item(row, 10).setText(f"{result_dict['fitted_eta'].get(hkl, np.nan):.3f}")
 
     def apply_selected_area(self):
 
@@ -1662,7 +2198,7 @@ class FittingMixin:
             for suffix in sorted_suffixes:
                 self.images.append(run_dict[suffix])
             run_number = len(run_dict)
-            self.message_box.append(f"Successfully loaded {run_number} FITS images from the selected folder.")
+            self.message_box.append(f"Successfully loaded {run_number} images from the selected folder.")
 
             # Calculate the total intensity of the first image
             total_intensity = np.sum(self.images[0])
@@ -1723,8 +2259,10 @@ class FittingMixin:
 
             # Display the first image with auto-adjusted contrast and brightness
             self.display_image()
+            self._set_fits_image_button_states(is_loading=False)
         else:
-            self.message_box.append("No valid FITS images were loaded from the selected folder.")
+            self.message_box.append("No valid images were loaded from the selected folder.")
+            self._set_fits_image_button_states(is_loading=False)
 
     def change_flight_path(self):
         """
@@ -1791,7 +2329,7 @@ class FittingMixin:
         if enabled:
             self.tof_array = None
             self.message_box.append(
-                "Manual mode enabled. Set anchors (wavelength or ToF) in the Config dialog."
+                "Manual mode enabled. Set anchors (wavelength or ToF) in Manual Spectra Setting."
             )
             self.update_manual_wavelengths()
         else:
@@ -1843,7 +2381,7 @@ class FittingMixin:
         user_anchor_count = len(anchor_map)
         anchors = sorted(anchor_map.items())
         if not anchors:
-            self.message_box.append("Provide at least two anchors in Config to compute manual wavelengths.")
+            self.message_box.append("Provide at least two anchors in Manual Spectra Setting to compute manual wavelengths.")
             self.wavelengths = np.array([])
             return
 
@@ -1901,10 +2439,10 @@ class FittingMixin:
                 self.update_plots()
 
     def _ensure_load_progress_dialog(self):
-        """Create the modal progress dialog for FITS loading if needed."""
+        """Create the modal progress dialog for image loading if needed."""
         if getattr(self, "_fits_progress_dialog", None) is None:
             self._fits_progress_dialog = QProgressDialog(
-                "Loading FITS images...", "Cancel", 0, 100, self
+                "Loading images...", "Cancel", 0, 100, self
             )
             self._fits_progress_dialog.setWindowTitle("Loading Images")
             self._fits_progress_dialog.setAutoClose(False)
@@ -1925,7 +2463,7 @@ class FittingMixin:
             self.fits_image_load_worker = None
             self.images = []
             self.image_slider.setEnabled(False)
-            self.load_button.setEnabled(True)
+            self._set_fits_image_button_states(is_loading=False)
             self.display_image()
             self.message_box.append("Image loading cancelled.")
         if getattr(self, "_fits_progress_dialog", None) is not None:
@@ -1933,7 +2471,7 @@ class FittingMixin:
 
     def update_fits_load_progress(self, value):
         """
-        Update the FITS Viewer image loading progress dialog.
+        Update the image loading progress dialog.
         """
         dialog = self._ensure_load_progress_dialog()
         dialog.setValue(value)
@@ -1957,31 +2495,141 @@ class FittingMixin:
         if getattr(self, "_fits_progress_dialog", None) is not None:
             self._fits_progress_dialog.hide()
             self._fits_progress_dialog.close()
-        self.load_button.setEnabled(True)        # Re-enable the load button
+        self._set_fits_image_button_states(is_loading=False)
+
+    def clear_loaded_fits_images(self):
+        worker = getattr(self, "fits_image_load_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.stop()
+            worker.wait(3000)
+        self.fits_image_load_worker = None
+
+        if getattr(self, "_fits_progress_dialog", None) is not None:
+            self._fits_progress_dialog.hide()
+
+        self.images = []
+        self.intensities = np.array([])
+        self.tof_array = None
+        self.wavelengths = np.array([])
+        self.current_image_index = 0
+        self.selected_area = None
+        self.current_batch_box = None
+        self.batch_box_patch = None
+        self.batch_roi_visible = False
+        self.auto_vmin = None
+        self.auto_vmax = None
+        self.current_vmin = None
+        self.current_vmax = None
+        self.min_slider_value = 0
+        self.max_slider_value = 1000
+        self.current_r1_min = None
+        self.current_r1_max = None
+        self.current_r2_min = None
+        self.current_r2_max = None
+        self.current_r3_min = None
+        self.current_r3_max = None
+        self.live_fit_enabled = False
+        self.live_fit_mode = None
+        self.manual_wavelength_mode = False
+        self.folder_path = ""
+        self.work_directory = ""
+        self._bragg_table_ready = False
+
+        if hasattr(self, "_reset_current_bragg_edge_state"):
+            self._reset_current_bragg_edge_state()
+
+        self.image_slider.blockSignals(True)
+        self.image_slider.setEnabled(False)
+        self.image_slider.setRange(0, 0)
+        self.image_slider.setValue(0)
+        self.image_slider.blockSignals(False)
+
+        self.bragg_table.setRowCount(0)
+        self.message_box.clear()
+        self._clear_fitting_canvases()
+        self._clear_image_canvas()
+        self._set_fits_image_button_states(is_loading=False)
+
+    def _clear_image_canvas(self):
+        self.canvas.axes.clear()
+        self.canvas.axes.set_title("")
+        self.canvas.draw_idle()
+
+    def _clear_fitting_canvases(self):
+        for title, canvas in (
+            ("", getattr(self, "plot_canvas_a", None)),
+            ("Region 1", getattr(self, "plot_canvas_b", None)),
+            ("Region 2", getattr(self, "plot_canvas_c", None)),
+            ("Region 3", getattr(self, "plot_canvas_d", None)),
+        ):
+            if canvas is None:
+                continue
+            self._initialize_fit_canvas(canvas, title=title or None)
+            canvas.draw_idle()
 
     def open_batch_settings_dialog(self):
         """Dialog to edit batch fitting parameters and ROI."""
         dialog = QDialog(self)
-        dialog.setWindowTitle("Batch Fit Settings")
+        dialog.setWindowTitle("Mapping Setting")
+        dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, True)
         dialog_layout = QVBoxLayout(dialog)
+        label_width = 95
+        field_width = 160
 
-        form_layout = QFormLayout()
+        def add_aligned_row(form, text, widget):
+            label = QLabel(text)
+            label.setFixedWidth(label_width)
+            widget.setFixedWidth(field_width)
+            form.addRow(label, widget)
+
         width_edit = QLineEdit(self.box_width_input.text())
         height_edit = QLineEdit(self.box_height_input.text())
         step_x_edit = QLineEdit(self.step_x_input.text())
         step_y_edit = QLineEdit(self.step_y_input.text())
+        help_text = (
+            "Macro pixel size sets the mapping box width and height in pixels.\n"
+            "Skipping step controls how far the mapping box moves between fits. "
+            "Smaller steps increase overlap and density. Interpolation fills skipped positions.\n"
+            "Mapping area defines the half-open pixel bounds x[min, max) and y[min, max) "
+            "used for the orange mapping ROI."
+        )
+        dialog.setWhatsThis(help_text)
 
-        form_layout.addRow("Box Width:", width_edit)
-        form_layout.addRow("Box Height:", height_edit)
-        form_layout.addRow("Step X:", step_x_edit)
-        form_layout.addRow("Step Y:", step_y_edit)
-        dialog_layout.addLayout(form_layout)
+        macro_group = QGroupBox("Macro pixel size")
+        macro_group.setWhatsThis(
+            "Set the mapping box size in pixels. This is the ROI size fitted at each mapping position."
+        )
+        macro_layout = QFormLayout(macro_group)
+        macro_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        add_aligned_row(macro_layout, "Width:", width_edit)
+        add_aligned_row(macro_layout, "Height:", height_edit)
+        dialog_layout.addWidget(macro_group)
 
+        skipping_group = QGroupBox("Skipping step")
+        skipping_group.setWhatsThis(
+            "Set how far the mapping box moves between fits. Interpolation can fill skipped positions in the exported map."
+        )
+        skipping_layout = QFormLayout(skipping_group)
+        skipping_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        add_aligned_row(skipping_layout, "Step X:", step_x_edit)
+        add_aligned_row(skipping_layout, "Step Y:", step_y_edit)
         interpolation_checkbox = QCheckBox("Enable interpolation")
         interpolation_checkbox.setChecked(self.interpolation_checkbox.isChecked())
-        dialog_layout.addWidget(interpolation_checkbox)
+        interpolation_checkbox.setWhatsThis(
+            "Fill output map values between sampled positions when the step is larger than one pixel."
+        )
+        interpolation_spacer = QLabel("")
+        interpolation_spacer.setFixedWidth(label_width)
+        skipping_layout.addRow(interpolation_spacer, interpolation_checkbox)
+        dialog_layout.addWidget(skipping_group)
 
-        roi_layout = QFormLayout()
+        mapping_group = QGroupBox("Mapping area")
+        mapping_group.setWhatsThis(
+            "Set the orange mapping ROI using half-open bounds. Example: x[10, 12), y[20, 23) includes x pixels 10-11 and y pixels 20-22."
+        )
+        roi_layout = QFormLayout(mapping_group)
+        roi_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         min_x_edit = QLineEdit(self.min_x_input.text())
         max_x_edit = QLineEdit(self.max_x_input.text())
         min_y_edit = QLineEdit(self.min_y_input.text())
@@ -1992,13 +2640,17 @@ class FittingMixin:
         )
         for roi_edit in (min_x_edit, max_x_edit, min_y_edit, max_y_edit):
             roi_edit.setToolTip(batch_roi_tooltip)
-        roi_layout.addRow("ROI X Min:", min_x_edit)
-        roi_layout.addRow("ROI X Max:", max_x_edit)
-        roi_layout.addRow("ROI Y Min:", min_y_edit)
-        roi_layout.addRow("ROI Y Max:", max_y_edit)
-        dialog_layout.addLayout(roi_layout)
+            roi_edit.setWhatsThis(batch_roi_tooltip)
+        for edit in (width_edit, height_edit, step_x_edit, step_y_edit):
+            edit.setWhatsThis(help_text)
+        add_aligned_row(roi_layout, "X Min:", min_x_edit)
+        add_aligned_row(roi_layout, "X Max:", max_x_edit)
+        add_aligned_row(roi_layout, "Y Min:", min_y_edit)
+        add_aligned_row(roi_layout, "Y Max:", max_y_edit)
+        dialog_layout.addWidget(mapping_group)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText("Apply")
         dialog_layout.addWidget(button_box)
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
@@ -2026,25 +2678,37 @@ class FittingMixin:
             self.min_y_input.setText(str(min_y))
             self.max_y_input.setText(str(max_y))
             self.interpolation_checkbox.setChecked(interpolation_checkbox.isChecked())
+            self._apply_mapping_settings_from_inputs()
 
             # Do NOT overwrite the current picked ROI (selected_area); batch settings
             # should not change the spectra used for single-pixel fits.
 
+    def _apply_mapping_settings_from_inputs(self, redraw=True, persist=True):
+        """Apply current mapping input fields to the active mapping ROI state."""
+        try:
+            int(self.box_width_input.text())
+            int(self.box_height_input.text())
+            int(self.step_x_input.text())
+            int(self.step_y_input.text())
+            int(self.min_x_input.text())
+            int(self.max_x_input.text())
+            int(self.min_y_input.text())
+            int(self.max_y_input.text())
+        except ValueError:
+            return False
+
+        self.batch_roi_visible = True
+        if redraw:
+            self.display_image()
+        if persist and hasattr(self, "save_user_settings"):
+            self.save_user_settings()
+        return True
+
     def open_general_settings_dialog(self):
-        """Dialog for auto/manual adjustments and flight/delay settings."""
+        """Dialog for fitting-related flight path and time delay settings."""
         dialog = QDialog(self)
-        dialog.setWindowTitle("Configuration")
+        dialog.setWindowTitle("Instrument Setting")
         layout = QVBoxLayout(dialog)
-
-        adjust_layout = QHBoxLayout()
-        auto_btn = QPushButton("Auto Adjust")
-        auto_btn.clicked.connect(self.auto_adjust)
-        adjust_layout.addWidget(auto_btn)
-
-        manual_btn = QPushButton("Manual Adjust")
-        manual_btn.clicked.connect(self.open_adjustments_dialog)
-        adjust_layout.addWidget(manual_btn)
-        layout.addLayout(adjust_layout)
 
         form_layout = QFormLayout()
         flight_spin = QDoubleSpinBox()
@@ -2060,11 +2724,29 @@ class FittingMixin:
         delay_spin.setValue(getattr(self, "delay", 0.0))
         form_layout.addRow("Time Delay (ms):", delay_spin)
 
-        symbol_spin = QSpinBox()
-        symbol_spin.setRange(1, 20)
-        symbol_spin.setValue(getattr(self, "symbol_size", 4))
-        form_layout.addRow("Symbol Size:", symbol_spin)
         layout.addLayout(form_layout)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(button_box)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+
+        if dialog.exec_() == QDialog.Accepted:
+            self.flight_path = flight_spin.value()
+            self.delay = delay_spin.value()
+            self.message_box.append(f"Flight path set to {self.flight_path:.3f} m.")
+            self.message_box.append(f"Time delay set to {self.delay:.4f} ms.")
+            if self.tof_array is not None:
+                self.update_wavelengths()
+                self.update_plots()
+            self.save_user_settings()
+        return
+
+    def open_manual_spectra_settings_dialog(self):
+        """Dialog for manual wavelength/ToF anchors and loading saved fitting metadata."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manual Spectra Setting")
+        layout = QVBoxLayout(dialog)
 
         anchor_mode_combo = QComboBox()
         anchor_mode_combo.addItems(["Wavelength (Å)", "Time of Flight (ms)"])
@@ -2143,141 +2825,12 @@ class FittingMixin:
         add_row_btn.clicked.connect(lambda: add_anchor_row())
         layout.addWidget(add_row_btn)
 
-        load_cfg_btn = QPushButton("Load configuration")
-        load_cfg_btn.setToolTip("Load metadata from a result CSV to reuse settings.")
-        layout.addWidget(load_cfg_btn)
-
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         layout.addWidget(button_box)
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
 
-        def _load_config_from_csv():
-            file_name, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select result CSV with metadata",
-                "",
-                "CSV Files (*.csv);;All Files (*)",
-            )
-            if not file_name:
-                return
-            metadata = {}
-            try:
-                with open(file_name, "r", encoding="utf-8") as f:
-                    first = f.readline().strip()
-                    if not first.startswith("Metadata Name"):
-                        QMessageBox.warning(dialog, "Invalid file", "Selected CSV does not contain metadata header.")
-                        return
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            break
-                        if "," in line:
-                            k, v = line.split(",", 1)
-                            metadata[k] = v
-            except Exception as exc:
-                QMessageBox.warning(dialog, "Load failed", f"Could not read metadata: {exc}")
-                return
-
-            def _set_float(spin, key):
-                try:
-                    spin.setValue(float(metadata[key]))
-                except (KeyError, TypeError, ValueError):
-                    pass
-            def _set_line_float(line_edit, key):
-                try:
-                    line_edit.setText(str(float(metadata[key])))
-                except (KeyError, TypeError, ValueError):
-                    pass
-            def _set_int(line_edit, key):
-                try:
-                    line_edit.setText(str(int(float(metadata[key]))))
-                except (KeyError, TypeError, ValueError):
-                    pass
-            def _set_bool(checkbox, key):
-                try:
-                    checkbox.setChecked(str(metadata[key]).strip().lower() in ("1","true","yes","y","on"))
-                except (KeyError, TypeError, ValueError):
-                    pass
-
-            _set_float(flight_spin, "flight_path")
-            for key in ("time_delay_ms", "delay"):
-                if key in metadata:
-                    _set_float(delay_spin, key)
-                    break
-            _set_line_float(self.min_wavelength_input, "min_wavelength")
-            _set_line_float(self.max_wavelength_input, "max_wavelength")
-            try:
-                if "symbol_size" in metadata:
-                    symbol_spin.setValue(int(float(metadata["symbol_size"])))
-            except (TypeError, ValueError):
-                pass
-
-            # Batch ROI and grid parameters
-            _set_int(self.box_width_input, "box_width")
-            _set_int(self.box_height_input, "box_height")
-            _set_int(self.step_x_input, "step_x")
-            _set_int(self.step_y_input, "step_y")
-            _set_int(self.min_x_input, "roi_x_min")
-            _set_int(self.max_x_input, "roi_x_max")
-            _set_int(self.min_y_input, "roi_y_min")
-            _set_int(self.max_y_input, "roi_y_max")
-
-            # Fix flags
-            _set_bool(self.fix_s_checkbox, "fix_s")
-            _set_bool(self.fix_t_checkbox, "fix_t")
-            _set_bool(self.fix_eta_checkbox, "fix_eta")
-
-            # Selected phase
-            phase_name = metadata.get("selected_phase")
-            if phase_name:
-                idx = self.phase_dropdown.findText(phase_name)
-                if idx == -1:
-                    self.phase_dropdown.addItem(phase_name)
-                    idx = self.phase_dropdown.findText(phase_name)
-                if idx >= 0:
-                    self.phase_dropdown.setCurrentIndex(idx)
-
-            # Restore Bragg table rows if present
-            bragg_rows = [(k, v) for k, v in metadata.items() if k.lower().startswith("bragg_table_row_")]
-            if bragg_rows:
-                bragg_rows.sort(key=lambda kv: int(''.join(filter(str.isdigit, kv[0])) or 0))
-                self.bragg_table.setRowCount(len(bragg_rows))
-                for row_idx, (_, row_text) in enumerate(bragg_rows):
-                    parts = row_text.split("|")
-                    if parts:
-                        parts[0] = parts[0].replace(";", ",")
-                    for col_idx in range(self.bragg_table.columnCount()):
-                        val = parts[col_idx] if col_idx < len(parts) else ""
-                        item = QTableWidgetItem(val)
-                        self.bragg_table.setItem(row_idx, col_idx, item)
-                self._bragg_table_ready = True
-
-            QMessageBox.information(dialog, "Configuration loaded", "Metadata applied where available.")
-
-        load_cfg_btn.clicked.connect(_load_config_from_csv)
-
         if dialog.exec_() == QDialog.Accepted:
-            self.flight_path = flight_spin.value()
-            self.delay = delay_spin.value()
-            self.message_box.append(f"Flight path set to {self.flight_path:.3f} m.")
-            self.message_box.append(f"Time delay set to {self.delay:.4f} ms.")
-
-            old_symbol_size = getattr(self, "symbol_size", 4)
-            self.symbol_size = symbol_spin.value()
-            if self.tof_array is not None:
-                self.update_wavelengths()
-                self.update_plots()
-
-            if (
-                self.symbol_size != old_symbol_size
-                and getattr(self, "intensities", None) is not None
-                and len(self.intensities) > 0
-            ):
-                self.update_plots()
-            self.apply_symbol_size()
-
-            anchors = []
             self.manual_anchor_mode = "tof" if anchor_mode_combo.currentIndex() == 1 else "wavelength"
             anchors = []
             for idx_spin, val_spin, _ in anchor_rows:
@@ -2290,6 +2843,177 @@ class FittingMixin:
                 self.update_manual_wavelengths()
                 if getattr(self, "selected_area", None):
                     self.update_plots()
+            self.save_user_settings()
+
+    def load_fitting_configuration_from_csv(self):
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select fitting configuration CSV",
+            "",
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not file_name:
+            return
+
+        metadata = {}
+        try:
+            with open(file_name, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                first = next(reader, None)
+                if not first or not first[0].strip().startswith("Metadata Name"):
+                    QMessageBox.warning(self, "Invalid file", "Selected CSV does not contain metadata header.")
+                    return
+                for row in reader:
+                    if not row or all(not cell.strip() for cell in row):
+                        break
+                    if len(row) >= 2:
+                        metadata[row[0].strip()] = row[1]
+        except Exception as exc:
+            QMessageBox.warning(self, "Load failed", f"Could not read metadata: {exc}")
+            return
+
+        def _set_line_float(line_edit, key):
+            try:
+                line_edit.setText(str(float(metadata[key])))
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        def _set_int(line_edit, key):
+            try:
+                line_edit.setText(str(int(float(metadata[key]))))
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        def _set_fix_state(name, key):
+            try:
+                checked = str(metadata[key]).strip().lower() in ("1", "true", "yes", "y", "on")
+                self.set_fix_parameter_state(name, checked)
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        def _set_checkbox_bool(checkbox, *keys):
+            for key in keys:
+                if key not in metadata:
+                    continue
+                checked = str(metadata[key]).strip().lower() in ("1", "true", "yes", "y", "on")
+                checkbox.setChecked(checked)
+                return
+
+        _set_line_float(self.min_wavelength_input, "min_wavelength")
+        _set_line_float(self.max_wavelength_input, "max_wavelength")
+        _set_int(self.box_width_input, "box_width")
+        _set_int(self.box_height_input, "box_height")
+        _set_int(self.step_x_input, "step_x")
+        _set_int(self.step_y_input, "step_y")
+        _set_int(self.min_x_input, "roi_x_min")
+        _set_int(self.max_x_input, "roi_x_max")
+        _set_int(self.min_y_input, "roi_y_min")
+        _set_int(self.max_y_input, "roi_y_max")
+        _set_checkbox_bool(self.interpolation_checkbox, "interpolation", "interpolation_enabled")
+
+        _set_fix_state("s", "fix_s")
+        _set_fix_state("t", "fix_t")
+        _set_fix_state("eta", "fix_eta")
+
+        try:
+            self.flight_path = float(metadata["flight_path"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        try:
+            self.delay = float(metadata["delay"])
+        except (KeyError, TypeError, ValueError):
+            pass
+
+        phase_name = metadata.get("selected_phase")
+        if phase_name:
+            idx = self.phase_dropdown.findText(phase_name)
+            if idx == -1:
+                self.phase_dropdown.addItem(phase_name)
+                idx = self.phase_dropdown.findText(phase_name)
+            if idx >= 0:
+                self.phase_dropdown.setCurrentIndex(idx)
+
+        bragg_rows = [(k, v) for k, v in metadata.items() if k.lower().startswith("bragg_table_row_")]
+        if bragg_rows:
+            bragg_rows.sort(key=lambda kv: int("".join(filter(str.isdigit, kv[0])) or 0))
+            self.bragg_table.setRowCount(len(bragg_rows))
+            for row_idx, (_, row_text) in enumerate(bragg_rows):
+                parts = row_text.split("|")
+                if parts:
+                    parts[0] = parts[0].replace(";", ",")
+                for col_idx in range(self.bragg_table.columnCount()):
+                    val = parts[col_idx] if col_idx < len(parts) else ""
+                    item = QTableWidgetItem(val)
+                    self.bragg_table.setItem(row_idx, col_idx, item)
+            self._bragg_table_ready = True
+
+        mapping_keys = {
+            "box_width",
+            "box_height",
+            "step_x",
+            "step_y",
+            "roi_x_min",
+            "roi_x_max",
+            "roi_y_min",
+            "roi_y_max",
+            "interpolation",
+            "interpolation_enabled",
+        }
+        if any(key in metadata for key in mapping_keys):
+            self._apply_mapping_settings_from_inputs(persist=False)
+
+        self.save_user_settings()
+        QMessageBox.information(self, "Configuration loaded", "Metadata applied where available.")
+
+    def save_fitting_configuration_to_csv(self):
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Fitting Configuration",
+            "",
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not file_name:
+            return
+        if not file_name.lower().endswith(".csv"):
+            file_name += ".csv"
+
+        metadata = self._build_fitting_configuration_metadata()
+        try:
+            with open(file_name, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Metadata Name", "Metadata Value"])
+                writer.writerows(metadata)
+                writer.writerow([])
+            QMessageBox.information(self, "Configuration saved", f"Fitting configuration saved to:\n{file_name}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Save failed", f"Could not save fitting configuration:\n{exc}")
+
+    def _build_fitting_configuration_metadata(self):
+        context = self._build_batch_fit_context()
+        metadata = [
+            ("box_width", self.box_width_input.text()),
+            ("box_height", self.box_height_input.text()),
+            ("step_x", self.step_x_input.text()),
+            ("step_y", self.step_y_input.text()),
+            ("interpolation", self.interpolation_checkbox.isChecked()),
+            ("roi_x_min", self.min_x_input.text()),
+            ("roi_x_max", self.max_x_input.text()),
+            ("roi_y_min", self.min_y_input.text()),
+            ("roi_y_max", self.max_y_input.text()),
+            ("number_of_edges", self.bragg_table.rowCount()),
+            ("directory", getattr(self, "work_directory", "")),
+            ("fix_s", self.fix_s_enabled()),
+            ("fix_t", self.fix_t_enabled()),
+            ("fix_eta", self.fix_eta_enabled()),
+            ("flight_path", getattr(self, "flight_path", "")),
+            ("delay", getattr(self, "delay", "")),
+            ("min_wavelength", context.get("min_wavelength")),
+            ("max_wavelength", context.get("max_wavelength")),
+            ("selected_phase", context.get("selected_phase")),
+        ]
+        for row_idx, row_text in enumerate(context.get("bragg_rows_text", []), start=1):
+            metadata.append((f"bragg_table_row_{row_idx}", row_text))
+        return metadata
 
     def open_adjustments_dialog(self):
         # (Re-open the existing dialog if it is already up)
@@ -2307,12 +3031,12 @@ class FittingMixin:
 
     def load_fits_images(self):
         """
-        Load FITS images by selecting a folder. Only images with suffixes from _00000 to _02924 are loaded.
+        Load image files by selecting a folder. Only images with suffixes from _00000 to _02924 are loaded.
         After loading, perform intensity check and scaling if necessary.
         """
-        # Open a folder dialog to select a directory containing FITS images
+        # Open a folder dialog to select a directory containing image files.
         folder_path = QFileDialog.getExistingDirectory(
-            self, "Select Folder Containing FITS Images", ""
+            self, "Select Folder Containing Images", ""
         )
         if folder_path:
             existing_worker = getattr(self, "fits_image_load_worker", None)
@@ -2326,7 +3050,7 @@ class FittingMixin:
             self.work_directory = os.path.dirname(folder_path)
 
             # Disable the load button to prevent multiple concurrent loads
-            self.load_button.setEnabled(False)
+            self._set_fits_image_button_states(is_loading=True)
 
             # Start image loading in a separate thread using ImageLoadWorker
             self.fits_image_load_worker = ImageLoadWorker(folder_path)
@@ -2395,6 +3119,7 @@ class FittingMixin:
 
     def display_image(self):
         if not self.images:
+            self._clear_image_canvas()
             return
 
         # Get the selected image based on the slider position
@@ -2458,30 +3183,32 @@ class FittingMixin:
             rect = Rectangle(xy, width, height, edgecolor='yellow', facecolor='none', lw=1)
             self.canvas.axes.add_patch(rect)
 
-        # Draw the static batch ROI from min/max inputs (orange)
-        try:
-            roi_min_x = int(self.min_x_input.text())
-            roi_max_x = int(self.max_x_input.text())
-            roi_min_y = int(self.min_y_input.text())
-            roi_max_y = int(self.max_y_input.text())
-            if roi_min_x < roi_max_x and roi_min_y < roi_max_y:
-                xy, width, height = self._slice_box_patch_args(
-                    roi_min_x,
-                    roi_max_x,
-                    roi_min_y,
-                    roi_max_y,
-                )
-                roi_rect = Rectangle(
-                    xy,
-                    width,
-                    height,
-                    edgecolor="orange",
-                    facecolor="none",
-                    lw=1,
-                )
-                self.canvas.axes.add_patch(roi_rect)
-        except ValueError:
-            pass
+        # Draw the static batch ROI from min/max inputs (orange) only after the
+        # Batch Fit Settings dialog has been applied in this session.
+        if getattr(self, "batch_roi_visible", False):
+            try:
+                roi_min_x = int(self.min_x_input.text())
+                roi_max_x = int(self.max_x_input.text())
+                roi_min_y = int(self.min_y_input.text())
+                roi_max_y = int(self.max_y_input.text())
+                if roi_min_x < roi_max_x and roi_min_y < roi_max_y:
+                    xy, width, height = self._slice_box_patch_args(
+                        roi_min_x,
+                        roi_max_x,
+                        roi_min_y,
+                        roi_max_y,
+                    )
+                    roi_rect = Rectangle(
+                        xy,
+                        width,
+                        height,
+                        edgecolor="orange",
+                        facecolor="none",
+                        lw=1,
+                    )
+                    self.canvas.axes.add_patch(roi_rect)
+            except ValueError:
+                pass
 
         # # Draw the batch fitting moving box, if available
         # if self.current_batch_box:
@@ -2712,6 +3439,7 @@ class FittingMixin:
             self._roi_active_corner = None
             # Recompute plots with the new ROI
             self.update_plots()
+            self.run_live_fit_preview()
         if self._dragging_batch_roi:
             self._dragging_batch_roi = False
             self._batch_drag_offset = (0.0, 0.0)
@@ -3077,6 +3805,8 @@ class FittingMixin:
 
     def _get_batch_roi(self):
         """Return current batch ROI (orange) as (xmin, xmax, ymin, ymax) or None if invalid."""
+        if not getattr(self, "batch_roi_visible", False):
+            return None
         try:
             xmin = int(self.min_x_input.text())
             xmax = int(self.max_x_input.text())
@@ -3167,26 +3897,49 @@ class FittingMixin:
         fig = canvas.fig
         main_ax = getattr(canvas, "axes", None)
         residual_ax = getattr(canvas, "residual_axes", None)
+        layout_key = self._fit_canvas_layout_key(canvas)
 
         valid_axes = (
             main_ax is not None
             and residual_ax is not None
             and main_ax in fig.axes
             and residual_ax in fig.axes
+            and getattr(canvas, "_fit_canvas_layout_key", None) == layout_key
         )
         if not valid_axes:
             fig.clf()
-            grid = fig.add_gridspec(2, 1, height_ratios=[4, 1], hspace=0.0)
+            grid = fig.add_gridspec(
+                2,
+                1,
+                height_ratios=self._fit_canvas_height_ratios(canvas),
+                hspace=0.0,
+            )
             main_ax = fig.add_subplot(grid[0, 0])
             residual_ax = fig.add_subplot(grid[1, 0], sharex=main_ax)
             canvas.axes = main_ax
             canvas.residual_axes = residual_ax
+            canvas._fit_canvas_layout_key = layout_key
 
         residual_ax.set_xlabel(self._fit_canvas_xlabel(canvas))
         return main_ax, residual_ax
 
+    def _fit_canvas_layout_key(self, canvas):
+        """Return a key for figure geometry that should trigger axis recreation."""
+        mode = getattr(self, "fitting_plot_layout_mode", "single")
+        if canvas is getattr(self, "plot_canvas_a", None):
+            return f"{mode}:primary"
+        return f"{mode}:secondary"
+
+    def _fit_canvas_height_ratios(self, canvas):
+        """Return main/residual height ratios tuned for the active plot layout."""
+        if self.is_single_fit_canvas_mode() and canvas is getattr(self, "plot_canvas_a", None):
+            return [8, 1]
+        return [5, 1]
+
     def _fit_canvas_xlabel(self, canvas):
         """Return residual x-axis label text for a fit canvas based on its 2x2 position."""
+        if self.is_single_fit_canvas_mode() and canvas is getattr(self, "plot_canvas_a", None):
+            return "Wavelength (A)"
         top_row = (
             getattr(self, "plot_canvas_a", None),
             getattr(self, "plot_canvas_b", None),
@@ -3299,18 +4052,416 @@ class FittingMixin:
         residual_ax.xaxis.label.set_size(residual_font_size)
         residual_ax.yaxis.label.set_size(residual_font_size)
 
-        # Reserve enough figure margins for axis labels/titles in 2x2 plot layout.
-        left_margin = min(0.28, max(0.18, 0.12 + 0.006 * font_size))
-        bottom_margin = min(0.30, max(0.16, 0.10 + 0.006 * font_size))
+        left_margin, right_margin, top_margin, bottom_margin = self._fit_canvas_margins(canvas, font_size)
         canvas.fig.subplots_adjust(
             left=left_margin,
-            right=0.98,
-            top=0.96,
+            right=right_margin,
+            top=top_margin,
             bottom=bottom_margin,
             hspace=0.0,
         )
 
         return main_ax, residual_ax
+
+    def _fit_canvas_margins(self, canvas, font_size):
+        """Return figure margins tuned for single-canvas and four-canvas layouts."""
+        scale = max(float(font_size), 6.0)
+        if self.is_single_fit_canvas_mode() and canvas is getattr(self, "plot_canvas_a", None):
+            return (
+                min(0.16, max(0.08, 0.04 + 0.0035 * scale)),
+                0.985,
+                0.965,
+                min(0.18, max(0.10, 0.055 + 0.004 * scale)),
+            )
+        return (
+            min(0.24, max(0.14, 0.08 + 0.0045 * scale)),
+            0.975,
+            0.955,
+            min(0.24, max(0.13, 0.075 + 0.0045 * scale)),
+        )
+
+    def _append_fit_message(self, text):
+        """Append a visually separated fitting message block."""
+        box = getattr(self, "message_box", None)
+        if box is None:
+            return
+
+        lines = str(text).strip().splitlines()
+        if not lines:
+            return
+
+        title = lines[0].strip()
+        body = "\n".join(lines[1:]).strip("\n")
+        palette = self._fit_message_palette(title)
+        timestamp = time.strftime("%H:%M:%S")
+        font_size = max(1, int(getattr(self, "gui_font_size", box.font().pointSize() or 8)))
+
+        body_html = ""
+        if body:
+            body_html = (
+                "<pre style=\""
+                "margin:4px 0 8px 10px;"
+                "font-family:Consolas, 'Courier New', monospace;"
+                "font-size:{font_size}pt;"
+                "white-space:pre-wrap;"
+                "color:#222;"
+                "\">"
+                f"{escape(body)}"
+                "</pre>"
+            ).format(font_size=font_size)
+
+        block_html = (
+            "<div style=\""
+            "margin-top:8px;"
+            "margin-bottom:6px;"
+            "border:1px solid {border};"
+            "border-left:4px solid {accent};"
+            "background:{background};"
+            "\">"
+            "<div style=\""
+            "padding:4px 7px;"
+            "font-weight:600;"
+            "font-size:{font_size}pt;"
+            "color:{header};"
+            "background:{header_bg};"
+            "\">"
+            "<span style=\"color:#666; font-weight:400;\">[{time}]</span> {title}"
+            "</div>"
+            "{body}"
+            "</div>"
+        ).format(
+            border=palette["border"],
+            accent=palette["accent"],
+            background=palette["background"],
+            header=palette["header"],
+            header_bg=palette["header_bg"],
+            font_size=font_size,
+            time=escape(timestamp),
+            title=escape(title),
+            body=body_html,
+        )
+        box.append(block_html)
+        scrollbar = box.verticalScrollBar()
+        if scrollbar is not None:
+            scrollbar.setValue(scrollbar.maximum())
+
+    @staticmethod
+    def _fit_message_palette(title):
+        """Return colours for a fitting message block based on its title."""
+        lowered = title.lower()
+        if "failed" in lowered or "error" in lowered:
+            return {
+                "accent": "#c62828",
+                "border": "#efb7b7",
+                "background": "#fff7f7",
+                "header": "#7f1d1d",
+                "header_bg": "#fde2e2",
+            }
+        if "completed" in lowered or "saved" in lowered:
+            return {
+                "accent": "#2e7d32",
+                "border": "#b7d9ba",
+                "background": "#f6fbf6",
+                "header": "#1f5f24",
+                "header_bg": "#e3f2e5",
+            }
+        if "started" in lowered or "requested" in lowered:
+            return {
+                "accent": "#1565c0",
+                "border": "#b8cbe6",
+                "background": "#f6f9fd",
+                "header": "#0d47a1",
+                "header_bg": "#e5eef9",
+            }
+        return {
+            "accent": "#6b7280",
+            "border": "#d7dbe0",
+            "background": "#fbfbfc",
+            "header": "#30343b",
+            "header_bg": "#eef0f3",
+        }
+
+    def _append_batch_message(self, text):
+        """Append a batch-processing message using the fitting block style."""
+        raw = str(text or "").strip()
+        if not raw:
+            return
+        if raw.startswith("["):
+            self._append_fit_message(raw)
+            return
+
+        lowered = raw.lower()
+        saved_marker = " saved to "
+        if saved_marker in lowered:
+            idx = lowered.find(saved_marker)
+            title = raw[:idx].strip()
+            path = raw[idx + len(saved_marker):].strip()
+            self._append_fit_message(f"[Batch fit] {title} saved\n  {path}")
+            return
+
+        if "failed" in lowered or "error" in lowered:
+            self._append_fit_message(f"[Batch fit] Failed\n  {raw}")
+        elif "stopped" in lowered or "cancelled" in lowered:
+            self._append_fit_message(f"[Batch fit] Stopped\n  {raw}")
+        elif "completed" in lowered:
+            self._append_fit_message(f"[Batch fit] Completed\n  {raw}")
+        else:
+            self._append_fit_message(f"[Batch fit] Update\n  {raw}")
+
+    @staticmethod
+    def _format_hkl_label(hkl):
+        if isinstance(hkl, tuple):
+            return "hkl(" + ", ".join(str(v) for v in hkl) + ")"
+        return str(hkl)
+
+    @staticmethod
+    def _format_number(value, digits=6):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "n/a"
+        if not np.isfinite(number):
+            return "n/a"
+        return f"{number:.{digits}f}"
+
+    def _format_value_unc(self, value, uncertainty, unit="", digits=6):
+        value_text = self._format_number(value, digits)
+        unc_text = self._format_number(uncertainty, digits)
+        suffix = f" {unit}" if unit else ""
+        if unc_text == "n/a":
+            return f"{value_text}{suffix}"
+        return f"{value_text} +/- {unc_text}{suffix}"
+
+    def _append_pattern_fit_summary(self, result_dict, min_wavelength=None, max_wavelength=None):
+        """Append a compact summary for a successful pattern fit."""
+        structure_type = result_dict.get("structure_type", "")
+        lattice_params = result_dict.get("lattice_params", {})
+        lattice_unc = result_dict.get("lattice_uncertainties", {})
+        bragg_edges = result_dict.get("bragg_edges", [])
+        edge_heights = result_dict.get("edge_heights", {})
+        edge_widths = result_dict.get("edge_widths", {})
+        fitted_s = result_dict.get("fitted_s", {})
+        fitted_t = result_dict.get("fitted_t", {})
+        fitted_eta = result_dict.get("fitted_eta", {})
+        s_unc = result_dict.get("s_uncertainties", {})
+        t_unc = result_dict.get("t_uncertainties", {})
+        eta_unc = result_dict.get("eta_uncertainties", {})
+
+        structure_map = {
+            "cubic": ["a"],
+            "fcc": ["a"],
+            "bcc": ["a"],
+            "tetragonal": ["a", "c"],
+            "hexagonal": ["a", "c"],
+            "orthorhombic": ["a", "b", "c"],
+        }
+
+        lines = ["[Pattern fit] Results"]
+        phase = getattr(self, "phase_dropdown", None)
+        phase_text = phase.currentText() if phase is not None else ""
+        if phase_text:
+            lines.append(f"  Phase: {phase_text}")
+        if np.isfinite(min_wavelength) and np.isfinite(max_wavelength):
+            lines.append(f"  Wavelength range: {min_wavelength:.4f} - {max_wavelength:.4f} A")
+        lines.append(f"  Edges used: {len(bragg_edges)}")
+
+        param_names = structure_map.get(structure_type, [])
+        if param_names:
+            lines.append("")
+            lines.append("  Lattice:")
+            for param in param_names:
+                lines.append(
+                    f"    {param} = {self._format_value_unc(lattice_params.get(param), lattice_unc.get(param), 'A')}"
+                )
+
+        if bragg_edges:
+            lines.append("")
+            lines.append("  Edge results:")
+            for edge in bragg_edges:
+                hkl = edge.get("hkl")
+                label = self._format_hkl_label(hkl)
+                parts = [
+                    f"s={self._format_value_unc(fitted_s.get(hkl), s_unc.get(hkl), digits=5)}",
+                    f"t={self._format_value_unc(fitted_t.get(hkl), t_unc.get(hkl), digits=5)}",
+                    f"eta={self._format_value_unc(fitted_eta.get(hkl), eta_unc.get(hkl), digits=4)}",
+                    f"height={self._format_number(edge_heights.get(hkl), 6)}",
+                    f"FWHM={self._format_number(edge_widths.get(hkl), 6)} A",
+                ]
+                lines.append(f"    {label}: " + ", ".join(parts))
+
+        self._append_fit_message("\n".join(lines))
+        self._append_fit_message("[Pattern fit] Completed")
+
+    def _append_individual_fit_summary(self, result, row_number):
+        """Append one compact summary for a successful individual edge fit."""
+        hkl = result.get("hkl")
+        d_fit, s_fit, t_fit, eta_fit, d_unc, s_unc, t_unc, eta_unc = result.get(
+            "fit_params", (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
+        )
+        baseline = result.get("baseline_params", {})
+        lines = [
+            f"  Edge {row_number + 1} {self._format_hkl_label(hkl)}:",
+            f"    d = {self._format_value_unc(d_fit, d_unc, 'A')}",
+            f"    height = {self._format_number(result.get('edge_height'), 6)}",
+            f"    FWHM = {self._format_number(result.get('edge_width'), 6)} A",
+            f"    RMS = {self._format_number(result.get('rms'), 6)}",
+            (
+                "    baseline: "
+                f"a0={self._format_number(baseline.get('a0'), 6)}, "
+                f"b0={self._format_number(baseline.get('b0'), 6)}, "
+                f"a_hkl={self._format_number(baseline.get('a_hkl'), 6)}, "
+                f"b_hkl={self._format_number(baseline.get('b_hkl'), 6)}"
+            ),
+        ]
+        free_params = []
+        if np.isfinite(s_unc):
+            free_params.append(f"s={self._format_value_unc(s_fit, s_unc, digits=6)}")
+        if np.isfinite(t_unc):
+            free_params.append(f"t={self._format_value_unc(t_fit, t_unc, digits=6)}")
+        if np.isfinite(eta_unc):
+            free_params.append(f"eta={self._format_value_unc(eta_fit, eta_unc, digits=4)}")
+        if free_params:
+            lines.append("    fitted shape: " + ", ".join(free_params))
+        self._append_fit_message("\n".join(lines))
+
+    def _add_live_fit_annotation(self, ax, text, data_x=None, data_y=None, fit_x=None, fit_y=None):
+        x_pos, y_pos, ha, va = self._choose_live_annotation_position(
+            ax,
+            text,
+            data_x,
+            data_y,
+            fit_x=fit_x,
+            fit_y=fit_y,
+        )
+        ax.text(
+            x_pos,
+            y_pos,
+            text,
+            transform=ax.transAxes,
+            ha=ha,
+            va=va,
+            fontsize=getattr(self, "plot_font_size", 12),
+            color="black",
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.75,
+                "pad": 2,
+            },
+        )
+
+    def _choose_live_annotation_position(self, ax, text, data_x=None, data_y=None, fit_x=None, fit_y=None):
+        text_lines = str(text).splitlines() or [""]
+        line_count = len(text_lines)
+        max_line_length = max(len(line) for line in text_lines)
+        box_width = min(0.62, max(0.24, 0.015 * max_line_length + 0.08))
+        box_height = min(0.44, max(0.12, 0.075 * line_count + 0.06))
+        margin = 0.02
+        bottom_margin = 0.08
+        candidates = [
+            self._live_annotation_candidate(margin, 1.0 - margin, "left", "top", box_width, box_height),
+            self._live_annotation_candidate(1.0 - margin, 1.0 - margin, "right", "top", box_width, box_height),
+            self._live_annotation_candidate(margin, bottom_margin, "left", "bottom", box_width, box_height),
+            self._live_annotation_candidate(1.0 - margin, bottom_margin, "right", "bottom", box_width, box_height),
+        ]
+        points = []
+        for x_arr, y_arr, weight in (
+            (data_x, data_y, 1.0),
+            (fit_x, fit_y, 2.0),
+        ):
+            axes_points = self._data_points_to_axes_fraction(ax, x_arr, y_arr)
+            if axes_points.size:
+                points.append((axes_points, weight))
+        for axes_points, weight in self._axes_artist_occupancy_points(ax):
+            if axes_points.size:
+                points.append((axes_points, weight))
+
+        best = candidates[1]
+        best_score = np.inf
+        for preference, candidate in enumerate(candidates):
+            x0, x1, y0, y1 = candidate["bounds"]
+            score = 0.0
+            for axes_points, weight in points:
+                xs = axes_points[:, 0]
+                ys = axes_points[:, 1]
+                in_box = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+                score += weight * np.count_nonzero(in_box)
+                if np.any(in_box):
+                    center = np.array([(x0 + x1) / 2.0, (y0 + y1) / 2.0])
+                    distances = np.linalg.norm(axes_points[in_box] - center, axis=1)
+                    score += weight * np.sum(np.maximum(0.0, 1.0 - distances))
+            score += preference * 0.01
+            if score < best_score:
+                best_score = score
+                best = candidate
+        return best["x"], best["y"], best["ha"], best["va"]
+
+    @staticmethod
+    def _live_annotation_candidate(x, y, ha, va, width, height):
+        if ha == "right":
+            x0 = max(0.0, x - width)
+            x1 = min(1.0, x)
+        else:
+            x0 = max(0.0, x)
+            x1 = min(1.0, x + width)
+        if va == "top":
+            y0 = max(0.0, y - height)
+            y1 = min(1.0, y)
+        else:
+            y0 = max(0.0, y)
+            y1 = min(1.0, y + height)
+        return {"x": x, "y": y, "ha": ha, "va": va, "bounds": (x0, x1, y0, y1)}
+
+    def _axes_artist_occupancy_points(self, ax):
+        points = []
+        for line in ax.lines:
+            try:
+                x = np.asarray(line.get_xdata(), dtype=float)
+                y = np.asarray(line.get_ydata(), dtype=float)
+            except (TypeError, ValueError):
+                continue
+            if x.size == 0 or y.size == 0:
+                continue
+            n = min(x.size, y.size)
+            x = x[:n]
+            y = y[:n]
+            if n == 2 and np.isfinite(x).all() and np.isclose(x[0], x[1]):
+                x_axes = self._data_points_to_axes_fraction(ax, [x[0]], [np.mean(ax.get_ylim())])
+                if x_axes.size:
+                    vertical_points = np.column_stack(
+                        (np.full(24, x_axes[0, 0]), np.linspace(0.0, 1.0, 24))
+                    )
+                    points.append((vertical_points, 1.5))
+                continue
+            if n > 400:
+                sample = np.linspace(0, n - 1, 400, dtype=int)
+                x = x[sample]
+                y = y[sample]
+            axes_points = self._data_points_to_axes_fraction(ax, x, y)
+            if axes_points.size:
+                weight = 2.0 if line.get_linestyle() not in ("None", "none", "") else 1.0
+                points.append((axes_points, weight))
+        return points
+
+    @staticmethod
+    def _data_points_to_axes_fraction(ax, x_arr, y_arr):
+        if x_arr is None or y_arr is None:
+            return np.empty((0, 2))
+        try:
+            x = np.asarray(x_arr, dtype=float)
+            y = np.asarray(y_arr, dtype=float)
+        except (TypeError, ValueError):
+            return np.empty((0, 2))
+        if x.size == 0 or y.size == 0:
+            return np.empty((0, 2))
+        n = min(x.size, y.size)
+        x = x[:n]
+        y = y[:n]
+        finite = np.isfinite(x) & np.isfinite(y)
+        if not np.any(finite):
+            return np.empty((0, 2))
+        xy_display = ax.transData.transform(np.column_stack((x[finite], y[finite])))
+        return ax.transAxes.inverted().transform(xy_display)
 
     @staticmethod
     def _segment_bounds_from_x(x_arr, gap_factor=8.0):
@@ -3414,10 +4565,6 @@ class FittingMixin:
 
         self.intensities = np.array(intensities)/[(xmax-xmin)*(ymax-ymin)]
 
-        # Apply smoothing if checkbox is checked
-        if self.smooth_checkbox.isChecked() and len(self.intensities) > 2:
-            self.intensities = np.convolve(self.intensities, np.ones(3)/3, mode='same')
-
         # Clear previous fitted parameters
         self.params_region1 = None
         self.params_region2 = None
@@ -3464,7 +4611,7 @@ class FittingMixin:
         )
 
         # **Calculate and Plot Theoretical Bragg Edges within the Range**
-        edges_in_range = self.get_edges_in_range(min_wavelength, max_wavelength) if self.show_theoretical_checkbox.isChecked() else []
+        edges_in_range = self.get_edges_in_range(min_wavelength, max_wavelength) if self.show_edge_lines_enabled() else []
         for (hkl, x_hkl) in edges_in_range:
             # Plot vertical dashed line for the theoretical Bragg edge
             ax_a.axvline(
@@ -3500,6 +4647,9 @@ class FittingMixin:
         # self.plot_canvas_a.axes.legend(unique_handles, unique_labels)
 
         self.plot_canvas_a.draw()
+
+        if self.is_single_fit_canvas_mode():
+            return
 
         active_bounds = self._active_region_bounds()
         if active_bounds is None:
@@ -3596,13 +4746,11 @@ class FittingMixin:
             except Exception as e:
                 QMessageBox.warning(self, "Save Data", f"Failed to save data:\n{e}")
 
-    def fit_all_regions(self):
+    def fit_all_regions(self, emit_messages=True, update_table=True, only_update_unfixed=False):
         """
         Performs the Region 1, 2, 3 fit for each row in the bragg_table, but only
         for rows that have valid (non-empty) data in all required columns.
         """
-        self.message_box.append("---------- Starting individual edges fitting ----------")
-
         def _range_from_rows(min_col, max_col, row_limit):
             xmins = []
             xmaxs = []
@@ -3621,35 +4769,91 @@ class FittingMixin:
                 return None
             return min(xmins), max(xmaxs)
 
-        # Start each run from clean region canvases so previous fits do not accumulate.
+        # Start each run from clean result canvases so previous fits do not accumulate.
         max_rows = min(5, self.bragg_table.rowCount())
         region_ranges = {
             "Region 1": _range_from_rows(2, 3, max_rows),  # plotted on canvas_b
             "Region 2": _range_from_rows(4, 5, max_rows),  # plotted on canvas_c
             "Region 3": _range_from_rows(6, 7, max_rows),  # plotted on canvas_d
         }
-        for region_name, canvas in (
-            ("Region 1", self.plot_canvas_b),
-            ("Region 2", self.plot_canvas_c),
-            ("Region 3", self.plot_canvas_d),
-        ):
-            ax_main, _ = self._initialize_fit_canvas(canvas)
-            x_range = region_ranges.get(region_name)
+        if self.is_single_fit_canvas_mode():
+            ax_main, _ = self._initialize_fit_canvas(self.plot_canvas_a)
+            raw_x = np.asarray(getattr(self, "selected_region_x", []), dtype=float)
+            raw_y = np.asarray(getattr(self, "selected_region_y", []), dtype=float)
+            if raw_x.size and raw_y.size:
+                n_points = min(raw_x.size, raw_y.size)
+                ax_main.plot(
+                    raw_x[:n_points],
+                    raw_y[:n_points],
+                    "o",
+                    markersize=getattr(self, "symbol_size", 4),
+                    markerfacecolor="blue",
+                    markeredgecolor="none",
+                )
+            if self.show_edge_lines_enabled():
+                try:
+                    min_wavelength = float(self.min_wavelength_input.text())
+                    max_wavelength = float(self.max_wavelength_input.text())
+                except (AttributeError, TypeError, ValueError):
+                    finite_x = raw_x[np.isfinite(raw_x)]
+                    if finite_x.size:
+                        min_wavelength = float(np.nanmin(finite_x))
+                        max_wavelength = float(np.nanmax(finite_x))
+                    else:
+                        min_wavelength = max_wavelength = np.nan
+                if np.isfinite(min_wavelength) and np.isfinite(max_wavelength) and min_wavelength < max_wavelength:
+                    x_span = max_wavelength - min_wavelength
+                    for hkl, x_hkl in self.get_edges_in_range(min_wavelength, max_wavelength):
+                        ax_main.axvline(x=x_hkl, color="red", linestyle="--")
+                        y_max = ax_main.get_ylim()[1]
+                        ax_main.text(
+                            x_hkl + 0.01 * x_span,
+                            y_max * 0.95,
+                            f"hkl{hkl}",
+                            rotation=90,
+                            verticalalignment="top",
+                            color="red",
+                            fontsize=getattr(self, "plot_font_size", 12),
+                        )
+            x_range = region_ranges.get("Region 3")
             if x_range is not None:
                 xlim = self._xlim_with_margin(x_range[0], x_range[1])
                 if xlim is not None:
                     ax_main.set_xlim(*xlim)
-            ax_main.text(
-                0.98,
-                0.98,
-                region_name,
-                transform=ax_main.transAxes,
-                ha="right",
-                va="top",
-                fontsize=getattr(self, "plot_font_size", 12),
-            )
-            canvas.draw()
+            self.plot_canvas_a.draw()
+        else:
+            for region_name, canvas in (
+                ("Region 1", self.plot_canvas_b),
+                ("Region 2", self.plot_canvas_c),
+                ("Region 3", self.plot_canvas_d),
+            ):
+                ax_main, _ = self._initialize_fit_canvas(canvas)
+                x_range = region_ranges.get(region_name)
+                if x_range is not None:
+                    xlim = self._xlim_with_margin(x_range[0], x_range[1])
+                    if xlim is not None:
+                        ax_main.set_xlim(*xlim)
+                ax_main.text(
+                    0.98,
+                    0.98,
+                    region_name,
+                    transform=ax_main.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=getattr(self, "plot_font_size", 12),
+                )
+                canvas.draw()
 
+        fitted_any = False
+        fit_results = []
+        attempted = 0
+        failed = 0
+        if emit_messages:
+            complete_rows = sum(1 for row in range(max_rows) if self.is_row_complete(row))
+            self._append_fit_message(
+                "[Individual edge fit] Started\n"
+                f"  Edges requested: {complete_rows}"
+            )
         for row in range(max_rows):
             # Check whether this row has all required inputs
             if not self.is_row_complete(row):
@@ -3657,11 +4861,34 @@ class FittingMixin:
                 continue
 
             # If row is valid, do the fit
-            self.message_box.append(f"Fitting for Edge {row + 1}...")
-            self.fit_region(row)
+            attempted += 1
+            result = self.fit_region(
+                row,
+                emit_messages=emit_messages,
+                update_table=update_table,
+                only_update_unfixed=only_update_unfixed,
+            )
+            fitted_any = fitted_any or bool(result)
+            if result:
+                fit_results.append(result)
+                if emit_messages:
+                    self._append_individual_fit_summary(result, row)
+            else:
+                failed += 1
+                if emit_messages:
+                    self._append_fit_message(f"  Edge {row + 1}: failed")
 
-        self.message_box.append("---------- Individual edges fitting completed ----------")   
-        self.fit_all_regions_button.setEnabled(True)
+        if emit_messages:
+            self._append_fit_message(
+                "[Individual edge fit] Completed\n"
+                f"  Succeeded: {len(fit_results)}\n"
+                f"  Failed: {failed}\n"
+                f"  Attempted: {attempted}"
+            )
+        self.set_fit_action_buttons_enabled(True)
+        if not emit_messages:
+            return fit_results
+        return fitted_any
 
     def is_row_complete(self, row_index):
         """
@@ -3708,12 +4935,18 @@ class FittingMixin:
         selected_phase=None,
         structure_type=None,
         lattice_params=None,
+        emit_messages=True,
+        update_table=True,
+        only_update_unfixed=False,
     ):
 
+        draw_plots = not skip_ui_updates
+        emit_messages = bool(emit_messages and draw_plots)
+        update_table = bool(update_table and draw_plots)
         if fit_flags is None:
-            fix_s = self.fix_s_checkbox.isChecked()
-            fix_t = self.fix_t_checkbox.isChecked()
-            fix_eta = self.fix_eta_checkbox.isChecked()
+            fix_s = self.fix_s_enabled()
+            fix_t = self.fix_t_enabled()
+            fix_eta = self.fix_eta_enabled()
         else:
             fix_s, fix_t, fix_eta = fit_flags
         selected_phase = selected_phase if selected_phase is not None else self.phase_dropdown.currentText()
@@ -3723,7 +4956,7 @@ class FittingMixin:
         lattice_params_data = dict(lattice_params if lattice_params is not None else getattr(self, "lattice_params", {}))
         structure_type_data = structure_type if structure_type is not None else getattr(self, "structure_type", "fcc" if is_known_phase else "unknown")
         params_store = {}
-        if not skip_ui_updates:
+        if draw_plots:
             if not hasattr(self, "params_unknown"):
                 self.params_unknown = {}
             params_store = self.params_unknown
@@ -3778,8 +5011,8 @@ class FittingMixin:
                 eta_val = float(self.bragg_table.item(row_number, 10).text())
 
         except Exception as e:
-            if not skip_ui_updates:
-                self.message_box.append(f"Edge {row_number+1} Error: {str(e)}")
+            if emit_messages:
+                self._append_fit_message(f"  Edge {row_number + 1}: setup failed - {e}")
             return
         # -------------------------------------------------
         #  Region 1 Fitting
@@ -3790,12 +5023,11 @@ class FittingMixin:
             y_r1 = intensities_data[mask_r1]
 
             if x_r1.size == 0:
-                if not skip_ui_updates:
-                    self.message_box.append(
-                        f"Edge {row_number + 1} - Region 1: No data in the specified range.")
+                if emit_messages:
+                    self._append_fit_message(f"  Edge {row_number + 1}: Region 1 has no data in range")
                 return
 
-            if not skip_ui_updates:
+            if draw_plots and not self.is_single_fit_canvas_mode():
                 ax_r1_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_c)
                 ax_r1_main.plot(
                     x_r1,
@@ -3813,7 +5045,7 @@ class FittingMixin:
             params_store[row_number, 1] = popt_r1  # (a0, b0)
             fit_y1 = fitting_function_1(x_r1, *popt_r1)
 
-            if not skip_ui_updates:
+            if draw_plots and not self.is_single_fit_canvas_mode():
                 ax_r1_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_c)
                 ax_r1_main.plot(x_r1, fit_y1, 'r-', 
                                              # label=f"Edge {row_number + 1} Fit R1"
@@ -3821,14 +5053,9 @@ class FittingMixin:
                 self._plot_residual_line(self.plot_canvas_c, x_r1, y_r1, fit_y1)
                 # self.plot_canvas_c.axes.legend()
                 self.plot_canvas_c.draw()
-                self.message_box.append(
-                    f"Edge {row_number + 1} - Fitted Region 1: "
-                    f"a0={popt_r1[0]:.6f}, b0={popt_r1[1]:.6f}")
-
         except Exception as e:
-            if not skip_ui_updates:
-                self.message_box.append(
-                    f"Edge {row_number + 1} - Error fitting Region 1: {e}")
+            if emit_messages:
+                self._append_fit_message(f"  Edge {row_number + 1}: Region 1 fit failed - {e}")
             return
 
         # -------------------------------------------------
@@ -3845,12 +5072,11 @@ class FittingMixin:
             y_r2 = intensities_data[mask_r2]
 
             if x_r2.size == 0:
-                if not skip_ui_updates:
-                    self.message_box.append(
-                        f"Edge {row_number + 1} - Region 2: No data in range.")
+                if emit_messages:
+                    self._append_fit_message(f"  Edge {row_number + 1}: Region 2 has no data in range")
                 return
 
-            if not skip_ui_updates:
+            if draw_plots and not self.is_single_fit_canvas_mode():
                 ax_r2_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_b)
                 ax_r2_main.plot(
                     x_r2,
@@ -3869,7 +5095,7 @@ class FittingMixin:
             params_store[row_number, 2] = popt_r2  # (a_hkl, b_hkl)
             fit_y2 = fitting_function_2(x_r2, *popt_r2, a0, b0)
 
-            if not skip_ui_updates:
+            if draw_plots and not self.is_single_fit_canvas_mode():
                 ax_r2_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_b)
                 ax_r2_main.plot(
                     x_r2, fit_y2, 'r-', 
@@ -3878,14 +5104,9 @@ class FittingMixin:
                 self._plot_residual_line(self.plot_canvas_b, x_r2, y_r2, fit_y2)
                 # self.plot_canvas_b.axes.legend()
                 self.plot_canvas_b.draw()
-                self.message_box.append(
-                    f"Edge {row_number + 1} - Fitted Region 2: "
-                    f"a_hkl={popt_r2[0]:.6f}, b_hkl={popt_r2[1]:.6f}")
-
         except Exception as e:
-            if not skip_ui_updates:
-                self.message_box.append(
-                    f"Edge {row_number + 1} - Error fitting Region 2: {e}")
+            if emit_messages:
+                self._append_fit_message(f"  Edge {row_number + 1}: Region 2 fit failed - {e}")
             return
 
         # -------------------------------------------------
@@ -3920,8 +5141,9 @@ class FittingMixin:
             x_r3    = wavelengths_data[mask_r3]
             y_r3    = intensities_data[mask_r3]
 
-            if not skip_ui_updates:
-                ax_r3_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_d)
+            if draw_plots:
+                final_canvas = self._final_fit_canvas()
+                ax_r3_main, _ = self._ensure_fit_canvas_axes(final_canvas)
                 ax_r3_main.plot(
                     x_r3,
                     y_r3,
@@ -4096,18 +5318,27 @@ class FittingMixin:
                     "fit_params": (d_fit, s_fit, t_fit, eta_fit, d_unc, s_unc, t_unc, eta_unc),
                     "edge_height": edge_height,
                     "edge_width": edge_width,
+                    "rms": rms_3,
+                    "baseline_params": {
+                        "a0": a0_fit,
+                        "b0": b0_fit,
+                        "a_hkl": a_hkl_fit,
+                        "b_hkl": b_hkl_fit,
+                    },
                 }
 
             # ---------- live plotting / messages (GUI) -----------
-            if not skip_ui_updates:
-                ax_r3_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_d)
+            if draw_plots:
+                final_canvas = self._final_fit_canvas()
+                ax_r3_main, _ = self._ensure_fit_canvas_axes(final_canvas)
                 ax_r3_main.plot(
                     x_r3, func_r3(x_r3, *popt_3), "r-",
                     # label=f"Edge {hkl} Fit R3"
                 )
-                self._plot_residual_line(self.plot_canvas_d, x_r3, y_r3, y3_fit)
+                self._plot_residual_line(final_canvas, x_r3, y_r3, y3_fit)
                 # self.plot_canvas_d.axes.legend()
-                self.plot_canvas_d.draw()
+                final_canvas.draw()
+            if False and emit_messages:
                 self.message_box.append(
                     f"Edge {row_number + 1} - Fitted Region 1: "
                     f"a0_fit={a0_fit:.6f}, b0={b0_fit:.6f}")
@@ -4131,13 +5362,34 @@ class FittingMixin:
                     f"Edge {hkl} – Fit Results:\n" + "\n".join(msg)
                 )
 
-                # update table cells
-                self._update_cell(row_number, 8,  f"{s_fit:.6f}")
-                self._update_cell(row_number, 9,  f"{t_fit:.6f}")
-                self._update_cell(row_number, 10, f"{eta_fit:.3f}")
+            if update_table:
+                if not only_update_unfixed or not fix_s:
+                    self._update_cell(row_number, 8,  f"{s_fit:.4f}")
+                if not only_update_unfixed or not fix_t:
+                    self._update_cell(row_number, 9,  f"{t_fit:.4f}")
+                if not only_update_unfixed or not fix_eta:
+                    self._update_cell(row_number, 10, f"{eta_fit:.3f}")
+            return {
+                "hkl": hkl,
+                "x": x_r3,
+                "y": y_r3,
+                "fit": y3_fit,
+                "fit_params": (d_fit, s_fit, t_fit, eta_fit, d_unc, s_unc, t_unc, eta_unc),
+                "edge_height": edge_height,
+                "edge_width": edge_width,
+                "rms": rms_3,
+                "baseline_params": {
+                    "a0": a0_fit,
+                    "b0": b0_fit,
+                    "a_hkl": a_hkl_fit,
+                    "b_hkl": b_hkl_fit,
+                },
+            }
 
         except Exception as e:
-            if not skip_ui_updates:
+            if emit_messages:
+                self._append_fit_message(f"  Edge {row_number + 1}: Region 3 fit failed - {e}")
+            if False and emit_messages:
                 self.message_box.append(
                     f"Edge {row_number+1} – Region‑3 Fit Error: {e}"
                 )
@@ -4209,13 +5461,13 @@ class FittingMixin:
         self.remaining_time_timer.start(5000)
 
         if not hasattr(self, 'work_directory'):
-            self.message_box.append("Working directory is not set. Please load FITS images first.")
+            self.message_box.append("Working directory is not set. Please load images first.")
             return
 
-        # Get the state of the fix_s and fix_t checkboxes
-        fix_s = self.fix_s_checkbox.isChecked()
-        fix_t = self.fix_t_checkbox.isChecked()
-        fix_eta = self.fix_eta_checkbox.isChecked()
+        # Get the state of the fix flags from the Bragg table header.
+        fix_s = self.fix_s_enabled()
+        fix_t = self.fix_t_enabled()
+        fix_eta = self.fix_eta_enabled()
         fit_context = self._build_batch_fit_context()
 
         # Start the batch fitting worker
@@ -4309,19 +5561,20 @@ class FittingMixin:
             return f"{seconds}s"
 
     def append_message(self, text):
-        self.message_box.append(text)
+        self._append_batch_message(text)
 
     def batch_fit_finished(self, filename):
         if filename:
-            self.message_box.append("Batch fitting completed.")
+            self._append_fit_message(f"[Batch fit] Completed\n  Results saved to {filename}")
         else:
-            self.message_box.append("Batch fitting completed with errors.")
+            self._append_fit_message("[Batch fit] Completed with errors")
         self.update_timer.stop()
         self.batch_progress_bar.setValue(100)
         self.batch_remaining_time_label.setText("Remaining: ")
         self.batch_progress_dialog.hide()
 
     def visualize_region3_fits(self):
+        return
         """
         Visualize the full-pattern fit (formerly "Region 3 fit") at user-specified positions.
         This takes bounding boxes around each (x_center, y_center) and calls fit_full_pattern_core.
@@ -4372,9 +5625,9 @@ class FittingMixin:
             self.message_box.append("Please enter valid min and max wavelengths.")
             return
 
-        fix_s = self.fix_s_checkbox.isChecked()
-        fix_t = self.fix_t_checkbox.isChecked()
-        fix_eta = self.fix_eta_checkbox.isChecked()
+        fix_s = self.fix_s_enabled()
+        fix_t = self.fix_t_enabled()
+        fix_eta = self.fix_eta_enabled()
 
         image_height, image_width = self.images[0].shape
 
@@ -4570,15 +5823,26 @@ class FittingMixin:
             if changed:
                 canvas.draw_idle()
 
+    def show_edge_lines_enabled(self):
+        """Return whether theoretical edge guide lines should be shown."""
+        action = getattr(self, "show_edge_line_action", None)
+        if action is not None:
+            return action.isChecked()
+        return bool(getattr(self, "show_edge_line", True))
+
     def increase_plot_font_size(self):
         """Shortcut handler to increase plot font."""
         if self.plot_font_size < 48:
             self.plot_font_size += 1
             self.update_plot_font_size(self.plot_font_size)
+            if hasattr(self, "save_user_settings"):
+                self.save_user_settings()
 
     def decrease_plot_font_size(self):
         """Shortcut handler to decrease plot font."""
         if self.plot_font_size > 6:
             self.plot_font_size -= 1
             self.update_plot_font_size(self.plot_font_size)
+            if hasattr(self, "save_user_settings"):
+                self.save_user_settings()
 

@@ -501,6 +501,121 @@ class PreprocessingMixin:
         """Clears the messages in the message box."""
         self.preproc_message_box.clear()
 
+    def clear_loaded_preprocessing_images(self):
+        """Release loaded preprocessing image data from all preprocessing sections."""
+        active_workers = []
+        for attr in (
+            "full_process_worker",
+            "outlier_worker",
+            "overlap_correction_worker",
+            "summation_worker",
+            "normalisation_worker",
+            "filtering_worker",
+            "outlier_image_load_worker",
+            "overlap_correction_image_load_worker",
+            "summation_image_load_worker",
+            "normalisation_data_load_worker",
+            "open_beam_load_worker",
+            "filtering_data_load_worker",
+            "_outlier_data_load_worker",
+            "_overlap_data_load_worker",
+            "_lazy_load_worker_3",
+            "_lazy_load_worker_2",
+            "_data_load_worker",
+        ):
+            worker = getattr(self, attr, None)
+            if worker is not None and hasattr(worker, "isRunning") and worker.isRunning():
+                active_workers.append(attr)
+
+        if active_workers:
+            QMessageBox.warning(
+                self,
+                "Preprocessing Active",
+                "Stop the active preprocessing job before clearing loaded images.",
+            )
+            return
+
+        def _count_run_images(value):
+            if isinstance(value, list):
+                return sum(_count_run_images(item) for item in value)
+            if isinstance(value, dict):
+                images = value.get("images")
+                if isinstance(images, dict):
+                    return len(images)
+                if images is not None:
+                    return 1
+            return 0
+
+        image_run_attrs = (
+            "summation_image_runs",
+            "scaling_image_runs",
+            "normalisation_image_runs",
+            "normalisation_open_beam_runs",
+            "stack_image_runs",
+            "overlap_correction_image_runs",
+            "filter_image_runs",
+            "outlier_image_runs",
+            "filtering_image_runs",
+            "open_beam_runs",
+            "_normalisation_batch_runs",
+        )
+        cleared_images = 0
+        for attr in image_run_attrs:
+            value = getattr(self, attr, None)
+            cleared_images += _count_run_images(value)
+            if value is not None:
+                setattr(self, attr, [])
+
+        for attr in (
+            "_open_beam_run",
+            "_current_loaded_run",
+            "_current_outlier_run",
+            "_current_overlap_run",
+            "_combined_run_2",
+            "_combined_run_3",
+        ):
+            value = getattr(self, attr, None)
+            cleared_images += _count_run_images(value)
+            if value is not None:
+                setattr(self, attr, None)
+
+        if getattr(self, "filtering_mask_image", None) is not None:
+            cleared_images += 1
+            self.filtering_mask_image = None
+
+        for progress_attr in (
+            "summation_load_progress",
+            "summation_progress",
+            "outlier_load_progress",
+            "outlier_progress",
+            "overlap_correction_load_progress",
+            "overlap_correction_progress",
+            "normalisation_load_progress",
+            "normalisation_progress",
+            "filtering_load_progress",
+            "filtering_progress",
+            "full_process_load_progress",
+            "full_process_progress",
+        ):
+            progress = getattr(self, progress_attr, None)
+            if progress is not None:
+                progress.setValue(0)
+
+        if hasattr(self, "summation_sum_button"):
+            self.summation_sum_button.setEnabled(False)
+
+        for dialog in getattr(self, "open_beam_plot_dialogs", []):
+            try:
+                dialog.close()
+            except Exception:
+                pass
+        self.open_beam_plot_dialogs = []
+
+        gc.collect()
+        self.preproc_message_box.append(
+            f"Cleared loaded preprocessing images ({cleared_images} image entries released)."
+        )
+
     def save_messages(self):
         """Saves the messages in the message box to a text file."""
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Messages", "", "Text Files (*.txt);;All Files (*)")

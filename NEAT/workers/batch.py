@@ -359,6 +359,7 @@ class BatchFitEdgesWorker(QThread):
             ("box_height", self.box_height),
             ("step_x", self.step_x),
             ("step_y", self.step_y),
+            ("interpolation", self.interpolation_enabled),
             ("roi_x_min", self.min_x),
             ("roi_x_max", self.max_x),
             ("roi_y_min", self.min_y),
@@ -479,6 +480,7 @@ class BatchFitEdgesWorker(QThread):
             ("box_height", self.box_height),
             ("step_x", self.step_x),
             ("step_y", self.step_y),
+            ("interpolation", self.interpolation_enabled),
             ("roi_x_min", self.min_x),
             ("roi_x_max", self.max_x),
             ("roi_y_min", self.min_y),
@@ -1005,6 +1007,7 @@ class BatchFitWorker(QThread):
             ("box_height", self.box_height),
             ("step_x", self.step_x),
             ("step_y", self.step_y),
+            ("interpolation", self.interpolation_enabled),
             ("roi_x_min", self.min_x),
             ("roi_x_max", self.max_x),
             ("roi_y_min", self.min_y),
@@ -1102,6 +1105,7 @@ class BatchFitWorker(QThread):
             ("box_height", self.box_height),
             ("step_x", self.step_x),
             ("step_y", self.step_y),
+            ("interpolation", self.interpolation_enabled),
             ("roi_x_min", self.min_x),
             ("roi_x_max", self.max_x),
             ("roi_y_min", self.min_y),
@@ -1218,7 +1222,7 @@ class ImageLoadWorker(QThread):
                 if f.lower().endswith(('.fits', '.fit', '.tiff', '.tif'))
             ]
             if not fits_files:
-                self.message.emit(f"No FITS files found in folder: \\{short_path}")
+                self.message.emit(f"No image files found in folder: \\{short_path}")
                 return
 
             # Sort files to ensure suffixes are aligned
@@ -1272,7 +1276,7 @@ class ImageLoadWorker(QThread):
                 self.progress_updated.emit(progress)
 
             if not run_dict:
-                self.message.emit(f"No FITS/TIFF images with numeric suffixes were found in folder: {self.folder_path}")
+                self.message.emit(f"No image files with numeric suffixes were found in folder: {self.folder_path}")
             else:
                 self.message.emit(f"Successfully loaded {len(run_dict)} images from \\{short_path}")
                 # Emit both folder_path and run_dict
@@ -1322,7 +1326,7 @@ class OpenBeamLoadWorker(QThread):
                 if f.lower().endswith(('.fits', '.fit', '.tiff', '.tif'))
             ]
             if not fits_files:
-                self.message.emit(f"No FITS files found in folder: \\{short_path}")
+                self.message.emit(f"No image files found in folder: \\{short_path}")
                 self.finished.emit()
                 return
 

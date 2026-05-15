@@ -247,6 +247,19 @@ class PostProcessingMixin:
             )
             dlg.show()
 
+    def clear_postprocessing_results(self):
+        """Clear loaded CSV result data and reset the post-processing UI."""
+        self.csv_data = None
+        self.current_csv_metadata = {}
+        self.current_csv_filename = ""
+        self.current_image_metadata = {}
+        self.metadata_display.clear()
+
+        for button in self.parameter_buttons.values():
+            button.setParent(None)
+        self.parameter_buttons.clear()
+        self.parameter_scroll_area.setWidget(self.parameter_widget)
+
     def create_parameter_buttons(self):
         """
         Dynamically creates buttons for each parameter available in the CSV data.

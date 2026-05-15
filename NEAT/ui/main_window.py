@@ -43,10 +43,10 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QAbstractItemView,
     QSizePolicy,
-    QShortcut,
+    QAction,
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl
-from PyQt5.QtGui import QDesktopServices, QFont, QKeySequence
+from PyQt5.QtGui import QDesktopServices, QFont
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.patches import Rectangle
 from scipy.optimize import curve_fit, least_squares
@@ -145,6 +145,9 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
 
         # Create a tab widget
         self.tabs = QTabWidget()
+        self.tabs.setTabPosition(QTabWidget.West)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.currentChanged.connect(self.on_main_tab_changed)
         main_layout = QVBoxLayout(self.central_widget)
         main_layout.addWidget(self.tabs)
 
@@ -160,9 +163,6 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.PostProcessingTab = QWidget()
         self.tabs.addTab(self.PostProcessingTab, "Data Post-Processing")
         
-        self.tab3 = QWidget()
-        self.tabs.addTab(self.tab3, "About")
-        
         # Set up the layout for Preprocessing tab
         self.setup_preprocessing_tab()
 
@@ -171,11 +171,10 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         
         # Set up the layout for PostProcessingTab (Data Post-Processing)
         self.setup_PostProcessingTab()
-        
-        self.setup_about_tab()
+        self.setup_menu_bar()
 
         # Variables for storing image data and auto-adjust parameters
-        self.images = []  # To store multiple FITS images
+        self.images = []  # To store multiple image frames
         self.current_image_index = 0
         self.selected_area = None  # Stores (xmin, xmax, ymin, ymax)
         self.auto_vmin, self.auto_vmax = None, None
@@ -264,13 +263,6 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         # Set initial global font and Matplotlib settings
         self.setGlobalFont()
         
-        # Create shortcuts to adjust font size
-        shortcutIncrease = QShortcut(QKeySequence("Shift+Up"), self)
-        shortcutIncrease.activated.connect(self.increaseFontSize)
-        
-        shortcutDecrease = QShortcut(QKeySequence("Shift+Down"), self)
-        shortcutDecrease.activated.connect(self.decreaseFontSize)
-
         QTimer.singleShot(1500, self.maybe_check_for_updates_on_startup)
 
     def setGlobalFont(self):
@@ -287,10 +279,18 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         # mpl.rcParams['figure.dpi'] = 100 * self.scale_factor
         # Update the font for all existing widgets
         update_all_widget_fonts(global_font)
+        message_box = getattr(self, "message_box", None)
+        if message_box is not None:
+            message_box.setFont(global_font)
+            message_box.setStyleSheet(
+                "QTextEdit { font-family: Arial; font-size: %dpt; }"
+                % int(self.gui_font_size)
+            )
 
     def increaseFontSize(self):
         self.gui_font_size += 1
         self.setGlobalFont()
+        self.save_user_settings()
         print("Font size increased to", self.gui_font_size)
 
     def decreaseFontSize(self):
@@ -298,7 +298,333 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         if self.gui_font_size > 1:
             self.gui_font_size -= 1
             self.setGlobalFont()
+            self.save_user_settings()
             print("Font size decreased to", self.gui_font_size)
+
+    def setup_menu_bar(self):
+        """Create a context-sensitive menu bar for the active workflow tab."""
+        self._menu_bar_ready = True
+        self.refresh_menu_bar_for_current_tab()
+
+    def refresh_menu_bar_for_current_tab(self):
+        """Rebuild the native menu bar so it matches the active top-level tab."""
+        if not getattr(self, "_menu_bar_ready", False):
+            return
+
+        menu_bar = self.menuBar()
+        menu_bar.clear()
+        self.show_edge_line_action = None
+        self.live_fit_preview_action = None
+        self.fitting_plot_layout_action = None
+        self.update_check_startup_action = None
+
+        current_widget = self.tabs.currentWidget() if hasattr(self, "tabs") else None
+        if current_widget is self.FittingTab:
+            self._build_fitting_menu_bar(menu_bar)
+        elif current_widget is self.PostProcessingTab:
+            self._build_postprocessing_menu_bar(menu_bar)
+        else:
+            self._build_preprocessing_menu_bar(menu_bar)
+
+        self._add_about_menu(menu_bar)
+
+    def _build_preprocessing_menu_bar(self, menu_bar):
+        file_menu = menu_bar.addMenu("File")
+        clear_loaded_images_action = QAction("Clear Loaded Images", self)
+        clear_loaded_images_action.triggered.connect(self.clear_loaded_preprocessing_images)
+        file_menu.addAction(clear_loaded_images_action)
+
+        clear_messages_action = QAction("Clear Messages", self)
+        clear_messages_action.triggered.connect(self.clear_messages)
+        file_menu.addAction(clear_messages_action)
+        self._add_exit_action(file_menu)
+
+        view_menu = menu_bar.addMenu("View")
+        self._add_ui_font_actions(view_menu)
+
+    def _build_fitting_menu_bar(self, menu_bar):
+        file_menu = menu_bar.addMenu("File")
+        load_images_action = QAction("Load Images...", self)
+        load_images_action.setShortcut("Ctrl+O")
+        load_images_action.triggered.connect(self.load_fits_images)
+        file_menu.addAction(load_images_action)
+
+        clear_images_action = QAction("Clear Images", self)
+        clear_images_action.triggered.connect(self.clear_loaded_fits_images)
+        file_menu.addAction(clear_images_action)
+
+        load_fitting_config_action = QAction("Load Fitting Configuration...", self)
+        load_fitting_config_action.triggered.connect(self.open_load_fitting_configuration_from_menu)
+        file_menu.addAction(load_fitting_config_action)
+
+        save_fitting_config_action = QAction("Save Fitting Configuration...", self)
+        save_fitting_config_action.triggered.connect(self.open_save_fitting_configuration_from_menu)
+        file_menu.addAction(save_fitting_config_action)
+
+        export_profile_action = QAction("Export Intensity Profile...", self)
+        export_profile_action.triggered.connect(self.export_data)
+        file_menu.addAction(export_profile_action)
+        self._add_exit_action(file_menu)
+
+        setting_menu = menu_bar.addMenu("Setting")
+        fitting_config_action = QAction("Instrument Setting...", self)
+        fitting_config_action.triggered.connect(self.open_fitting_config_from_menu)
+        setting_menu.addAction(fitting_config_action)
+
+        manual_spectra_action = QAction("Manual Spectra Setting...", self)
+        manual_spectra_action.triggered.connect(self.open_manual_spectra_setting_from_menu)
+        setting_menu.addAction(manual_spectra_action)
+
+        phase_management_action = QAction("Phase Management...", self)
+        phase_management_action.triggered.connect(self.open_phase_management_from_menu)
+        setting_menu.addAction(phase_management_action)
+
+        view_menu = menu_bar.addMenu("View")
+        self.show_edge_line_action = QAction("Show Edge Line", self)
+        self.show_edge_line_action.setCheckable(True)
+        self.show_edge_line_action.setChecked(bool(getattr(self, "show_edge_line", True)))
+        self.show_edge_line_action.toggled.connect(self.on_show_edge_line_toggled)
+        view_menu.addAction(self.show_edge_line_action)
+
+        self.live_fit_preview_action = QAction("Live Fit Preview", self)
+        self.live_fit_preview_action.setCheckable(True)
+        self.live_fit_preview_action.setChecked(
+            bool(getattr(self, "live_fit_preview_enabled", True))
+        )
+        self.live_fit_preview_action.toggled.connect(self.on_live_fit_preview_toggled)
+        view_menu.addAction(self.live_fit_preview_action)
+
+        self.fitting_plot_layout_action = QAction("Four Fit Canvases", self)
+        self.fitting_plot_layout_action.setCheckable(True)
+        self.fitting_plot_layout_action.setChecked(
+            getattr(self, "fitting_plot_layout_mode", "single") == "quad"
+        )
+        self.fitting_plot_layout_action.toggled.connect(self.on_fitting_plot_layout_toggled)
+        view_menu.addAction(self.fitting_plot_layout_action)
+        view_menu.addSeparator()
+
+        auto_adjust_action = QAction("Auto Adjust", self)
+        auto_adjust_action.triggered.connect(self.open_auto_adjust_from_menu)
+        view_menu.addAction(auto_adjust_action)
+
+        manual_adjust_action = QAction("Manual Adjust...", self)
+        manual_adjust_action.triggered.connect(self.open_manual_adjust_from_menu)
+        view_menu.addAction(manual_adjust_action)
+        view_menu.addSeparator()
+
+        symbol_size_action = QAction("Symbol Size...", self)
+        symbol_size_action.triggered.connect(self.open_symbol_size_dialog)
+        view_menu.addAction(symbol_size_action)
+
+        self._add_ui_font_actions(view_menu)
+        view_menu.addSeparator()
+        self._add_canvas_font_actions(view_menu)
+
+    def _build_postprocessing_menu_bar(self, menu_bar):
+        file_menu = menu_bar.addMenu("File")
+        load_csv_action = QAction("Load Post-processing CSV...", self)
+        load_csv_action.setShortcut("Ctrl+O")
+        load_csv_action.triggered.connect(self.open_postprocessing_csv_from_menu)
+        file_menu.addAction(load_csv_action)
+
+        load_image_action = QAction("Load Image Result...", self)
+        load_image_action.triggered.connect(self.open_image_result_from_menu)
+        file_menu.addAction(load_image_action)
+
+        clear_results_action = QAction("Clear Results", self)
+        clear_results_action.triggered.connect(self.clear_postprocessing_results_from_menu)
+        file_menu.addAction(clear_results_action)
+        self._add_exit_action(file_menu)
+
+        view_menu = menu_bar.addMenu("View")
+        self._add_ui_font_actions(view_menu)
+
+    def _add_ui_font_actions(self, menu):
+        increase_font_action = QAction("Increase UI Font", self)
+        increase_font_action.setShortcut("Shift+Up")
+        increase_font_action.triggered.connect(self.increaseFontSize)
+        menu.addAction(increase_font_action)
+
+        decrease_font_action = QAction("Decrease UI Font", self)
+        decrease_font_action.setShortcut("Shift+Down")
+        decrease_font_action.triggered.connect(self.decreaseFontSize)
+        menu.addAction(decrease_font_action)
+
+    def _add_canvas_font_actions(self, menu):
+        increase_plot_font_action = QAction("Increase Canvas Font", self)
+        increase_plot_font_action.setShortcut("Ctrl+Up")
+        increase_plot_font_action.triggered.connect(self.increase_plot_font_size)
+        menu.addAction(increase_plot_font_action)
+
+        decrease_plot_font_action = QAction("Decrease Canvas Font", self)
+        decrease_plot_font_action.setShortcut("Ctrl+Down")
+        decrease_plot_font_action.triggered.connect(self.decrease_plot_font_size)
+        menu.addAction(decrease_plot_font_action)
+
+    def _add_exit_action(self, menu):
+        menu.addSeparator()
+        exit_action = QAction("Exit", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+        menu.addAction(exit_action)
+
+    def _add_about_menu(self, menu_bar):
+        about_menu = menu_bar.addMenu("About")
+        about_action = QAction("About NEAT", self)
+        about_action.triggered.connect(self.show_about_dialog)
+        about_menu.addAction(about_action)
+
+        self.update_check_startup_action = QAction("Check for Updates on Startup", self)
+        self.update_check_startup_action.setCheckable(True)
+        self.update_check_startup_action.setChecked(
+            bool(getattr(self, "check_updates_on_startup", True))
+        )
+        self.update_check_startup_action.toggled.connect(self.on_update_check_startup_toggled)
+        about_menu.addAction(self.update_check_startup_action)
+
+        check_updates_action = QAction("Check for Updates Now", self)
+        check_updates_action.triggered.connect(self.check_for_updates_now)
+        about_menu.addAction(check_updates_action)
+        about_menu.addSeparator()
+
+        user_manual_action = QAction("User Manual", self)
+        user_manual_action.triggered.connect(self.open_user_manual)
+        about_menu.addAction(user_manual_action)
+
+        github_action = QAction("GitHub Repository", self)
+        github_action.triggered.connect(self.open_github_repository)
+        about_menu.addAction(github_action)
+
+        video_action = QAction("Video Tutorials", self)
+        video_action.triggered.connect(self.open_video_tutorials)
+        about_menu.addAction(video_action)
+
+    def open_postprocessing_csv_from_menu(self):
+        self.tabs.setCurrentWidget(self.PostProcessingTab)
+        self.load_csv_file()
+
+    def open_image_result_from_menu(self):
+        self.tabs.setCurrentWidget(self.PostProcessingTab)
+        self.load_image_results()
+
+    def clear_postprocessing_results_from_menu(self):
+        self.tabs.setCurrentWidget(self.PostProcessingTab)
+        self.clear_postprocessing_results()
+
+    def open_fitting_config_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        self.open_general_settings_dialog()
+
+    def open_manual_spectra_setting_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        self.open_manual_spectra_settings_dialog()
+
+    def open_load_fitting_configuration_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        self.load_fitting_configuration_from_csv()
+
+    def open_save_fitting_configuration_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        self.save_fitting_configuration_to_csv()
+
+    def open_auto_adjust_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        self.auto_adjust()
+
+    def open_manual_adjust_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        self.open_adjustments_dialog()
+
+    def open_phase_management_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        self.open_add_phase_dialog()
+
+    def open_symbol_size_dialog(self):
+        value, ok = QInputDialog.getInt(
+            self,
+            "Symbol Size",
+            "Symbol Size:",
+            int(getattr(self, "symbol_size", 4)),
+            1,
+            20,
+            1,
+        )
+        if not ok:
+            return
+        self.symbol_size = value
+        self.apply_symbol_size()
+        if getattr(self, "intensities", None) is not None and len(self.intensities) > 0:
+            self.update_plots()
+        self.save_user_settings()
+
+    def open_user_manual(self):
+        QDesktopServices.openUrl(
+            QUrl("https://github.com/RayZhang2024/NEAT/blob/main/User%20manual.md")
+        )
+
+    def open_github_repository(self):
+        QDesktopServices.openUrl(QUrl("https://github.com/RayZhang2024/NEAT"))
+
+    def open_video_tutorials(self):
+        QDesktopServices.openUrl(QUrl("https://www.youtube.com/@RayOnNeutrons"))
+
+    def show_about_dialog(self):
+        QMessageBox.about(
+            self,
+            "About NEAT",
+            (
+                f"<h2>NEAT Neutron Bragg Edge Analysis Toolkit v{self.app_version}</h2>"
+                "<p><b>Developed by:</b><br>"
+                "Engineering and imaging group<br>"
+                "ISIS Neutron and Muon Source<br>"
+                "Rutherford Appleton Laboratory</p>"
+                "<p><b>Main authors:</b><br>"
+                "Ruiyao Zhang (ruiyao.zhang@stfc.ac.uk)<br>"
+                "Ranggi Ramadhan (ranggi.ramadhan@stfc.ac.uk)</p>"
+                "<p><b>Project resources:</b><br>"
+                "Use the About menu to open the user manual, GitHub repository, "
+                "video tutorials, or check for updates.</p>"
+            ),
+        )
+
+    def sync_update_check_controls(self):
+        checked = bool(getattr(self, "check_updates_on_startup", True))
+        for control in (
+            getattr(self, "update_check_startup_checkbox", None),
+            getattr(self, "update_check_startup_action", None),
+        ):
+            if control is None:
+                continue
+            control.blockSignals(True)
+            control.setChecked(checked)
+            control.blockSignals(False)
+
+    def sync_show_edge_line_controls(self):
+        checked = bool(getattr(self, "show_edge_line", True))
+        action = getattr(self, "show_edge_line_action", None)
+        if action is None:
+            return
+        action.blockSignals(True)
+        action.setChecked(checked)
+        action.blockSignals(False)
+
+    def sync_live_fit_preview_controls(self):
+        checked = bool(getattr(self, "live_fit_preview_enabled", True))
+        action = getattr(self, "live_fit_preview_action", None)
+        if action is None:
+            return
+        action.blockSignals(True)
+        action.setChecked(checked)
+        action.blockSignals(False)
+
+    def sync_fitting_plot_layout_controls(self):
+        checked = getattr(self, "fitting_plot_layout_mode", "single") == "quad"
+        action = getattr(self, "fitting_plot_layout_action", None)
+        if action is None:
+            return
+        action.blockSignals(True)
+        action.setChecked(checked)
+        action.blockSignals(False)
 
     def get_edges_in_range(self, min_wavelength, max_wavelength):
         """
@@ -606,46 +932,46 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             # region 1 might be a small offset above x_hkl, etc.
             # ---------------------------------------------
             r1_min = x_hkl * 1.04
-            r1_min_item = QTableWidgetItem(f"{r1_min:.4f}")
+            r1_min_item = QTableWidgetItem(f"{r1_min:.2f}")
             r1_min_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 4, r1_min_item)
     
             r1_max = min(x_hkl * 1.12, x_hkl + 0.4)
-            r1_max_item = QTableWidgetItem(f"{r1_max:.4f}")
+            r1_max_item = QTableWidgetItem(f"{r1_max:.2f}")
             r1_max_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 5, r1_max_item)
     
             # Region 2
             r2_min = max(x_hkl * 0.90, x_hkl - 0.3)
-            r2_min_item = QTableWidgetItem(f"{r2_min:.4f}")
+            r2_min_item = QTableWidgetItem(f"{r2_min:.2f}")
             r2_min_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 2, r2_min_item)
     
             r2_max = x_hkl * 0.98
-            r2_max_item = QTableWidgetItem(f"{r2_max:.4f}")
+            r2_max_item = QTableWidgetItem(f"{r2_max:.2f}")
             r2_max_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 3, r2_max_item)
     
             # Region 3
             r3_min = r2_min
-            r3_min_item = QTableWidgetItem(f"{r3_min:.4f}")
+            r3_min_item = QTableWidgetItem(f"{r3_min:.2f}")
             r3_min_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 6, r3_min_item)
     
             r3_max = r1_max
-            r3_max_item = QTableWidgetItem(f"{r3_max:.4f}")
+            r3_max_item = QTableWidgetItem(f"{r3_max:.2f}")
             r3_max_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 7, r3_max_item)
     
             # s parameter
             s = 0.001
-            s_item = QTableWidgetItem(f"{s:.5f}")
+            s_item = QTableWidgetItem(f"{s:.4f}")
             s_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 8, s_item)
     
             # t parameter
             t = 0.01
-            t_item = QTableWidgetItem(f"{t:.5f}")
+            t_item = QTableWidgetItem(f"{t:.4f}")
             t_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 9, t_item)
             
@@ -864,7 +1190,37 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
     def on_update_check_startup_toggled(self, checked):
         """Apply preference from About tab checkbox."""
         self.check_updates_on_startup = bool(checked)
+        self.sync_update_check_controls()
         self.save_user_settings()
+
+    def on_show_edge_line_toggled(self, checked):
+        """Apply theoretical edge line visibility from the Setting menu."""
+        self.show_edge_line = bool(checked)
+        self.sync_show_edge_line_controls()
+        if hasattr(self, "update_plots"):
+            self.update_plots()
+        self.save_user_settings()
+
+    def on_live_fit_preview_toggled(self, checked):
+        """Apply live fit preview visibility from the View menu."""
+        self.live_fit_preview_enabled = bool(checked)
+        self.sync_live_fit_preview_controls()
+        self.save_user_settings()
+
+    def on_fitting_plot_layout_toggled(self, checked):
+        """Apply fitting plot layout from the View menu."""
+        mode = "quad" if checked else "single"
+        if hasattr(self, "set_fitting_plot_layout_mode"):
+            self.set_fitting_plot_layout_mode(mode, refresh_plots=True)
+        else:
+            self.fitting_plot_layout_mode = mode
+            self.sync_fitting_plot_layout_controls()
+        self.save_user_settings()
+
+    def on_main_tab_changed(self, index):
+        """Track the active top-level tab for next launch."""
+        self.last_open_tab_index = int(index)
+        self.refresh_menu_bar_for_current_tab()
 
     def check_for_updates_now(self):
         """Manual update-check action from UI."""
@@ -986,12 +1342,32 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.min_wavelength_input.setText(str(wavelength.get("min", self.min_wavelength_input.text())))
         self.max_wavelength_input.setText(str(wavelength.get("max", self.max_wavelength_input.text())))
 
-        self.fix_s_checkbox.setChecked(data.get("fix_s", self.fix_s_checkbox.isChecked()))
-        self.fix_t_checkbox.setChecked(data.get("fix_t", self.fix_t_checkbox.isChecked()))
-        self.fix_eta_checkbox.setChecked(data.get("fix_eta", self.fix_eta_checkbox.isChecked()))
+        self.set_fix_parameter_state("s", data.get("fix_s", self.fix_s_enabled()))
+        self.set_fix_parameter_state("t", data.get("fix_t", self.fix_t_enabled()))
+        self.set_fix_parameter_state("eta", data.get("fix_eta", self.fix_eta_enabled()))
         self.symbol_size = data.get("symbol_size", getattr(self, "symbol_size", 4))
         if hasattr(self, "apply_symbol_size"):
             self.apply_symbol_size()
+        self.show_edge_line = bool(data.get("show_edge_line", getattr(self, "show_edge_line", True)))
+        self.sync_show_edge_line_controls()
+        self.live_fit_preview_enabled = bool(
+            data.get("live_fit_preview_enabled", getattr(self, "live_fit_preview_enabled", True))
+        )
+        self.sync_live_fit_preview_controls()
+        fitting_plot_layout_mode = data.get(
+            "fitting_plot_layout_mode",
+            getattr(self, "fitting_plot_layout_mode", "single"),
+        )
+        if hasattr(self, "set_fitting_plot_layout_mode"):
+            self.set_fitting_plot_layout_mode(fitting_plot_layout_mode, refresh_plots=False)
+        else:
+            self.fitting_plot_layout_mode = fitting_plot_layout_mode
+            self.sync_fitting_plot_layout_controls()
+        if hasattr(self, "tabs"):
+            tab_index = int(data.get("last_open_tab_index", getattr(self, "last_open_tab_index", 0)))
+            tab_index = max(0, min(tab_index, self.tabs.count() - 1))
+            self.last_open_tab_index = tab_index
+            self.tabs.setCurrentIndex(tab_index)
 
         manual_range = data.get("manual_wavelength", {})
         anchors = manual_range.get("anchors")
@@ -1022,10 +1398,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.ignored_update_version = str(
             updates.get("ignored_version", self.ignored_update_version)
         )
-        if hasattr(self, "update_check_startup_checkbox"):
-            self.update_check_startup_checkbox.blockSignals(True)
-            self.update_check_startup_checkbox.setChecked(self.check_updates_on_startup)
-            self.update_check_startup_checkbox.blockSignals(False)
+        self.sync_update_check_controls()
 
     def save_user_settings(self):
         """Persist key GUI parameters to disk."""
@@ -1045,10 +1418,14 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
                 "min": self.min_wavelength_input.text(),
                 "max": self.max_wavelength_input.text(),
             },
-            "fix_s": self.fix_s_checkbox.isChecked(),
-            "fix_t": self.fix_t_checkbox.isChecked(),
-            "fix_eta": self.fix_eta_checkbox.isChecked(),
+            "fix_s": self.fix_s_enabled(),
+            "fix_t": self.fix_t_enabled(),
+            "fix_eta": self.fix_eta_enabled(),
             "symbol_size": getattr(self, "symbol_size", 4),
+            "show_edge_line": bool(getattr(self, "show_edge_line", True)),
+            "live_fit_preview_enabled": bool(getattr(self, "live_fit_preview_enabled", True)),
+            "fitting_plot_layout_mode": getattr(self, "fitting_plot_layout_mode", "single"),
+            "last_open_tab_index": self.tabs.currentIndex() if hasattr(self, "tabs") else 0,
             "manual_wavelength": {
                 "mode": getattr(self, "manual_anchor_mode", "wavelength"),
                 "anchors": getattr(self, "manual_wavelength_anchors", []),
