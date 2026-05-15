@@ -68,6 +68,7 @@ from ...workers.batch import (
 )
 from ..dialogs import (
     AdjustmentsDialog,
+    FitVisualizationDialog,
     MplCanvas,
     OpenBeamPlotDialog,
 )
