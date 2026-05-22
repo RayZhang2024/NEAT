@@ -9,9 +9,10 @@ import numpy as np
 import pandas as pd
 import psutil
 from astropy.io import fits
+from PIL import Image, TiffImagePlugin
 from PyQt5.QtCore import Qt, QEventLoop, QThread, pyqtSignal
 
-from .batch import load_image_file
+from .batch import get_raden_tiff_stack_info, load_image_file
 
 class OutlierFilteringWorker(QThread):
     progress_updated = pyqtSignal(int)
@@ -1549,11 +1550,197 @@ class FilteringWorker(QThread):
         except Exception as e:
             self.message.emit(f"Error copying related files: {e}")
 
+class RadenNormalisationWorker(QThread):
+    progress_updated = pyqtSignal(int)
+    finished = pyqtSignal()
+    message = pyqtSignal(str)
+
+    def __init__(
+        self,
+        sample_run,
+        open_beam_run,
+        output_folder,
+        base_name,
+        window_half,
+        adjacent_sum,
+    ):
+        super().__init__()
+        self.sample_run = sample_run
+        self.open_beam_run = open_beam_run
+        self.output_folder = output_folder
+        self.base_name = base_name
+        self.window_half = int(window_half)
+        self.adjacent_sum = int(adjacent_sum)
+        self._is_running = True
+
+    @staticmethod
+    def _pulse_count(info):
+        meta = info.get("axes", {}).get("meta", {})
+        for key in ("pulses_with_data", "pulses"):
+            value = meta.get(key)
+            if value is not None and np.isfinite(value) and value > 0:
+                return float(value)
+        return None
+
+    @staticmethod
+    def _read_frame(tiff, index):
+        tiff.seek(index)
+        frame = np.array(tiff, dtype=np.float32, copy=True)
+        np.nan_to_num(frame, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        return frame
+
+    @staticmethod
+    def _same_tof_axis(sample_info, open_beam_info):
+        sample_tof = sample_info.get("axes", {}).get("tof", {})
+        open_beam_tof = open_beam_info.get("axes", {}).get("tof", {})
+        for key in ("bins", "min", "max"):
+            try:
+                if not np.isclose(float(sample_tof[key]), float(open_beam_tof[key])):
+                    return False
+            except (KeyError, TypeError, ValueError):
+                return False
+        return str(sample_tof.get("units", "")).lower() == str(open_beam_tof.get("units", "")).lower()
+
+    def _validate(self, sample_info, open_beam_info):
+        if int(sample_info["n_frames"]) != int(open_beam_info["n_frames"]):
+            raise ValueError(
+                f"Frame count mismatch: sample={sample_info['n_frames']}, open beam={open_beam_info['n_frames']}."
+            )
+        if tuple(sample_info["image_shape"]) != tuple(open_beam_info["image_shape"]):
+            raise ValueError(
+                f"Image shape mismatch: sample={sample_info['image_shape']}, open beam={open_beam_info['image_shape']}."
+            )
+        if not self._same_tof_axis(sample_info, open_beam_info):
+            raise ValueError("Sample and open-beam RADEN TOF axes do not match.")
+
+    def _normalise_frame(self, sample_frame, open_beam_sum, frame_count, scale):
+        window_half = self.window_half
+        full_win = (2 * window_half + 1) ** 2
+        thresh = 1e-7
+
+        if sample_frame.shape != open_beam_sum.shape:
+            raise ValueError("sample/open-beam frame shape mismatch")
+        height, width = sample_frame.shape
+        if height < 2 * window_half + 1 or width < 2 * window_half + 1:
+            raise ValueError("frame is too small for the selected spatial window")
+
+        integral = open_beam_sum.cumsum(0).cumsum(1)
+        integral = np.pad(integral, ((1, 0), (1, 0)), "constant")
+        counts = np.pad(np.ones_like(sample_frame).cumsum(0).cumsum(1), ((1, 0), (1, 0)), "constant")
+
+        rows, cols = np.ogrid[:height, :width]
+        r0, r1 = rows - window_half, rows + window_half + 1
+        c0, c1 = cols - window_half, cols + window_half + 1
+        r0, r1 = np.clip(r0, 0, height), np.clip(r1, 0, height)
+        c0, c1 = np.clip(c0, 0, width), np.clip(c1, 0, width)
+
+        part_sum = integral[r1, c1] - integral[r0, c1] - integral[r1, c0] + integral[r0, c0]
+        part_count = counts[r1, c1] - counts[r0, c1] - counts[r1, c0] + counts[r0, c0]
+        scaled = np.where(part_count > 0, part_sum * (full_win / part_count), thresh).astype(np.float32)
+
+        normalised = (frame_count * full_win * sample_frame / scaled) * np.float32(scale)
+        return np.nan_to_num(normalised, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    def _copy_sidecars(self, sample_info, output_tiff):
+        output_stem = os.path.splitext(os.path.basename(output_tiff))[0]
+        source_folder = os.path.dirname(sample_info["file_path"])
+        copied_exts = set()
+        metadata_path = sample_info.get("metadata_path")
+        if metadata_path and os.path.exists(metadata_path):
+            ext = os.path.splitext(metadata_path)[1].lower()
+            shutil.copyfile(metadata_path, os.path.join(self.output_folder, output_stem + ext))
+            copied_exts.add(ext)
+
+        for ext in (".stat", ".json", ".log"):
+            if ext in copied_exts:
+                continue
+            for name in os.listdir(source_folder):
+                source_path = os.path.join(source_folder, name)
+                if os.path.isfile(source_path) and os.path.splitext(name)[1].lower() == ext:
+                    shutil.copyfile(source_path, os.path.join(self.output_folder, output_stem + ext))
+                    copied_exts.add(ext)
+                    break
+
+    def run(self):
+        try:
+            os.makedirs(self.output_folder, exist_ok=True)
+            sample_info = self.sample_run.get("info") or get_raden_tiff_stack_info(self.sample_run["folder_path"])
+            open_beam_info = self.open_beam_run.get("info") or get_raden_tiff_stack_info(self.open_beam_run["folder_path"])
+            self._validate(sample_info, open_beam_info)
+
+            sample_pulses = self._pulse_count(sample_info)
+            open_beam_pulses = self._pulse_count(open_beam_info)
+            if sample_pulses and open_beam_pulses:
+                scale = np.float32(open_beam_pulses / sample_pulses)
+                self.message.emit(
+                    f"RADEN pulse scale: sample={sample_pulses:.0f}, open-beam={open_beam_pulses:.0f}, scale={scale:.4f}"
+                )
+            else:
+                scale = np.float32(1.0)
+                self.message.emit("RADEN pulse metadata unavailable; using scale=1.0")
+
+            output_stem = self.base_name.strip() or "normalised"
+            sample_stem = os.path.splitext(os.path.basename(sample_info["file_path"]))[0]
+            if output_stem.lower().endswith((".tif", ".tiff")):
+                output_stem = os.path.splitext(output_stem)[0]
+            else:
+                output_stem = f"{output_stem}_{sample_stem}"
+            output_tiff = os.path.join(self.output_folder, output_stem + ".tiff")
+
+            total = int(sample_info["n_frames"])
+            self.message.emit(
+                f"<b>--- Starting RADEN stack normalisation ---</b> "
+                f"{total} frames, output='{os.path.basename(output_tiff)}'"
+            )
+
+            with Image.open(sample_info["file_path"]) as sample_tiff, Image.open(open_beam_info["file_path"]) as open_beam_tiff:
+                with TiffImagePlugin.AppendingTiffWriter(output_tiff, new=True) as writer:
+                    for index in range(total):
+                        if not self._is_running:
+                            self.message.emit("User stopped RADEN normalisation.")
+                            break
+
+                        sample_frame = self._read_frame(sample_tiff, index)
+                        start = max(0, index - self.adjacent_sum)
+                        end = min(total - 1, index + self.adjacent_sum)
+                        open_beam_sum = None
+                        for open_beam_index in range(start, end + 1):
+                            open_beam_frame = self._read_frame(open_beam_tiff, open_beam_index)
+                            if open_beam_sum is None:
+                                open_beam_sum = open_beam_frame.astype(np.float64)
+                            else:
+                                open_beam_sum += open_beam_frame
+
+                        normalised = self._normalise_frame(sample_frame, open_beam_sum, end - start + 1, scale)
+                        Image.fromarray(normalised).save(writer, format="TIFF")
+                        if index != total - 1:
+                            writer.newFrame()
+
+                        self.progress_updated.emit(int(100 * (index + 1) / total))
+                        if index % 100 == 0:
+                            gc.collect()
+
+            if self._is_running:
+                self._copy_sidecars(sample_info, output_tiff)
+                self.message.emit(f"RADEN stack normalisation complete: {output_tiff}")
+
+        except Exception as exc:
+            self.message.emit(f"Fatal error in RADEN normalisation: {exc}")
+        finally:
+            gc.collect()
+            self.finished.emit()
+
+    def stop(self):
+        self._is_running = False
+        self.message.emit("Stop signal received. Terminating RADEN normalisation process.")
+
+
 __all__ = [
     "OutlierFilteringWorker",
     "SummationWorker",
     "OverlapCorrectionWorker",
     "NormalisationWorker",
+    "RadenNormalisationWorker",
     "FullProcessWorker",
     "FilteringWorker",
 ]

@@ -123,6 +123,13 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         super().__init__()
         
         self.flight_path = 56.4
+        self.flight_path_source = "App setting"
+        self.current_fitting_input = ""
+        self.wavelength_flight_path = None
+        self.tof_axis_centers_us = None
+        self.wavelength_depends_on_flight_path = False
+        self.nexus_axis_centers = None
+        self.nexus_axis_uses_flight_path = False
         self.delay = 0.0
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.app_version = str(__version__).strip()
@@ -344,26 +351,39 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
 
     def _build_fitting_menu_bar(self, menu_bar):
         file_menu = menu_bar.addMenu("File")
-        load_images_action = QAction("Load Images...", self)
+        load_images_action = QAction("Load MCP images", self)
         load_images_action.setShortcut("Ctrl+O")
         load_images_action.triggered.connect(self.load_fits_images)
         file_menu.addAction(load_images_action)
 
-        clear_images_action = QAction("Clear Images", self)
-        clear_images_action.triggered.connect(self.clear_loaded_fits_images)
-        file_menu.addAction(clear_images_action)
+        load_nexus_action = QAction("Load Nexus images", self)
+        load_nexus_action.triggered.connect(self.open_nexus_image_stack_from_menu)
+        file_menu.addAction(load_nexus_action)
 
-        load_fitting_config_action = QAction("Load Fitting Configuration...", self)
+        load_raden_action = QAction("Load Raden images", self)
+        load_raden_action.triggered.connect(self.open_raden_tiff_stack_from_menu)
+        file_menu.addAction(load_raden_action)
+
+        import_profile_action = QAction("Load line profile", self)
+        import_profile_action.triggered.connect(self.open_import_intensity_profile_from_menu)
+        file_menu.addAction(import_profile_action)
+
+        export_profile_action = QAction("Export line profile", self)
+        export_profile_action.triggered.connect(self.export_data)
+        file_menu.addAction(export_profile_action)
+
+        load_fitting_config_action = QAction("Load fitting configuration", self)
         load_fitting_config_action.triggered.connect(self.open_load_fitting_configuration_from_menu)
         file_menu.addAction(load_fitting_config_action)
 
-        save_fitting_config_action = QAction("Save Fitting Configuration...", self)
+        save_fitting_config_action = QAction("Export fitting configuration", self)
         save_fitting_config_action.triggered.connect(self.open_save_fitting_configuration_from_menu)
         file_menu.addAction(save_fitting_config_action)
 
-        export_profile_action = QAction("Export Intensity Profile...", self)
-        export_profile_action.triggered.connect(self.export_data)
-        file_menu.addAction(export_profile_action)
+        clear_images_action = QAction("Clear images", self)
+        clear_images_action.triggered.connect(self.clear_loaded_fits_images)
+        file_menu.addAction(clear_images_action)
+
         self._add_exit_action(file_menu)
 
         setting_menu = menu_bar.addMenu("Setting")
@@ -526,6 +546,18 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
     def open_save_fitting_configuration_from_menu(self):
         self.tabs.setCurrentWidget(self.FittingTab)
         self.save_fitting_configuration_to_csv()
+
+    def open_nexus_image_stack_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        self.load_nexus_image_stack()
+
+    def open_raden_tiff_stack_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        self.load_raden_tiff_stack()
+
+    def open_import_intensity_profile_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        self.import_intensity_profile()
 
     def open_auto_adjust_from_menu(self):
         self.tabs.setCurrentWidget(self.FittingTab)

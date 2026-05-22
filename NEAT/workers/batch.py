@@ -2,9 +2,12 @@
 
 import datetime
 import gc
+import json
 import os
+import re
 import warnings
 
+import h5py
 import numpy as np
 import pandas as pd
 from astropy.io import fits
@@ -13,6 +16,13 @@ try:
     import imageio.v2 as imageio
 except ImportError:  # pragma: no cover
     imageio = None
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None
+
+if imageio is None and Image is None:  # pragma: no cover
     try:
         from PIL import Image
     except ImportError:
@@ -41,6 +51,405 @@ from scipy.interpolate import griddata
 from scipy.optimize import curve_fit, least_squares
 
 from ..core import calculate_x_hkl_general, fitting_function_3
+
+
+def _decode_hdf5_attr(value):
+    if isinstance(value, bytes):
+        return value.decode(errors="ignore")
+    if isinstance(value, np.bytes_):
+        return value.decode(errors="ignore")
+    return value
+
+
+def _dataset_units(dataset):
+    units = _decode_hdf5_attr(dataset.attrs.get("units", ""))
+    return str(units or "").strip().lower()
+
+
+def _find_nexus_signal_dataset(handle):
+    candidates = []
+
+    def collect(name, obj):
+        if not isinstance(obj, h5py.Dataset):
+            return
+        if len(obj.shape) != 2:
+            return
+        if not np.issubdtype(obj.dtype, np.number):
+            return
+        signal = obj.attrs.get("signal", 0)
+        try:
+            signal_score = int(signal)
+        except (TypeError, ValueError):
+            signal_score = 0
+        name_score = 2 if os.path.basename(name).lower() in ("values", "data", "signal") else 0
+        size_score = int(np.prod(obj.shape))
+        candidates.append((signal_score, name_score, size_score, name))
+
+    handle.visititems(collect)
+    if not candidates:
+        raise ValueError("No numeric 2D signal dataset found in the NeXus file.")
+
+    candidates.sort(reverse=True)
+    return candidates[0][3]
+
+
+def _extract_nexus_source_sample_distance(handle):
+    parameter_map_path = "mantid_workspace_1/instrument/instrument_parameter_map/data"
+    if parameter_map_path in handle:
+        raw = handle[parameter_map_path][()]
+        text = raw[0].decode(errors="ignore") if getattr(raw, "size", 0) else ""
+        match = re.search(r"source;V3D;pos;\[[^,\]]+,[^,\]]+,([\-0-9.]+)\]", text, re.IGNORECASE)
+        if match:
+            return abs(float(match.group(1)))
+
+    instrument_xml_path = "mantid_workspace_1/instrument/instrument_xml/data"
+    if instrument_xml_path in handle:
+        raw = handle[instrument_xml_path][()]
+        text = raw[0].decode(errors="ignore") if getattr(raw, "size", 0) else ""
+        match = re.search(r'<component\s+type="source">\s*<location[^>]*\sz="([\-0-9.]+)"', text)
+        if match:
+            return abs(float(match.group(1)))
+
+    return None
+
+
+def _extract_nexus_sample_detector_distance(handle):
+    distance_path = "mantid_workspace_1/instrument/physical_detectors/distance"
+    if distance_path in handle:
+        distances = np.asarray(handle[distance_path][()], dtype=float)
+        finite = distances[np.isfinite(distances)]
+        if finite.size:
+            return float(np.nanmean(finite))
+
+    positions_path = "mantid_workspace_1/instrument/detector/detector_positions"
+    if positions_path in handle:
+        positions = np.asarray(handle[positions_path][()], dtype=float)
+        if positions.ndim == 2 and positions.shape[1] == 3:
+            distances = np.linalg.norm(positions, axis=1)
+            finite = distances[np.isfinite(distances)]
+            if finite.size:
+                return float(np.nanmean(finite))
+
+    return None
+
+
+def _axis_centers(axis, expected_count=None):
+    axis = np.asarray(axis, dtype=float).reshape(-1)
+    if axis.size < 3:
+        raise ValueError("NeXus axis must contain at least three values.")
+    if expected_count is not None and axis.size == expected_count + 1:
+        return 0.5 * (axis[:-1] + axis[1:])
+    elif expected_count is not None and axis.size == expected_count:
+        return axis
+    elif axis.size > 3:
+        return 0.5 * (axis[:-1] + axis[1:])
+    return axis
+
+
+def _axis_uses_flight_path(centers, units):
+    units_text = str(units or "").lower()
+    if "tof" in units_text or "micro" in units_text or "usec" in units_text:
+        return True
+    if "wavelength" in units_text or "angstrom" in units_text or units_text in ("a", "aa"):
+        return False
+    # Mantid NGEM workspaces commonly store TOF even when the unit metadata is terse.
+    return np.nanmax(centers) > 1000
+
+
+def _axis_to_wavelengths(axis, units, flight_path, expected_count=None):
+    centers = _axis_centers(axis, expected_count=expected_count)
+
+    if _axis_uses_flight_path(centers, units):
+        if not np.isfinite(flight_path) or flight_path <= 0:
+            raise ValueError("A positive flight path is required to convert NeXus TOF to wavelength.")
+        return (centers * 3.956) / float(flight_path) / 1000.0
+    return centers
+
+
+def _tof_us_to_wavelengths(tof_us, flight_path):
+    tof_us = np.asarray(tof_us, dtype=float)
+    if not np.isfinite(flight_path) or flight_path <= 0:
+        raise ValueError("A positive flight path is required to convert TOF to wavelength.")
+    return (tof_us * 3.956) / float(flight_path) / 1000.0
+
+
+def get_nexus_image_stack_info(file_path):
+    """Return metadata needed before loading a NeXus image stack."""
+    with h5py.File(file_path, "r") as handle:
+        signal_path = _find_nexus_signal_dataset(handle)
+        signal = handle[signal_path]
+        n_detectors, n_bins = signal.shape
+        side = int(round(np.sqrt(n_detectors)))
+        if side * side != n_detectors:
+            raise ValueError(
+                f"NeXus signal has {n_detectors} spectra; only square detector grids are currently supported."
+            )
+
+        parent_path = os.path.dirname(signal_path)
+        axis_path = f"{parent_path}/axis1"
+        if axis_path not in handle:
+            raise ValueError(f"Could not find axis1 next to NeXus signal dataset {signal_path}.")
+        axis = handle[axis_path]
+
+        source_sample = _extract_nexus_source_sample_distance(handle)
+        sample_detector = _extract_nexus_sample_detector_distance(handle)
+        file_flight_path = None
+        if source_sample is not None and sample_detector is not None:
+            file_flight_path = float(source_sample + sample_detector)
+
+        return {
+            "signal_path": signal_path,
+            "axis_path": axis_path,
+            "axis_units": _dataset_units(axis),
+            "n_detectors": int(n_detectors),
+            "n_bins": int(n_bins),
+            "image_shape": (side, side),
+            "source_sample_distance": source_sample,
+            "sample_detector_distance": sample_detector,
+            "file_flight_path": file_flight_path,
+        }
+
+
+def load_nexus_image_stack(file_path, flight_path):
+    """Load a NeXus 2D detector-by-spectrum workspace as image frames."""
+    info = get_nexus_image_stack_info(file_path)
+    with h5py.File(file_path, "r") as handle:
+        signal = handle[info["signal_path"]]
+        axis = handle[info["axis_path"]][()]
+        axis_centers = _axis_centers(axis, expected_count=signal.shape[1])
+        wavelengths = _axis_to_wavelengths(
+            axis,
+            info["axis_units"],
+            flight_path,
+            expected_count=signal.shape[1],
+        )
+        if wavelengths.size != signal.shape[1]:
+            raise ValueError(
+                f"NeXus wavelength count ({wavelengths.size}) does not match image count ({signal.shape[1]})."
+            )
+
+        data = np.asarray(signal[()], dtype=np.float32)
+        np.nan_to_num(data, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        height, width = info["image_shape"]
+        images = [data[:, idx].reshape(height, width) for idx in range(data.shape[1])]
+
+    info = dict(info)
+    info["axis_centers"] = axis_centers.astype(float)
+    info["axis_uses_flight_path"] = bool(_axis_uses_flight_path(axis_centers, info["axis_units"]))
+    info["wavelength_flight_path"] = float(flight_path)
+    return images, wavelengths.astype(float), info
+
+
+def _find_raden_tiff_file(path):
+    """Return the multi-page RADEN TIFF file from a folder or direct TIFF path."""
+    if os.path.isfile(path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".tif", ".tiff"):
+            raise ValueError("RADEN stack input must be a TIFF file or a folder containing one.")
+        return path
+
+    if not os.path.isdir(path):
+        raise ValueError(f"RADEN stack path does not exist: {path}")
+
+    candidates = []
+    for name in os.listdir(path):
+        if os.path.splitext(name)[1].lower() in (".tif", ".tiff"):
+            full_path = os.path.join(path, name)
+            if os.path.isfile(full_path):
+                candidates.append(full_path)
+    if not candidates:
+        raise ValueError(f"No TIFF files found in RADEN folder: {path}")
+    if len(candidates) == 1:
+        return candidates[0]
+    return max(candidates, key=os.path.getsize)
+
+
+def _parse_raden_axis_line(text, axis_name):
+    match = re.search(
+        rf"^\s*{re.escape(axis_name)}\s*:\s*Nbins\s*=\s*(\d+)\s*,\s*"
+        r"Min\s*=\s*([\-+0-9.eE]+)\s*,\s*"
+        r"Max\s*=\s*([\-+0-9.eE]+)\s*,\s*"
+        r"Bin size\s*=\s*([\-+0-9.eE]+)\s*,\s*"
+        r"Units\s*=\s*([^\r\n]+)",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if not match:
+        return None
+    return {
+        "bins": int(match.group(1)),
+        "min": float(match.group(2)),
+        "max": float(match.group(3)),
+        "bin_size": float(match.group(4)),
+        "units": match.group(5).strip(),
+    }
+
+
+def parse_raden_stat_file(stat_path):
+    """Parse RADEN .stat metadata containing X/Y/TOF bin definitions."""
+    with open(stat_path, "r", encoding="utf-8", errors="replace") as handle:
+        text = handle.read()
+    axes = {}
+    for axis_name in ("X", "Y", "TOF"):
+        axis = _parse_raden_axis_line(text, axis_name)
+        if axis is None:
+            raise ValueError(f"Could not parse {axis_name} axis from RADEN stat file.")
+        axes[axis_name.lower()] = axis
+    metadata = {}
+    for key in ("Entries", "Pulses", "Pulses with data"):
+        match = re.search(rf"^\s*{re.escape(key)}\s*:\s*([\-+0-9.eE]+)", text, flags=re.MULTILINE)
+        if match:
+            metadata[key.lower().replace(" ", "_")] = float(match.group(1))
+    axes["meta"] = metadata
+    return axes
+
+
+def parse_raden_json_file(json_path):
+    """Parse RADEN conversion JSON metadata as a fallback when .stat is absent."""
+    with open(json_path, "r", encoding="utf-8", errors="replace") as handle:
+        data = json.load(handle)
+    params = data.get("params", data)
+
+    def axis_from_params(prefix, units):
+        try:
+            bins = int(params[f"{prefix}_bins"])
+            amin = float(params[f"{prefix}_min"])
+            amax = float(params[f"{prefix}_max"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Could not parse {prefix.upper()} axis from RADEN JSON metadata.") from exc
+        return {
+            "bins": bins,
+            "min": amin,
+            "max": amax,
+            "bin_size": (amax - amin) / bins if bins else np.nan,
+            "units": units,
+        }
+
+    return {
+        "x": axis_from_params("x", "mm"),
+        "y": axis_from_params("y", "mm"),
+        "tof": axis_from_params("t", "ms"),
+        "meta": {},
+    }
+
+
+def _find_raden_metadata_file(tiff_path):
+    folder = os.path.dirname(tiff_path)
+    stem = os.path.splitext(os.path.basename(tiff_path))[0]
+    for ext in (".stat", ".json"):
+        candidate = os.path.join(folder, stem + ext)
+        if os.path.exists(candidate):
+            return candidate
+    for ext in (".stat", ".json"):
+        candidates = [
+            os.path.join(folder, name)
+            for name in os.listdir(folder)
+            if os.path.splitext(name)[1].lower() == ext
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
+def _load_raden_metadata(tiff_path):
+    metadata_path = _find_raden_metadata_file(tiff_path)
+    if metadata_path is None:
+        raise ValueError("Could not find RADEN .stat or .json metadata next to the TIFF stack.")
+    ext = os.path.splitext(metadata_path)[1].lower()
+    if ext == ".stat":
+        axes = parse_raden_stat_file(metadata_path)
+    elif ext == ".json":
+        axes = parse_raden_json_file(metadata_path)
+    else:
+        raise ValueError(f"Unsupported RADEN metadata file: {metadata_path}")
+    return metadata_path, axes
+
+
+def _axis_centers_from_min_max(axis):
+    bins = int(axis["bins"])
+    if bins <= 0:
+        raise ValueError("Axis bin count must be positive.")
+    amin = float(axis["min"])
+    amax = float(axis["max"])
+    edges = np.linspace(amin, amax, bins + 1)
+    return 0.5 * (edges[:-1] + edges[1:])
+
+
+def _convert_tof_axis_to_us(tof_axis):
+    centers = _axis_centers_from_min_max(tof_axis)
+    units = str(tof_axis.get("units", "")).strip().lower()
+    if units in ("us", "usec", "microsecond", "microseconds"):
+        return centers
+    if units in ("ms", "msec", "millisecond", "milliseconds"):
+        return centers * 1000.0
+    if units in ("s", "sec", "second", "seconds"):
+        return centers * 1_000_000.0
+    raise ValueError(f"Unsupported RADEN TOF unit: {tof_axis.get('units')}")
+
+
+def get_raden_tiff_stack_info(path):
+    """Inspect a RADEN multi-page TIFF stack and its sidecar metadata."""
+    if Image is None:
+        raise ImportError("Pillow is required to inspect RADEN multi-page TIFF stacks.")
+    tiff_path = _find_raden_tiff_file(path)
+    metadata_path, axes = _load_raden_metadata(tiff_path)
+    with Image.open(tiff_path) as image:
+        n_frames = int(getattr(image, "n_frames", 1))
+        width, height = image.size
+        mode = image.mode
+
+    if n_frames <= 1:
+        raise ValueError("RADEN TIFF stack must contain more than one frame.")
+    if int(axes["tof"]["bins"]) != n_frames:
+        raise ValueError(
+            f"RADEN TOF bins ({axes['tof']['bins']}) do not match TIFF frames ({n_frames})."
+        )
+
+    tof_axis_centers_us = _convert_tof_axis_to_us(axes["tof"])
+    if tof_axis_centers_us.size != n_frames:
+        raise ValueError("RADEN TOF axis length does not match TIFF frame count.")
+
+    bytes_per_frame = width * height * np.dtype(np.float32).itemsize
+    return {
+        "format": "RADEN TIFF",
+        "file_path": tiff_path,
+        "metadata_path": metadata_path,
+        "axes": axes,
+        "n_frames": n_frames,
+        "image_shape": (height, width),
+        "mode": mode,
+        "tof_axis_centers_us": tof_axis_centers_us.astype(float),
+        "axis_uses_flight_path": True,
+        "estimated_bytes": int(bytes_per_frame * n_frames),
+    }
+
+
+def load_raden_tiff_stack(path, flight_path, progress_callback=None, stop_checker=None):
+    """Load a RADEN multi-page TIFF stack as image frames and wavelength values."""
+    if Image is None:
+        raise ImportError("Pillow is required to load RADEN multi-page TIFF stacks.")
+    info = get_raden_tiff_stack_info(path)
+    tiff_path = info["file_path"]
+    tof_axis_centers_us = np.asarray(info["tof_axis_centers_us"], dtype=float)
+    wavelengths = _tof_us_to_wavelengths(tof_axis_centers_us, flight_path)
+
+    images = []
+    n_frames = int(info["n_frames"])
+    with Image.open(tiff_path) as image:
+        for idx in range(n_frames):
+            if stop_checker is not None and stop_checker():
+                raise InterruptedError("RADEN TIFF stack loading cancelled by user.")
+            image.seek(idx)
+            frame = np.array(image, dtype=np.float32, copy=True)
+            np.nan_to_num(frame, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            images.append(np.flipud(frame))
+            if progress_callback is not None and (idx == 0 or (idx + 1) % 10 == 0 or idx + 1 == n_frames):
+                progress_callback(int(((idx + 1) / n_frames) * 100))
+
+    info = dict(info)
+    info["wavelength_flight_path"] = float(flight_path)
+    return images, wavelengths.astype(float), info
+
 
 class BatchFitEdgesWorker(QThread):
     progress_updated = pyqtSignal(int)
@@ -97,6 +506,9 @@ class BatchFitEdgesWorker(QThread):
 
         self.metadata_snapshot = {
             "flight_path": self.fit_context.get("flight_path"),
+            "flight_path_source": self.fit_context.get("flight_path_source"),
+            "data_source": self.fit_context.get("data_source"),
+            "input_file": self.fit_context.get("input_file"),
             "min_wavelength": self.fit_context.get("min_wavelength"),
             "max_wavelength": self.fit_context.get("max_wavelength"),
             "selected_phase": self.fit_context.get("selected_phase"),
@@ -370,6 +782,9 @@ class BatchFitEdgesWorker(QThread):
             ("fix_t", self.fix_t),
             ("fix_eta", self.fix_eta),
             ("flight_path", self.metadata_snapshot.get("flight_path")),
+            ("flight_path_source", self.metadata_snapshot.get("flight_path_source")),
+            ("data_source", self.metadata_snapshot.get("data_source")),
+            ("input_file", self.metadata_snapshot.get("input_file")),
             ("min_wavelength", self.metadata_snapshot.get("min_wavelength")),
             ("max_wavelength", self.metadata_snapshot.get("max_wavelength")),
             ("selected_phase", self.metadata_snapshot.get("selected_phase")),
@@ -490,6 +905,9 @@ class BatchFitEdgesWorker(QThread):
             ("fix_t", self.fix_t),
             ("fix_eta", self.fix_eta),
             ("flight_path", self.metadata_snapshot.get("flight_path")),
+            ("flight_path_source", self.metadata_snapshot.get("flight_path_source")),
+            ("data_source", self.metadata_snapshot.get("data_source")),
+            ("input_file", self.metadata_snapshot.get("input_file")),
             ("min_wavelength", self.metadata_snapshot.get("min_wavelength")),
             ("max_wavelength", self.metadata_snapshot.get("max_wavelength")),
             ("selected_phase", self.metadata_snapshot.get("selected_phase")),
@@ -650,6 +1068,9 @@ class BatchFitWorker(QThread):
         self.hkl_list = []
         self.metadata_snapshot = {
             "flight_path": self.fit_context.get("flight_path"),
+            "flight_path_source": self.fit_context.get("flight_path_source"),
+            "data_source": self.fit_context.get("data_source"),
+            "input_file": self.fit_context.get("input_file"),
             "min_wavelength": self.fit_context.get("min_wavelength"),
             "max_wavelength": self.fit_context.get("max_wavelength"),
             "selected_phase": self.fit_context.get("selected_phase"),
@@ -1017,6 +1438,9 @@ class BatchFitWorker(QThread):
             ("fix_t", self.fix_t),
             ("fix_eta", self.fix_eta),
             ("flight_path", self.metadata_snapshot.get("flight_path")),
+            ("flight_path_source", self.metadata_snapshot.get("flight_path_source")),
+            ("data_source", self.metadata_snapshot.get("data_source")),
+            ("input_file", self.metadata_snapshot.get("input_file")),
             ("min_wavelength", self.metadata_snapshot.get("min_wavelength")),
             ("max_wavelength", self.metadata_snapshot.get("max_wavelength")),
             ("selected_phase", self.metadata_snapshot.get("selected_phase")),
@@ -1115,6 +1539,9 @@ class BatchFitWorker(QThread):
             ("fix_t", self.fix_t),
             ("fix_eta", self.fix_eta),
             ("flight_path", self.metadata_snapshot.get("flight_path")),
+            ("flight_path_source", self.metadata_snapshot.get("flight_path_source")),
+            ("data_source", self.metadata_snapshot.get("data_source")),
+            ("input_file", self.metadata_snapshot.get("input_file")),
             ("min_wavelength", self.metadata_snapshot.get("min_wavelength")),
             ("max_wavelength", self.metadata_snapshot.get("max_wavelength")),
             ("selected_phase", self.metadata_snapshot.get("selected_phase")),
@@ -1292,6 +1719,94 @@ class ImageLoadWorker(QThread):
     def stop(self):
         self._stop_requested = True
 
+
+class NexusImageStackLoadWorker(QThread):
+    progress_updated = pyqtSignal(int)
+    stack_loaded = pyqtSignal(str, object, object, float, dict)
+    finished = pyqtSignal()
+    message = pyqtSignal(str)
+
+    def __init__(self, file_path, flight_path):
+        super().__init__()
+        self.file_path = file_path
+        self.flight_path = float(flight_path)
+        self._stop_requested = False
+
+    def run(self):
+        try:
+            if self._stop_requested:
+                self.message.emit("NeXus image-stack loading cancelled by user.")
+                return
+            self.progress_updated.emit(5)
+            images, wavelengths, info = load_nexus_image_stack(self.file_path, self.flight_path)
+            self.progress_updated.emit(95)
+            if self._stop_requested:
+                self.message.emit("NeXus image-stack loading cancelled by user.")
+                return
+            self.message.emit(
+                "Loaded NeXus image stack: "
+                f"{len(images)} frames, image size {info['image_shape'][1]} x {info['image_shape'][0]}."
+            )
+            self.stack_loaded.emit(self.file_path, images, wavelengths, self.flight_path, info)
+            self.progress_updated.emit(100)
+        except Exception as exc:
+            self.message.emit(f"Failed to load NeXus image stack: {exc}")
+        finally:
+            gc.collect()
+            self.finished.emit()
+
+    def stop(self):
+        self._stop_requested = True
+
+
+class RadenTiffStackLoadWorker(QThread):
+    progress_updated = pyqtSignal(int)
+    stack_loaded = pyqtSignal(str, object, object, float, dict)
+    finished = pyqtSignal()
+    message = pyqtSignal(str)
+
+    def __init__(self, path, flight_path):
+        super().__init__()
+        self.path = path
+        self.flight_path = float(flight_path)
+        self._stop_requested = False
+
+    def run(self):
+        try:
+            if self._stop_requested:
+                self.message.emit("RADEN TIFF stack loading cancelled by user.")
+                return
+
+            def emit_progress(value):
+                self.progress_updated.emit(max(1, min(95, int(value))))
+
+            images, wavelengths, info = load_raden_tiff_stack(
+                self.path,
+                self.flight_path,
+                progress_callback=emit_progress,
+                stop_checker=lambda: self._stop_requested,
+            )
+            if self._stop_requested:
+                self.message.emit("RADEN TIFF stack loading cancelled by user.")
+                return
+            self.message.emit(
+                "Loaded RADEN TIFF stack: "
+                f"{len(images)} frames, image size {info['image_shape'][1]} x {info['image_shape'][0]}."
+            )
+            self.stack_loaded.emit(info["file_path"], images, wavelengths, self.flight_path, info)
+            self.progress_updated.emit(100)
+        except InterruptedError as exc:
+            self.message.emit(str(exc))
+        except Exception as exc:
+            self.message.emit(f"Failed to load RADEN TIFF stack: {exc}")
+        finally:
+            gc.collect()
+            self.finished.emit()
+
+    def stop(self):
+        self._stop_requested = True
+
+
 class OpenBeamLoadWorker(QThread):
     progress_updated = pyqtSignal(int)
     finished = pyqtSignal()
@@ -1400,6 +1915,14 @@ class OpenBeamLoadWorker(QThread):
 __all__ = [
     "BatchFitEdgesWorker",
     "BatchFitWorker",
+    "NexusImageStackLoadWorker",
+    "RadenTiffStackLoadWorker",
     "ImageLoadWorker",
     "OpenBeamLoadWorker",
+    "get_nexus_image_stack_info",
+    "get_raden_tiff_stack_info",
+    "load_nexus_image_stack",
+    "load_raden_tiff_stack",
+    "parse_raden_json_file",
+    "parse_raden_stat_file",
 ]

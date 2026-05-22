@@ -41,13 +41,14 @@ from PyQt5.QtWidgets import (
     QShortcut,
 )
 
-from ...workers.batch import ImageLoadWorker, OpenBeamLoadWorker
+from ...workers.batch import ImageLoadWorker, OpenBeamLoadWorker, get_raden_tiff_stack_info
 from ...workers.preprocessing import (
     FilteringWorker,
     FullProcessWorker,
     NormalisationWorker,
     OutlierFilteringWorker,
     OverlapCorrectionWorker,
+    RadenNormalisationWorker,
     SummationWorker,
 )
 from ..dialogs import MaskGeneratorDialog, OpenBeamPlotDialog
@@ -1652,6 +1653,12 @@ class PreprocessingMixin:
             self, "Select Folder Containing Data Images for normalisation", ""
         )
         if folder_path:
+            run = self._classify_normalisation_folder(folder_path)
+            if run["kind"] == "raden_tiff_stack":
+                self._normalisation_batch_paths = [run]
+                self.preproc_message_box.append(self._format_raden_detection_message("data", run["info"]))
+                return
+
             # Check if the selected folder has child folders.
             child_folders = [
                 os.path.join(folder_path, item)
@@ -1662,12 +1669,29 @@ class PreprocessingMixin:
                 self.preproc_message_box.append(
                     f"Detected {len(child_folders)} sub-folders. They will be processed sequentially when normalisation starts."
                 )
-                self._normalisation_batch_paths = child_folders
+                self._normalisation_batch_paths = [
+                    self._classify_normalisation_folder(child_folder) for child_folder in child_folders
+                ]
             else:
                 self.preproc_message_box.append(
                     "No sub-folders detected; the selected folder will be treated as a single dataset."
                 )
-                self._normalisation_batch_paths = [folder_path]
+                self._normalisation_batch_paths = [run]
+
+    def _classify_normalisation_folder(self, folder_path):
+        try:
+            info = get_raden_tiff_stack_info(folder_path)
+        except Exception:
+            return {"folder_path": folder_path, "kind": "classic_image_folder"}
+        return {"folder_path": folder_path, "kind": "raden_tiff_stack", "info": info}
+
+    def _format_raden_detection_message(self, label, info):
+        tof_axis = info.get("axes", {}).get("tof", {})
+        return (
+            f"Detected RADEN {label} stack: "
+            f"{info['n_frames']} frames, {info['image_shape'][1]} x {info['image_shape'][0]}, "
+            f"TOF {tof_axis.get('min')} - {tof_axis.get('max')} {tof_axis.get('units', '')}."
+        )
 
     def remove_normalisation_data_images(self):
         if self.normalisation_image_runs:
@@ -1756,7 +1780,25 @@ class PreprocessingMixin:
             self.normalisation_stop_button.setEnabled(False)
             return
 
-        current_folder = self._normalisation_batch_paths[self._current_dataset_index]
+        current_run = self._normalisation_batch_paths[self._current_dataset_index]
+        if isinstance(current_run, str):
+            current_run = {"folder_path": current_run, "kind": "classic_image_folder"}
+        current_folder = current_run["folder_path"]
+
+        open_beam_run = self.normalisation_open_beam_runs[0]
+        sample_kind = current_run.get("kind", "classic_image_folder")
+        open_beam_kind = open_beam_run.get("kind", "classic_image_folder")
+        if sample_kind != open_beam_kind:
+            self.preproc_message_box.append(
+                "Sample and open-beam formats do not match. "
+                "RADEN stack normalisation requires both sample and open beam to be RADEN stacks."
+            )
+            self._current_dataset_index += 1
+            self._process_next_dataset()
+            return
+        if sample_kind == "raden_tiff_stack":
+            self._start_raden_normalisation(current_run, open_beam_run)
+            return
 
         short_path = self.get_short_path(current_folder, levels=2)
 
@@ -1769,10 +1811,40 @@ class PreprocessingMixin:
         self._data_load_worker.finished.connect(self._on_data_load_finished)
         self._data_load_worker.start()
 
+    def _start_raden_normalisation(self, sample_run, open_beam_run):
+        folder_path = sample_run["folder_path"]
+        short_path = self.get_short_path(folder_path, levels=2)
+        output_folder_run = os.path.join(self._overall_output_folder, "normalised_" + os.path.basename(folder_path))
+        try:
+            os.makedirs(output_folder_run, exist_ok=True)
+        except Exception as exc:
+            self.preproc_message_box.append(f"Failed to create output folder for \\{short_path}: <b>{exc}</b>")
+            self._current_dataset_index += 1
+            self._process_next_dataset()
+            return
+
+        self.preproc_message_box.append(f"Starting RADEN normalisation for dataset: <b>\\{short_path}</b>")
+        self.normalisation_worker = RadenNormalisationWorker(
+            sample_run,
+            open_beam_run,
+            output_folder_run,
+            self._base_name,
+            self._window_half,
+            adjacent_sum=self._adjacent_sum,
+        )
+        self.normalisation_worker.progress_updated.connect(self.update_normalisation_progress)
+        self.normalisation_worker.message.connect(self.preproc_message_box.append)
+        self.normalisation_worker.finished.connect(self._on_normalisation_finished)
+        self.normalisation_worker.start()
+
     def _on_dataset_loaded(self, folder_path, run_dict):
         # Store the loaded dataset temporarily.
         if run_dict:
-            self._current_loaded_run = {'folder_path': folder_path, 'images': run_dict}
+            self._current_loaded_run = {
+                'folder_path': folder_path,
+                'images': run_dict,
+                'kind': 'classic_image_folder',
+            }
         else:
             self._current_loaded_run = None
 
@@ -1932,6 +2004,13 @@ class PreprocessingMixin:
         # Open a folder, start OpenBeamLoadWorker, connect signals
         folder_path = QFileDialog.getExistingDirectory(self, "Select Folder Containing Open Beam Images", "")
         if folder_path:
+            run = self._classify_normalisation_folder(folder_path)
+            if run["kind"] == "raden_tiff_stack":
+                self.normalisation_open_beam_runs = [run]
+                self.normalisation_load_progress.setValue(100)
+                self.preproc_message_box.append(self._format_raden_detection_message("open-beam", run["info"]))
+                return
+
             # Create and start the worker
             self.open_beam_load_worker = OpenBeamLoadWorker(folder_path, area_x=(10, 500), area_y=(10, 500))
             self.open_beam_load_worker.progress_updated.connect(self.update_normalisation_load_progress)
@@ -1946,7 +2025,8 @@ class PreprocessingMixin:
 
         self.normalisation_open_beam_runs.append({
             "folder_path": folder_path,       # ← real directory
-            "images"     : summed_intensities
+            "images"     : summed_intensities,
+            "kind"       : "classic_image_folder"
         })
 
         # ----- the plotting block stays the same ----------------------

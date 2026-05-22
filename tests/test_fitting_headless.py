@@ -1,9 +1,22 @@
 import unittest
+import tempfile
+import os
 
 import numpy as np
+import pandas as pd
+import h5py
+from PIL import Image
 
 from NEAT.core import fitting_function_3
 from NEAT.ui.mixins.fitting import FittingMixin
+from NEAT.workers.batch import (
+    get_nexus_image_stack_info,
+    get_raden_tiff_stack_info,
+    load_nexus_image_stack,
+    load_raden_tiff_stack,
+    parse_raden_stat_file,
+)
+from NEAT.workers.preprocessing import RadenNormalisationWorker
 
 
 class _DummyItem:
@@ -42,6 +55,17 @@ class _DummyTextInput:
 
     def text(self):
         return self._text
+
+    def setText(self, text):
+        self._text = str(text)
+
+
+class _DummyMessageBox:
+    def __init__(self):
+        self.messages = []
+
+    def append(self, text):
+        self.messages.append(str(text))
 
 
 class _DummyDropdown:
@@ -162,6 +186,250 @@ class TestFittingHeadless(unittest.TestCase):
         ctx = obj._build_batch_fit_context()
         self.assertFalse(ctx["bragg_rows"][0]["valid"])
         self.assertIsNone(ctx["bragg_rows"][0]["regions"])
+
+    def test_read_intensity_profile_file_accepts_csv_header(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
+            handle.write("Wavelength,Summed Intensity\n")
+            handle.write("2.0,10\n")
+            handle.write("1.5,8\n")
+            handle.write("2.5,12\n")
+            file_name = handle.name
+        try:
+            wavelengths, intensities = FittingMixin._read_intensity_profile_file(file_name)
+        finally:
+            try:
+                os.unlink(file_name)
+            except OSError:
+                pass
+
+        np.testing.assert_allclose(wavelengths, [1.5, 2.0, 2.5])
+        np.testing.assert_allclose(intensities, [8.0, 10.0, 12.0])
+
+    def test_read_intensity_profile_file_accepts_whitespace_without_header(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+            handle.write("2.0 10\n")
+            handle.write("1.5 8\n")
+            handle.write("2.5 12\n")
+            file_name = handle.name
+        try:
+            wavelengths, intensities = FittingMixin._read_intensity_profile_file(file_name)
+        finally:
+            try:
+                os.unlink(file_name)
+            except OSError:
+                pass
+
+        np.testing.assert_allclose(wavelengths, [1.5, 2.0, 2.5])
+        np.testing.assert_allclose(intensities, [8.0, 10.0, 12.0])
+
+    def test_read_intensity_profile_file_accepts_xlsx_header(self):
+        fd, file_name = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        try:
+            pd.DataFrame(
+                [["wavelength", "intensity"], [2.0, 10], [1.5, 8], [2.5, 12]]
+            ).to_excel(file_name, header=False, index=False)
+            wavelengths, intensities = FittingMixin._read_intensity_profile_file(file_name)
+        finally:
+            try:
+                os.unlink(file_name)
+            except OSError:
+                pass
+
+        np.testing.assert_allclose(wavelengths, [1.5, 2.0, 2.5])
+        np.testing.assert_allclose(intensities, [8.0, 10.0, 12.0])
+
+    def test_read_intensity_profile_file_accepts_mantid_nexus_table(self):
+        fd, file_name = tempfile.mkstemp(suffix=".nxs")
+        os.close(fd)
+        try:
+            with h5py.File(file_name, "w") as handle:
+                entry = handle.create_group("mantid_workspace_1")
+                table = entry.create_group("table_workspace")
+                x = table.create_dataset("column_1", data=np.array([2.0, 1.5, 2.5]))
+                x.attrs["name"] = "XS0"
+                y = table.create_dataset("column_2", data=np.array([10.0, 8.0, 12.0]))
+                y.attrs["name"] = "YS0"
+                e = table.create_dataset("column_3", data=np.array([0.1, 0.1, 0.1]))
+                e.attrs["name"] = "ES0"
+            wavelengths, intensities = FittingMixin._read_intensity_profile_file(file_name)
+        finally:
+            try:
+                os.unlink(file_name)
+            except OSError:
+                pass
+
+        np.testing.assert_allclose(wavelengths, [1.5, 2.0, 2.5])
+        np.testing.assert_allclose(intensities, [8.0, 10.0, 12.0])
+
+    def test_load_nexus_image_stack_uses_file_geometry_and_tof_edges(self):
+        fd, file_name = tempfile.mkstemp(suffix=".nxs")
+        os.close(fd)
+        try:
+            with h5py.File(file_name, "w") as handle:
+                entry = handle.create_group("mantid_workspace_1")
+                instrument = entry.create_group("instrument")
+                parameter_map = instrument.create_group("instrument_parameter_map")
+                parameter_map.create_dataset(
+                    "data",
+                    data=np.array([b"NGEM/source;V3D;pos;[0,0,-10.0];visible:true"]),
+                )
+                physical_detectors = instrument.create_group("physical_detectors")
+                physical_detectors.create_dataset("distance", data=np.full(4, 2.0))
+                workspace = entry.create_group("workspace")
+                values = workspace.create_dataset(
+                    "values",
+                    data=np.array(
+                        [
+                            [1.0, 2.0, 3.0],
+                            [4.0, 5.0, 6.0],
+                            [7.0, 8.0, 9.0],
+                            [10.0, 11.0, 12.0],
+                        ]
+                    ),
+                )
+                values.attrs["signal"] = 1
+                axis = workspace.create_dataset("axis1", data=np.array([1000.0, 2000.0, 3000.0, 4000.0]))
+                axis.attrs["units"] = "TOF"
+
+            info = get_nexus_image_stack_info(file_name)
+            self.assertAlmostEqual(info["file_flight_path"], 12.0)
+            images, wavelengths, stack_info = load_nexus_image_stack(file_name, info["file_flight_path"])
+        finally:
+            try:
+                os.unlink(file_name)
+            except OSError:
+                pass
+
+        expected_wavelengths = np.array([1500.0, 2500.0, 3500.0]) * 3.956 / 12.0 / 1000.0
+        np.testing.assert_allclose(wavelengths, expected_wavelengths)
+        np.testing.assert_allclose(stack_info["axis_centers"], [1500.0, 2500.0, 3500.0])
+        self.assertTrue(stack_info["axis_uses_flight_path"])
+        self.assertEqual(len(images), 3)
+        self.assertEqual(images[0].shape, (2, 2))
+        np.testing.assert_allclose(images[0], [[1.0, 4.0], [7.0, 10.0]])
+
+    def test_nexus_wavelengths_recalculate_when_flight_path_changes(self):
+        obj = _HeadlessFitting()
+        obj.flight_path = 12.0
+        obj.flight_path_source = "NeXus file"
+        obj.delay = 0.0
+        obj.fitting_data_source = "images"
+        obj.images = [np.zeros((2, 2)) for _ in range(3)]
+        obj.tof_array = None
+        obj.tof_axis_centers_us = np.array([1500.0, 2500.0, 3500.0])
+        obj.wavelength_depends_on_flight_path = True
+        obj.nexus_axis_centers = obj.tof_axis_centers_us
+        obj.nexus_axis_uses_flight_path = True
+        obj.min_wavelength_input = _DummyTextInput("")
+        obj.max_wavelength_input = _DummyTextInput("")
+        obj.message_box = _DummyMessageBox()
+        obj.update_plots = lambda: None
+
+        self.assertTrue(obj._recalculate_nexus_wavelengths_from_axis(source_label="NeXus file", show_message=False))
+        first = obj.wavelengths.copy()
+
+        obj.flight_path = 24.0
+        self.assertTrue(obj._apply_instrument_settings_to_loaded_data())
+
+        np.testing.assert_allclose(obj.wavelengths, first / 2.0)
+        self.assertEqual(obj.flight_path_source, "App setting")
+        self.assertAlmostEqual(obj.wavelength_flight_path, 24.0)
+        self.assertEqual(obj.min_wavelength_input.text(), f"{obj.wavelengths[0]:.6g}")
+
+    def test_parse_raden_stat_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".stat", delete=False) as handle:
+            handle.write("Version number: 1.4.3\n")
+            handle.write("Axes:\n")
+            handle.write(" X: Nbins=4, Min=0, Max=8, Bin size=2, Units=mm\n")
+            handle.write(" Y: Nbins=3, Min=1, Max=7, Bin size=2, Units=mm\n")
+            handle.write(" TOF: Nbins=5, Min=0, Max=10, Bin size=2, Units=ms\n")
+            file_name = handle.name
+        try:
+            axes = parse_raden_stat_file(file_name)
+        finally:
+            try:
+                os.unlink(file_name)
+            except OSError:
+                pass
+
+        self.assertEqual(axes["x"]["bins"], 4)
+        self.assertEqual(axes["y"]["min"], 1.0)
+        self.assertEqual(axes["tof"]["units"], "ms")
+
+    def test_load_raden_tiff_stack_uses_stat_tof_axis(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tiff_path = os.path.join(folder, "NID000001_20210519.tiff")
+            stat_path = os.path.join(folder, "NID000001_20210519.stat")
+            frames = [
+                np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+                np.array([[5.0, 6.0], [7.0, 8.0]], dtype=np.float32),
+                np.array([[9.0, 10.0], [11.0, 12.0]], dtype=np.float32),
+            ]
+            pil_frames = [Image.fromarray(frame) for frame in frames]
+            pil_frames[0].save(tiff_path, save_all=True, append_images=pil_frames[1:])
+            with open(stat_path, "w", encoding="utf-8") as handle:
+                handle.write("Version number: 1.4.3\n")
+                handle.write("Axes:\n")
+                handle.write(" X: Nbins=2, Min=0, Max=2, Bin size=1, Units=mm\n")
+                handle.write(" Y: Nbins=2, Min=0, Max=2, Bin size=1, Units=mm\n")
+                handle.write(" TOF: Nbins=3, Min=0, Max=3, Bin size=1, Units=ms\n")
+
+            info = get_raden_tiff_stack_info(folder)
+            images, wavelengths, stack_info = load_raden_tiff_stack(folder, 10.0)
+
+        self.assertEqual(info["n_frames"], 3)
+        self.assertEqual(info["image_shape"], (2, 2))
+        np.testing.assert_allclose(info["tof_axis_centers_us"], [500.0, 1500.0, 2500.0])
+        np.testing.assert_allclose(wavelengths, np.array([500.0, 1500.0, 2500.0]) * 3.956 / 10.0 / 1000.0)
+        self.assertEqual(len(images), 3)
+        np.testing.assert_allclose(images[0], np.flipud(frames[0]))
+        self.assertTrue(stack_info["axis_uses_flight_path"])
+
+    def test_raden_normalisation_worker_writes_multipage_tiff(self):
+        def write_raden_stack(folder, stem, values, pulses):
+            os.makedirs(folder, exist_ok=True)
+            tiff_path = os.path.join(folder, stem + ".tiff")
+            stat_path = os.path.join(folder, stem + ".stat")
+            frames = [np.full((5, 5), value, dtype=np.float32) for value in values]
+            pil_frames = [Image.fromarray(frame) for frame in frames]
+            pil_frames[0].save(tiff_path, save_all=True, append_images=pil_frames[1:])
+            with open(stat_path, "w", encoding="utf-8") as handle:
+                handle.write("Version number: 1.4.3\n")
+                handle.write("Axes:\n")
+                handle.write(" X: Nbins=5, Min=0, Max=5, Bin size=1, Units=mm\n")
+                handle.write(" Y: Nbins=5, Min=0, Max=5, Bin size=1, Units=mm\n")
+                handle.write(f" TOF: Nbins={len(values)}, Min=0, Max={len(values)}, Bin size=1, Units=ms\n")
+                handle.write("Entries:100\n")
+                handle.write(f"Pulses:{pulses}\n")
+                handle.write(f"Pulses with data:{pulses}\n")
+            return get_raden_tiff_stack_info(folder)
+
+        with tempfile.TemporaryDirectory() as root:
+            sample_folder = os.path.join(root, "sample")
+            open_beam_folder = os.path.join(root, "open_beam")
+            output_folder = os.path.join(root, "out")
+            sample_info = write_raden_stack(sample_folder, "sample_stack", [10.0, 20.0, 30.0], 2)
+            open_beam_info = write_raden_stack(open_beam_folder, "open_beam_stack", [20.0, 40.0, 60.0], 4)
+
+            worker = RadenNormalisationWorker(
+                {"folder_path": sample_folder, "kind": "raden_tiff_stack", "info": sample_info},
+                {"folder_path": open_beam_folder, "kind": "raden_tiff_stack", "info": open_beam_info},
+                output_folder,
+                "normalised",
+                window_half=0,
+                adjacent_sum=0,
+            )
+            worker.run()
+
+            output_tiff = os.path.join(output_folder, "normalised_sample_stack.tiff")
+            self.assertTrue(os.path.exists(output_tiff))
+            self.assertTrue(os.path.exists(os.path.join(output_folder, "normalised_sample_stack.stat")))
+            with Image.open(output_tiff) as image:
+                self.assertEqual(image.n_frames, 3)
+                for idx in range(3):
+                    image.seek(idx)
+                    np.testing.assert_allclose(np.array(image), np.ones((5, 5), dtype=np.float32))
 
     def test_fit_region_headless_known_phase(self):
         obj = _HeadlessFitting()

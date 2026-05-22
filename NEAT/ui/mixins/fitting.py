@@ -8,6 +8,7 @@ import time
 from html import escape
 
 import matplotlib as mpl
+import h5py
 import numpy as np
 import pandas as pd
 from astropy.io import fits
@@ -65,6 +66,10 @@ from ...workers.batch import (
     BatchFitEdgesWorker,
     BatchFitWorker,
     ImageLoadWorker,
+    NexusImageStackLoadWorker,
+    RadenTiffStackLoadWorker,
+    get_nexus_image_stack_info,
+    get_raden_tiff_stack_info,
 )
 from ..dialogs import (
     AdjustmentsDialog,
@@ -255,6 +260,9 @@ class FittingMixin:
             "lattice_params": dict(getattr(self, "lattice_params", {})),
             "selected_phase": selected_phase,
             "flight_path": getattr(self, "flight_path", None),
+            "flight_path_source": getattr(self, "flight_path_source", "App setting"),
+            "data_source": getattr(self, "fitting_data_source", "images"),
+            "input_file": getattr(self, "current_fitting_input", ""),
             "min_wavelength": _safe_float_text(self.min_wavelength_input.text() if hasattr(self, "min_wavelength_input") else ""),
             "max_wavelength": _safe_float_text(self.max_wavelength_input.text() if hasattr(self, "max_wavelength_input") else ""),
             "bragg_rows": bragg_rows,
@@ -268,6 +276,7 @@ class FittingMixin:
         self.plot_font_size = getattr(self, "plot_font_size", 12)
         self.symbol_size = getattr(self, "symbol_size", 4)
         self.show_edge_line = getattr(self, "show_edge_line", True)
+        self.fitting_data_source = getattr(self, "fitting_data_source", "images")
         self.fitting_plot_layout_mode = self._normalize_fitting_plot_layout_mode(
             getattr(self, "fitting_plot_layout_mode", "single")
         )
@@ -380,17 +389,6 @@ class FittingMixin:
 
         # ============== Controls in Lower Left Layout ==============
         button_layout = QHBoxLayout()
-        self.load_button = self.create_fitting_icon_button("load", "Load images")
-        self.load_button.clicked.connect(self.load_fits_images)
-        self.load_button.setToolTip("Select a folder to load image files")
-        button_layout.addWidget(self.load_button)
-
-        self.clear_load_button = self.create_fitting_icon_button("clear", "Clear images")
-        self.clear_load_button.clicked.connect(self.clear_loaded_fits_images)
-        self.clear_load_button.setToolTip("Clear loaded images, plots, table, and messages")
-        self.clear_load_button.setEnabled(False)
-        button_layout.addWidget(self.clear_load_button)
-
         self.phase_dropdown = QComboBox()
         self.phase_placeholder = "Select Phase"
         self.phase_dropdown.addItem(self.phase_placeholder)  # Placeholder/default item
@@ -415,6 +413,8 @@ class FittingMixin:
         self.ymin_input.setToolTip(roi_bounds_tooltip)
         self.ymax_input = QLineEdit("320")
         self.ymax_input.setToolTip(roi_bounds_tooltip)
+        for roi_input in (self.xmin_input, self.xmax_input, self.ymin_input, self.ymax_input):
+            roi_input.editingFinished.connect(self.apply_selected_area_from_inputs)
 
         selection_layout.addWidget(QLabel("X Min:"), 0, 0)
         selection_layout.addWidget(self.xmin_input, 0, 1)
@@ -424,28 +424,6 @@ class FittingMixin:
         selection_layout.addWidget(self.ymin_input, 0, 5)
         selection_layout.addWidget(QLabel("Y Max:"), 0, 6)
         selection_layout.addWidget(self.ymax_input, 0, 7)
-
-        self.select_area_button = self.create_fitting_icon_button("pick", "Pick ROI")
-        self.select_area_button.clicked.connect(self.select_area)
-        # self.select_area_button.setStyleSheet("""
-        #     QPushButton {
-        #         font-size: 32px;
-        #         background-color: #4CAF50;
-        #         color: white;
-        #         border: none;
-        #         border-radius: 3px;
-        #     }
-        #     QPushButton:hover {
-        #         background-color: #45a049;
-        #     }
-        # """)
-        self.select_area_button.setToolTip('Click to display intensity vs wavelength from the selected area')
-        selection_layout.addWidget(self.select_area_button, 0, 8)
-
-        self.export_data_button = self.create_fitting_icon_button("export", "Export intensity profile")
-        self.export_data_button.setToolTip('Click to export intensity vs wavelength profile')
-        self.export_data_button.clicked.connect(self.export_data)
-        selection_layout.addWidget(self.export_data_button, 0, 9)
 
         lower_left_layout.addLayout(selection_layout)
 
@@ -554,6 +532,7 @@ class FittingMixin:
         self.batch_settings_button.setToolTip("Configure batch fitting parameters")
         self.batch_settings_button.clicked.connect(self.open_batch_settings_dialog)
         fit_buttons_layout.addWidget(self.batch_settings_button)
+        self._set_mapping_controls_enabled(False)
 
         self.stop_batch_fit_button = self.create_fitting_icon_button("stop", "Stop")
         self.stop_batch_fit_button.setToolTip('Stop batch fitting')
@@ -841,6 +820,12 @@ class FittingMixin:
             painter.drawLine(QPoint(16, 7), QPoint(16, 17))
             painter.drawLine(QPoint(16, 7), QPoint(11, 12))
             painter.drawLine(QPoint(16, 7), QPoint(21, 12))
+        elif icon_name == "import":
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(7, 18, 18, 6)
+            painter.drawLine(QPoint(16, 7), QPoint(16, 17))
+            painter.drawLine(QPoint(16, 17), QPoint(11, 12))
+            painter.drawLine(QPoint(16, 17), QPoint(21, 12))
 
         painter.end()
         return QIcon(pixmap)
@@ -887,10 +872,20 @@ class FittingMixin:
 
     def _set_fits_image_button_states(self, is_loading=False):
         has_images = bool(getattr(self, "images", []))
-        self.load_button.setEnabled(not is_loading)
+        load_button = getattr(self, "load_button", None)
+        if load_button is not None:
+            load_button.setEnabled(not is_loading)
         clear_button = getattr(self, "clear_load_button", None)
         if clear_button is not None:
             clear_button.setEnabled((not is_loading) and has_images)
+        self._set_mapping_controls_enabled(has_images and not is_loading)
+
+    def _set_mapping_controls_enabled(self, enabled):
+        """Enable image-stack mapping controls only when spatial image data exists."""
+        for button_name in ("batch_map_button", "batch_settings_button"):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.setEnabled(bool(enabled))
 
     def update_fitting_mode_button_styles(self):
         selected_style = (
@@ -938,6 +933,9 @@ class FittingMixin:
             self.live_fit_mode = mode
 
     def run_selected_batch_fit(self):
+        if getattr(self, "fitting_data_source", "images") == "profile":
+            self.message_box.append("Mapping is not available for imported intensity profiles.")
+            return
         if getattr(self, "fitting_mode", "individual") == "pattern":
             self.batch_fit()
         else:
@@ -1099,10 +1097,14 @@ class FittingMixin:
             final_canvas.draw()
 
     def set_fit_action_buttons_enabled(self, enabled):
-        for button_name in ("fit_roi_button", "batch_map_button"):
-            button = getattr(self, button_name, None)
-            if button is not None:
-                button.setEnabled(enabled)
+        fit_button = getattr(self, "fit_roi_button", None)
+        if fit_button is not None:
+            fit_button.setEnabled(enabled)
+        self._set_mapping_controls_enabled(
+            bool(enabled)
+            and getattr(self, "fitting_data_source", "images") != "profile"
+            and bool(getattr(self, "images", []))
+        )
 
     def on_bragg_header_fix_state_changed(self, column, checked):
         if column == 8:
@@ -1370,6 +1372,9 @@ class FittingMixin:
         Initiates the batch fitting process over the ROI using the 'fit_region' approach
         for each row in the bragg_table. Similar to 'batch_fit' but calls 'fit_region'.
         """
+        if getattr(self, "fitting_data_source", "images") == "profile":
+            self.message_box.append("Mapping is not available for imported intensity profiles.")
+            return
         # Ensure ROI and box dimensions are defined
         try:
             box_width = int(self.box_width_input.text())
@@ -2192,6 +2197,14 @@ class FittingMixin:
         prompt user for manual selection.
         """
         if run_dict:
+            self.fitting_data_source = "images"
+            self.flight_path_source = "App setting"
+            self.current_fitting_input = folder_path
+            self.tof_axis_centers_us = None
+            self.wavelength_depends_on_flight_path = False
+            self.nexus_axis_centers = None
+            self.nexus_axis_uses_flight_path = False
+            self.wavelength_flight_path = None
             # Sort the suffixes to ensure images are in correct order
             sorted_suffixes = sorted(run_dict.keys())
             # Clear existing images if any
@@ -2260,6 +2273,7 @@ class FittingMixin:
 
             # Display the first image with auto-adjusted contrast and brightness
             self.display_image()
+            self.apply_selected_area_from_inputs()
             self._set_fits_image_button_states(is_loading=False)
         else:
             self.message_box.append("No valid images were loaded from the selected folder.")
@@ -2268,7 +2282,7 @@ class FittingMixin:
     def change_flight_path(self):
         """
         Opens a dialog to allow the user to change the flight path value.
-        Then updates the wavelength calculation if tof_array is available.
+        Then updates the wavelength calculation when the loaded data is flight-path dependent.
         """
         new_flight_path, ok = QInputDialog.getDouble(
             self,
@@ -2282,15 +2296,82 @@ class FittingMixin:
         if ok:
             self.flight_path = new_flight_path
             self.message_box.append(f"Flight path updated to {self.flight_path}")
-
-            # If we already have a tof_array loaded, recalculate wavelengths
-            if self.tof_array is not None and len(self.tof_array) > 0:
-                self.update_wavelengths()
-                self.message_box.append("Click 'Pick' to update the plot")
+            if self._apply_instrument_settings_to_loaded_data():
+                self.message_box.append("Loaded wavelength data updated with the new flight path.")
             else:
-                self.message_box.append("No ToF data available to update wavelengths.")
+                self.message_box.append("No flight-path-dependent loaded data to update.")
         else:
             self.message_box.append("Flight path change cancelled.")
+
+    def _update_wavelength_bounds_from_current_array(self):
+        if self.wavelengths is None or len(self.wavelengths) == 0:
+            return
+        self.start_wavelength = float(self.wavelengths[0])
+        self.end_wavelength = float(self.wavelengths[-1])
+        min_input = getattr(self, "min_wavelength_input", None)
+        max_input = getattr(self, "max_wavelength_input", None)
+        if min_input is not None:
+            min_input.setText(f"{self.start_wavelength:.6g}")
+        if max_input is not None:
+            max_input.setText(f"{self.end_wavelength:.6g}")
+
+    def _recalculate_wavelengths_from_tof_axis(self, source_label=None, show_message=True, axis_label="TOF"):
+        centers = getattr(self, "tof_axis_centers_us", None)
+        if centers is None:
+            centers = getattr(self, "nexus_axis_centers", None)
+        depends_on_path = (
+            getattr(self, "wavelength_depends_on_flight_path", False)
+            or getattr(self, "nexus_axis_uses_flight_path", False)
+        )
+        if centers is None or not depends_on_path:
+            return False
+        flight_path = float(getattr(self, "flight_path", 0.0) or 0.0)
+        if not np.isfinite(flight_path) or flight_path <= 0:
+            self.message_box.append("Flight path must be > 0 to convert TOF to wavelength.")
+            return False
+
+        centers = np.asarray(centers, dtype=float)
+        adjusted_centers = centers + float(getattr(self, "delay", 0.0) or 0.0) * 1000.0
+        self.wavelengths = (adjusted_centers * 3.956) / flight_path / 1000.0
+        if len(self.wavelengths) != len(getattr(self, "images", [])):
+            self.message_box.append(
+                f"Warning: Number of wavelengths ({len(self.wavelengths)}) "
+                f"does not match number of images ({len(getattr(self, 'images', []))})."
+            )
+        self.wavelength_flight_path = flight_path
+        if source_label:
+            self.flight_path_source = source_label
+        self._update_wavelength_bounds_from_current_array()
+        if show_message:
+            self.message_box.append(
+                f"Updated {axis_label} wavelengths: {self.start_wavelength:.6f} / {self.end_wavelength:.6f} "
+                f"A using flight path {flight_path:.6f} m."
+            )
+        return True
+
+    def _recalculate_nexus_wavelengths_from_axis(self, source_label=None, show_message=True):
+        return self._recalculate_wavelengths_from_tof_axis(
+            source_label=source_label,
+            show_message=show_message,
+            axis_label="NeXus",
+        )
+
+    def _apply_instrument_settings_to_loaded_data(self):
+        if getattr(self, "fitting_data_source", "images") == "profile":
+            return False
+        if getattr(self, "manual_wavelength_mode", False):
+            self.update_wavelengths()
+            self.update_plots()
+            return True
+        if self.tof_array is not None and len(self.tof_array) > 0:
+            self.flight_path_source = "App setting"
+            self.update_wavelengths()
+            self.update_plots()
+            return True
+        if self._recalculate_wavelengths_from_tof_axis(source_label="App setting"):
+            self.update_plots()
+            return True
+        return False
 
     def update_wavelengths(self):
         """
@@ -2311,11 +2392,13 @@ class FittingMixin:
                     f"does not match number of images ({len(self.images)})."
                 )
 
-            self.start_wavelength = self.wavelengths[0]
-            self.end_wavelength = self.wavelengths[-1]
+            self.wavelength_flight_path = float(self.flight_path)
+            self._update_wavelength_bounds_from_current_array()
             self.message_box.append(
                 f"Updated start/end wavelengths: {self.start_wavelength:.6f} / {self.end_wavelength:.6f}"
             )
+        elif self._recalculate_wavelengths_from_tof_axis():
+            return
         else:
             self.wavelengths = np.array([])
             self.message_box.append("No valid ToF data to compute wavelengths.")
@@ -2451,24 +2534,36 @@ class FittingMixin:
             self._fits_progress_dialog.canceled.connect(self._cancel_fits_loading)
         return self._fits_progress_dialog
 
+    def _hide_load_progress_dialog(self):
+        """Hide the image-loading progress dialog without treating completion as cancellation."""
+        dialog = getattr(self, "_fits_progress_dialog", None)
+        if dialog is None:
+            return
+        previous_blocked = dialog.blockSignals(True)
+        dialog.hide()
+        dialog.blockSignals(previous_blocked)
+
     def _cancel_fits_loading(self):
         """Stop the worker if the user cancels loading."""
         worker = getattr(self, "fits_image_load_worker", None)
-        if worker is not None:
-            worker.requestInterruption()
-            worker.stop()
-            worker.wait(3000)
-            if worker.isRunning():
-                self.message_box.append("Stopping image loader...")
-                return
-            self.fits_image_load_worker = None
-            self.images = []
-            self.image_slider.setEnabled(False)
-            self._set_fits_image_button_states(is_loading=False)
-            self.display_image()
-            self.message_box.append("Image loading cancelled.")
-        if getattr(self, "_fits_progress_dialog", None) is not None:
-            self._fits_progress_dialog.hide()
+        if worker is None or not worker.isRunning():
+            self._hide_load_progress_dialog()
+            return
+
+        worker.requestInterruption()
+        worker.stop()
+        worker.wait(3000)
+        if worker.isRunning():
+            self.message_box.append("Stopping image loader...")
+            return
+
+        self.fits_image_load_worker = None
+        self.images = []
+        self.image_slider.setEnabled(False)
+        self._set_fits_image_button_states(is_loading=False)
+        self.display_image()
+        self.message_box.append("Image loading cancelled.")
+        self._hide_load_progress_dialog()
 
     def update_fits_load_progress(self, value):
         """
@@ -2477,8 +2572,7 @@ class FittingMixin:
         dialog = self._ensure_load_progress_dialog()
         dialog.setValue(value)
         if value >= 100:
-            dialog.hide()
-            dialog.close()
+            self._hide_load_progress_dialog()
 
     def fits_image_loading_finished(self):
         """
@@ -2493,9 +2587,7 @@ class FittingMixin:
                 self.message_box.append("Image loader is still running; cleanup deferred.")
                 return
             self.fits_image_load_worker = None
-        if getattr(self, "_fits_progress_dialog", None) is not None:
-            self._fits_progress_dialog.hide()
-            self._fits_progress_dialog.close()
+        self._hide_load_progress_dialog()
         self._set_fits_image_button_states(is_loading=False)
 
     def clear_loaded_fits_images(self):
@@ -2510,6 +2602,14 @@ class FittingMixin:
             self._fits_progress_dialog.hide()
 
         self.images = []
+        self.fitting_data_source = "images"
+        self.flight_path_source = "App setting"
+        self.current_fitting_input = ""
+        self.tof_axis_centers_us = None
+        self.wavelength_depends_on_flight_path = False
+        self.nexus_axis_centers = None
+        self.nexus_axis_uses_flight_path = False
+        self.wavelength_flight_path = None
         self.intensities = np.array([])
         self.tof_array = None
         self.wavelengths = np.array([])
@@ -2568,6 +2668,237 @@ class FittingMixin:
                 continue
             self._initialize_fit_canvas(canvas, title=title or None)
             canvas.draw_idle()
+
+    @staticmethod
+    def _read_intensity_profile_file(file_name):
+        """Read wavelength/intensity columns from CSV, TXT, XLSX, or NeXus profile data."""
+        ext = os.path.splitext(file_name)[1].lower()
+        if ext in (".nxs", ".h5", ".hdf5"):
+            return FittingMixin._read_nexus_intensity_profile_file(file_name)
+        if ext == ".xlsx":
+            frame = pd.read_excel(file_name, header=None)
+        elif ext == ".xls":
+            raise ValueError("Legacy .xls files are not supported. Save the profile as .xlsx, .csv, or .txt.")
+        else:
+            read_attempts = (
+                {"header": None, "comment": "#", "sep": None, "engine": "python"},
+                {"header": None, "comment": "#", "sep": r"[\s,;\t]+", "engine": "python"},
+            )
+            last_error = None
+            frame = None
+            for kwargs in read_attempts:
+                try:
+                    candidate = pd.read_csv(file_name, **kwargs)
+                    if candidate.shape[1] >= 2:
+                        frame = candidate
+                        break
+                    frame = candidate
+                except Exception as exc:
+                    last_error = exc
+            if frame is None:
+                raise ValueError(f"Could not read profile file: {last_error}")
+            if frame.shape[1] < 2:
+                raise ValueError("Profile file must contain at least two columns.")
+
+        if frame.shape[1] < 2:
+            raise ValueError("Profile file must contain at least two columns.")
+
+        data = frame.iloc[:, :2].copy()
+        data.columns = ["wavelength", "intensity"]
+        data["wavelength"] = pd.to_numeric(data["wavelength"], errors="coerce")
+        data["intensity"] = pd.to_numeric(data["intensity"], errors="coerce")
+        data = data.dropna(subset=["wavelength", "intensity"])
+        data = data[np.isfinite(data["wavelength"]) & np.isfinite(data["intensity"])]
+        if len(data) < 3:
+            raise ValueError("Profile file must contain at least three numeric wavelength/intensity rows.")
+
+        data = data.sort_values("wavelength")
+        return (
+            data["wavelength"].to_numpy(dtype=float),
+            data["intensity"].to_numpy(dtype=float),
+        )
+
+    @staticmethod
+    def _read_nexus_intensity_profile_file(file_name):
+        """Read a 1D wavelength/intensity profile from a NeXus/HDF5 file."""
+        candidates = []
+        with h5py.File(file_name, "r") as handle:
+            def collect(name, obj):
+                if not isinstance(obj, h5py.Dataset):
+                    return
+                if len(obj.shape) != 1 or obj.shape[0] < 3:
+                    return
+                if not np.issubdtype(obj.dtype, np.number):
+                    return
+                label_parts = [name.lower(), os.path.basename(name).lower()]
+                for attr_name in ("name", "long_name", "axis", "units"):
+                    attr_val = obj.attrs.get(attr_name)
+                    if attr_val is None:
+                        continue
+                    if isinstance(attr_val, bytes):
+                        attr_val = attr_val.decode(errors="ignore")
+                    elif isinstance(attr_val, np.ndarray):
+                        attr_val = " ".join(
+                            v.decode(errors="ignore") if isinstance(v, bytes) else str(v)
+                            for v in attr_val.ravel()
+                        )
+                    label_parts.append(str(attr_val).lower())
+                candidates.append(
+                    {
+                        "path": name,
+                        "label": " ".join(label_parts),
+                        "data": np.asarray(obj[()], dtype=float),
+                    }
+                )
+
+            handle.visititems(collect)
+
+        if len(candidates) < 2:
+            raise ValueError("NeXus file must contain at least two numeric 1D datasets.")
+
+        def score_wavelength(candidate):
+            label = candidate["label"]
+            score = 0
+            for token in ("wavelength", "lambda", "dspacing", "xso", "xs0", "x axis", "axis"):
+                if token in label:
+                    score += 5
+            if os.path.basename(candidate["path"]).lower() in ("x", "axis", "wavelength", "lambda", "column_1"):
+                score += 4
+            arr = candidate["data"]
+            if np.all(np.diff(arr) > 0):
+                score += 2
+            return score
+
+        def score_intensity(candidate):
+            label = candidate["label"]
+            score = 0
+            for token in ("intensity", "transmission", "signal", "counts", "yso", "ys0", "y axis"):
+                if token in label:
+                    score += 5
+            if os.path.basename(candidate["path"]).lower() in ("y", "data", "signal", "intensity", "column_2"):
+                score += 4
+            return score
+
+        x_candidates = sorted(candidates, key=score_wavelength, reverse=True)
+        for x_candidate in x_candidates:
+            x_data = x_candidate["data"]
+            y_candidates = [
+                candidate for candidate in candidates
+                if candidate["path"] != x_candidate["path"] and candidate["data"].shape == x_data.shape
+            ]
+            if not y_candidates:
+                continue
+            y_candidate = max(y_candidates, key=score_intensity)
+            if score_wavelength(x_candidate) <= 0 and score_intensity(y_candidate) <= 0:
+                continue
+            return FittingMixin._clean_profile_arrays(x_data, y_candidate["data"])
+
+        raise ValueError("Could not identify matching wavelength and intensity datasets in the NeXus file.")
+
+    @staticmethod
+    def _clean_profile_arrays(wavelengths, intensities):
+        wavelengths = np.asarray(wavelengths, dtype=float).reshape(-1)
+        intensities = np.asarray(intensities, dtype=float).reshape(-1)
+        if wavelengths.size != intensities.size:
+            raise ValueError("Wavelength and intensity arrays have different lengths.")
+        finite = np.isfinite(wavelengths) & np.isfinite(intensities)
+        wavelengths = wavelengths[finite]
+        intensities = intensities[finite]
+        if wavelengths.size < 3:
+            raise ValueError("Profile must contain at least three finite wavelength/intensity rows.")
+        order = np.argsort(wavelengths)
+        return wavelengths[order], intensities[order]
+
+    def _clear_loaded_images_for_profile_import(self):
+        """Release image-stack state before using an imported intensity profile."""
+        worker = getattr(self, "fits_image_load_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.stop()
+            worker.wait(3000)
+        self.fits_image_load_worker = None
+
+        if getattr(self, "_fits_progress_dialog", None) is not None:
+            self._fits_progress_dialog.hide()
+
+        self.images = []
+        self.tof_axis_centers_us = None
+        self.wavelength_depends_on_flight_path = False
+        self.nexus_axis_centers = None
+        self.nexus_axis_uses_flight_path = False
+        self.wavelength_flight_path = None
+        self.tof_array = None
+        self.current_image_index = 0
+        self.selected_area = None
+        self.current_batch_box = None
+        self.batch_box_patch = None
+        self.batch_roi_visible = False
+        self.auto_vmin = None
+        self.auto_vmax = None
+        self.current_vmin = None
+        self.current_vmax = None
+        self.manual_wavelength_mode = False
+
+        slider = getattr(self, "image_slider", None)
+        if slider is not None:
+            slider.blockSignals(True)
+            slider.setEnabled(False)
+            slider.setRange(0, 0)
+            slider.setValue(0)
+            slider.blockSignals(False)
+
+        self._set_fits_image_button_states(is_loading=False)
+        self._clear_image_canvas()
+        gc.collect()
+
+    def import_intensity_profile(self):
+        """Import a wavelength/intensity line profile and use it as the initial ROI spectrum."""
+        options = QFileDialog.Options()
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Intensity Profile",
+            "",
+            "Profile Files (*.csv *.txt *.xlsx *.nxs);;CSV Files (*.csv);;Text Files (*.txt);;Excel Files (*.xlsx);;NeXus Files (*.nxs);;All Files (*)",
+            options=options,
+        )
+        if not file_name:
+            return
+
+        try:
+            wavelengths, intensities = self._read_intensity_profile_file(file_name)
+        except Exception as exc:
+            QMessageBox.warning(self, "Import failed", f"Could not import intensity profile:\n{exc}")
+            return
+
+        self._clear_loaded_images_for_profile_import()
+        self.fitting_data_source = "profile"
+        self.folder_path = os.path.dirname(file_name)
+        self.work_directory = os.path.dirname(file_name)
+        self.current_fitting_input = file_name
+        self.wavelengths = wavelengths
+        self.intensities = intensities
+        self.start_wavelength = float(wavelengths[0])
+        self.end_wavelength = float(wavelengths[-1])
+        self.selected_region_x = wavelengths
+        self.selected_region_y = intensities
+        self.params_region1 = None
+        self.params_region2 = None
+        self.params_region3 = {}
+        self.live_fit_enabled = False
+        self.live_fit_mode = None
+
+        self.min_wavelength_input.setText(f"{self.start_wavelength:.6g}")
+        self.max_wavelength_input.setText(f"{self.end_wavelength:.6g}")
+        self._bragg_table_ready = True
+        if hasattr(self, "_reset_current_bragg_edge_state"):
+            self._reset_current_bragg_edge_state()
+        self.update_bragg_edge_table()
+        self.update_plots()
+        self._set_mapping_controls_enabled(False)
+        self.message_box.append(
+            f"Imported intensity profile from {os.path.basename(file_name)} "
+            f"({len(wavelengths)} points). Mapping is disabled for profile data."
+        )
 
     def open_batch_settings_dialog(self):
         """Dialog to edit batch fitting parameters and ROI."""
@@ -2737,9 +3068,10 @@ class FittingMixin:
             self.delay = delay_spin.value()
             self.message_box.append(f"Flight path set to {self.flight_path:.3f} m.")
             self.message_box.append(f"Time delay set to {self.delay:.4f} ms.")
-            if self.tof_array is not None:
-                self.update_wavelengths()
-                self.update_plots()
+            if self._apply_instrument_settings_to_loaded_data():
+                self.message_box.append("Loaded wavelength data updated with the current instrument settings.")
+            else:
+                self.message_box.append("No flight-path-dependent loaded data to update.")
             self.save_user_settings()
         return
 
@@ -3007,6 +3339,9 @@ class FittingMixin:
             ("fix_t", self.fix_t_enabled()),
             ("fix_eta", self.fix_eta_enabled()),
             ("flight_path", getattr(self, "flight_path", "")),
+            ("flight_path_source", getattr(self, "flight_path_source", "")),
+            ("data_source", getattr(self, "fitting_data_source", "")),
+            ("input_file", getattr(self, "current_fitting_input", "")),
             ("delay", getattr(self, "delay", "")),
             ("min_wavelength", context.get("min_wavelength")),
             ("max_wavelength", context.get("max_wavelength")),
@@ -3052,6 +3387,7 @@ class FittingMixin:
 
             # Disable the load button to prevent multiple concurrent loads
             self._set_fits_image_button_states(is_loading=True)
+            self._ensure_load_progress_dialog().setWindowTitle("Loading Images")
 
             # Start image loading in a separate thread using ImageLoadWorker
             self.fits_image_load_worker = ImageLoadWorker(folder_path)
@@ -3060,6 +3396,261 @@ class FittingMixin:
             self.fits_image_load_worker.run_loaded.connect(self.handle_fits_run_loaded)
             self.fits_image_load_worker.finished.connect(self.fits_image_loading_finished)
             self.fits_image_load_worker.start()
+
+    def load_nexus_image_stack(self):
+        """Load a NeXus file containing a detector-by-wavelength image stack."""
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select NeXus Image Stack",
+            "",
+            "NeXus Files (*.nxs *.h5 *.hdf5);;All Files (*)",
+        )
+        if not file_name:
+            return
+
+        existing_worker = getattr(self, "fits_image_load_worker", None)
+        if existing_worker is not None and existing_worker.isRunning():
+            self.message_box.append("Image loading is already in progress.")
+            return
+
+        try:
+            info = get_nexus_image_stack_info(file_name)
+        except Exception as exc:
+            QMessageBox.warning(self, "Load NeXus Stack", f"Could not inspect NeXus file:\n{exc}")
+            return
+
+        flight_path, source_label = self._choose_nexus_flight_path(info)
+        if flight_path is None:
+            self.message_box.append("NeXus image-stack loading cancelled.")
+            return
+
+        self.fits_image_load_worker = None
+        self.folder_path = os.path.dirname(file_name)
+        self.work_directory = os.path.dirname(file_name)
+        self._set_fits_image_button_states(is_loading=True)
+        self._ensure_load_progress_dialog().setWindowTitle("Loading NeXus Image Stack")
+
+        self.fits_image_load_worker = NexusImageStackLoadWorker(file_name, flight_path)
+        self.fits_image_load_worker.progress_updated.connect(self.update_fits_load_progress)
+        self.fits_image_load_worker.message.connect(self.message_box.append)
+        self.fits_image_load_worker.stack_loaded.connect(
+            lambda path, images, wavelengths, used_path, stack_info: self.handle_nexus_stack_loaded(
+                path,
+                images,
+                wavelengths,
+                used_path,
+                stack_info,
+                source_label,
+            )
+        )
+        self.fits_image_load_worker.finished.connect(self.fits_image_loading_finished)
+        self.fits_image_load_worker.start()
+
+    @staticmethod
+    def _format_byte_size(num_bytes):
+        value = float(num_bytes)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if value < 1024.0 or unit == "TB":
+                return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
+            value /= 1024.0
+        return f"{value:.2f} TB"
+
+    def load_raden_tiff_stack(self):
+        """Load a RADEN multi-page TIFF stack with sidecar TOF metadata."""
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select RADEN TIFF Stack Folder",
+            "",
+        )
+        if not folder_path:
+            return
+
+        existing_worker = getattr(self, "fits_image_load_worker", None)
+        if existing_worker is not None and existing_worker.isRunning():
+            self.message_box.append("Image loading is already in progress.")
+            return
+
+        try:
+            info = get_raden_tiff_stack_info(folder_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Load RADEN TIFF Stack", f"Could not inspect RADEN TIFF stack:\n{exc}")
+            return
+
+        flight_path = float(getattr(self, "flight_path", 0.0) or 0.0)
+        if not np.isfinite(flight_path) or flight_path <= 0:
+            QMessageBox.warning(
+                self,
+                "Load RADEN TIFF Stack",
+                "Set a positive flight path in Instrument Setting before loading a RADEN TOF stack.",
+            )
+            return
+
+        tof_axis = info.get("axes", {}).get("tof", {})
+        estimated = self._format_byte_size(info.get("estimated_bytes", 0))
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Question)
+        message.setWindowTitle("Load RADEN TIFF Stack")
+        message.setText("Load this RADEN multi-page TIFF stack for Bragg-edge fitting?")
+        message.setInformativeText(
+            f"Frames: {info['n_frames']}\n"
+            f"Image size: {info['image_shape'][1]} x {info['image_shape'][0]}\n"
+            f"TOF range: {self._format_number(tof_axis.get('min'), 6)} - "
+            f"{self._format_number(tof_axis.get('max'), 6)} {tof_axis.get('units', '')}\n"
+            f"Flight path: {flight_path:.6f} m (App setting)\n"
+            f"Estimated image memory: {estimated}"
+        )
+        message.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        message.setDefaultButton(QMessageBox.Cancel)
+        if message.exec_() != QMessageBox.Ok:
+            self.message_box.append("RADEN TIFF stack loading cancelled.")
+            return
+
+        self.fits_image_load_worker = None
+        self.folder_path = os.path.dirname(info["file_path"])
+        self.work_directory = os.path.dirname(info["file_path"])
+        self._set_fits_image_button_states(is_loading=True)
+        self._ensure_load_progress_dialog().setWindowTitle("Loading RADEN TIFF Stack")
+
+        self.fits_image_load_worker = RadenTiffStackLoadWorker(info["file_path"], flight_path)
+        self.fits_image_load_worker.progress_updated.connect(self.update_fits_load_progress)
+        self.fits_image_load_worker.message.connect(self.message_box.append)
+        self.fits_image_load_worker.stack_loaded.connect(
+            lambda path, images, wavelengths, used_path, stack_info: self.handle_raden_stack_loaded(
+                path,
+                images,
+                wavelengths,
+                used_path,
+                stack_info,
+            )
+        )
+        self.fits_image_load_worker.finished.connect(self.fits_image_loading_finished)
+        self.fits_image_load_worker.start()
+
+    def _choose_nexus_flight_path(self, info):
+        app_flight_path = float(getattr(self, "flight_path", 0.0) or 0.0)
+        nexus_flight_path = info.get("file_flight_path")
+        if nexus_flight_path is None or not np.isfinite(nexus_flight_path) or nexus_flight_path <= 0:
+            QMessageBox.information(
+                self,
+                "NeXus Flight Path",
+                (
+                    "The NeXus file does not contain enough geometry to calculate a flight path.\n"
+                    f"The current app setting ({app_flight_path:.6f} m) will be used."
+                ),
+            )
+            return app_flight_path, "App setting"
+
+        source_sample = info.get("source_sample_distance")
+        sample_detector = info.get("sample_detector_distance")
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Question)
+        message.setWindowTitle("NeXus Flight Path")
+        message.setText("Choose the flight path used to convert NeXus TOF bins to wavelength.")
+        message.setInformativeText(
+            f"NeXus geometry: {nexus_flight_path:.6f} m\n"
+            f"  source-sample: {self._format_number(source_sample, 6)} m\n"
+            f"  sample-detector: {self._format_number(sample_detector, 6)} m\n\n"
+            f"Current app setting: {app_flight_path:.6f} m"
+        )
+        nexus_button = message.addButton("Use NeXus File", QMessageBox.AcceptRole)
+        app_button = message.addButton("Use App Setting", QMessageBox.ActionRole)
+        message.addButton(QMessageBox.Cancel)
+        message.setDefaultButton(nexus_button)
+        message.exec_()
+
+        clicked = message.clickedButton()
+        if clicked is nexus_button:
+            return float(nexus_flight_path), "NeXus file"
+        if clicked is app_button:
+            return app_flight_path, "App setting"
+        return None, ""
+
+    def handle_raden_stack_loaded(self, file_path, images, wavelengths, flight_path, info):
+        """Install a loaded RADEN TIFF stack into the standard fitting state."""
+        self.fitting_data_source = "images"
+        self.flight_path = float(flight_path)
+        self.flight_path_source = "App setting"
+        self.current_fitting_input = file_path
+        self.images = list(images)
+        self.wavelengths = np.asarray(wavelengths, dtype=float)
+        self.tof_axis_centers_us = np.asarray(info.get("tof_axis_centers_us"), dtype=float)
+        self.wavelength_depends_on_flight_path = True
+        self.nexus_axis_centers = None
+        self.nexus_axis_uses_flight_path = False
+        self.wavelength_flight_path = float(flight_path)
+        self.tof_array = None
+        self.intensities = np.array([])
+        self.selected_region_x = np.array([])
+        self.selected_region_y = np.array([])
+        self.current_image_index = 0
+        self.current_batch_box = None
+        self.batch_box_patch = None
+        self.batch_roi_visible = False
+        self.manual_wavelength_mode = False
+
+        self._recalculate_wavelengths_from_tof_axis(
+            source_label=self.flight_path_source,
+            show_message=False,
+            axis_label="RADEN",
+        )
+
+        self.image_slider.setEnabled(True)
+        self.image_slider.setRange(0, len(self.images) - 1)
+        self.image_slider.setValue(0)
+        self._set_fits_image_button_states(is_loading=False)
+        self.display_image()
+        self.apply_selected_area_from_inputs()
+        self.message_box.append(
+            "RADEN TIFF stack ready for Bragg-edge fitting. "
+            f"Flight path used: {self.flight_path:.6f} m ({self.flight_path_source}). "
+            f"Wavelength range: {self.start_wavelength:.6f} - {self.end_wavelength:.6f} A."
+        )
+
+    def handle_nexus_stack_loaded(self, file_path, images, wavelengths, flight_path, info, source_label):
+        """Install a loaded NeXus image stack into the standard fitting state."""
+        self.fitting_data_source = "images"
+        self.flight_path = float(flight_path)
+        self.flight_path_source = source_label or "NeXus file"
+        self.current_fitting_input = file_path
+        self.images = list(images)
+        self.wavelengths = np.asarray(wavelengths, dtype=float)
+        self.nexus_axis_centers = info.get("axis_centers")
+        if self.nexus_axis_centers is not None:
+            self.nexus_axis_centers = np.asarray(self.nexus_axis_centers, dtype=float)
+        self.nexus_axis_uses_flight_path = bool(info.get("axis_uses_flight_path", False))
+        self.tof_axis_centers_us = self.nexus_axis_centers if self.nexus_axis_uses_flight_path else None
+        self.wavelength_depends_on_flight_path = self.nexus_axis_uses_flight_path
+        self.wavelength_flight_path = float(flight_path) if self.nexus_axis_uses_flight_path else None
+        self.tof_array = None
+        self.intensities = np.array([])
+        self.selected_region_x = np.array([])
+        self.selected_region_y = np.array([])
+        self.current_image_index = 0
+        self.current_batch_box = None
+        self.batch_box_patch = None
+        self.batch_roi_visible = False
+        self.manual_wavelength_mode = False
+
+        if self.nexus_axis_uses_flight_path:
+            self._recalculate_wavelengths_from_tof_axis(
+                source_label=self.flight_path_source,
+                show_message=False,
+                axis_label="NeXus",
+            )
+        elif self.wavelengths.size:
+            self._update_wavelength_bounds_from_current_array()
+
+        self.image_slider.setEnabled(True)
+        self.image_slider.setRange(0, len(self.images) - 1)
+        self.image_slider.setValue(0)
+        self._set_fits_image_button_states(is_loading=False)
+        self.display_image()
+        self.apply_selected_area_from_inputs()
+        self.message_box.append(
+            "NeXus image stack ready for Bragg-edge fitting. "
+            f"Flight path used: {self.flight_path:.6f} m ({self.flight_path_source}). "
+            f"Wavelength range: {self.start_wavelength:.6f} - {self.end_wavelength:.6f} A."
+        )
 
     def auto_adjust(self):
         """
@@ -3298,6 +3889,31 @@ class FittingMixin:
     # ──────────────────────────────────────────────────────────────
     # Interactive ROI dragging on the canvas (yellow box)
     # ──────────────────────────────────────────────────────────────
+    def apply_selected_area_from_inputs(self):
+        """Apply ROI coordinate edits immediately when they form a valid image ROI."""
+        if not getattr(self, "images", []):
+            return
+        try:
+            xmin = int(self.xmin_input.text())
+            xmax = int(self.xmax_input.text())
+            ymin = int(self.ymin_input.text())
+            ymax = int(self.ymax_input.text())
+        except ValueError:
+            return
+        if xmin >= xmax or ymin >= ymax:
+            return
+        height, width = self.images[0].shape
+        if xmin < 0 or ymin < 0 or xmax > width or ymax > height:
+            return
+        new_area = (xmin, xmax, ymin, ymax)
+        if getattr(self, "selected_area", None) == new_area:
+            return
+        self.selected_area = new_area
+        self._bragg_table_ready = True
+        self.update_bragg_edge_table()
+        self.display_image()
+        self.update_plots()
+
     def _on_canvas_press(self, event):
         if event.button != 1 or event.inaxes != self.canvas.axes:
             return
@@ -4262,6 +4878,10 @@ class FittingMixin:
         phase_text = phase.currentText() if phase is not None else ""
         if phase_text:
             lines.append(f"  Phase: {phase_text}")
+        lines.append(f"  Flight path: {self._format_number(getattr(self, 'flight_path', np.nan), 6)} m")
+        source = getattr(self, "flight_path_source", "")
+        if source:
+            lines.append(f"  Flight path source: {source}")
         if np.isfinite(min_wavelength) and np.isfinite(max_wavelength):
             lines.append(f"  Wavelength range: {min_wavelength:.4f} - {max_wavelength:.4f} A")
         lines.append(f"  Edges used: {len(bragg_edges)}")
@@ -4551,20 +5171,33 @@ class FittingMixin:
         )
 
     def update_plots(self):
-        if not self.images or not self.selected_area:
-            return
+        if getattr(self, "fitting_data_source", "images") == "profile":
+            if not hasattr(self, "wavelengths") or self.wavelengths is None:
+                return
+            if not hasattr(self, "intensities") or self.intensities is None:
+                return
+            self.wavelengths = np.asarray(self.wavelengths, dtype=float)
+            self.intensities = np.asarray(self.intensities, dtype=float)
+            if self.wavelengths.size == 0 or self.intensities.size == 0:
+                return
+            if self.wavelengths.size != self.intensities.size:
+                self.message_box.append("Cannot plot because wavelength and intensity profile lengths do not match.")
+                return
+        else:
+            if not self.images or not self.selected_area:
+                return
 
-        # Sum intensity in the selected area for each image
-        intensities = []
-        for img in self.images:
-            xmin, xmax, ymin, ymax = self.selected_area
-            selected_area = img[ymin:ymax, xmin:xmax]
-            intensities.append(np.sum(selected_area))
+            # Sum intensity in the selected area for each image
+            intensities = []
+            for img in self.images:
+                xmin, xmax, ymin, ymax = self.selected_area
+                selected_area = img[ymin:ymax, xmin:xmax]
+                intensities.append(np.sum(selected_area))
 
-        if not intensities:
-            return
+            if not intensities:
+                return
 
-        self.intensities = np.array(intensities)/[(xmax-xmin)*(ymax-ymin)]
+            self.intensities = np.array(intensities)/[(xmax-xmin)*(ymax-ymin)]
 
         # Clear previous fitted parameters
         self.params_region1 = None
@@ -4853,7 +5486,8 @@ class FittingMixin:
             complete_rows = sum(1 for row in range(max_rows) if self.is_row_complete(row))
             self._append_fit_message(
                 "[Individual edge fit] Started\n"
-                f"  Edges requested: {complete_rows}"
+                f"  Edges requested: {complete_rows}\n"
+                f"  Flight path: {self._format_number(getattr(self, 'flight_path', np.nan), 6)} m"
             )
         for row in range(max_rows):
             # Check whether this row has all required inputs
@@ -5400,6 +6034,9 @@ class FittingMixin:
         Initiates the batch fitting process over the ROI by calling the fit_full_pattern
         function for each box in the defined grid.
         """
+        if getattr(self, "fitting_data_source", "images") == "profile":
+            self.message_box.append("Mapping is not available for imported intensity profiles.")
+            return
         # Ensure ROI and box dimensions are defined
         try:
             box_width = int(self.box_width_input.text())
