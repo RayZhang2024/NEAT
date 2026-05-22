@@ -20,7 +20,7 @@ hiddenimports = []
 project_root = Path.cwd()
 
 # Pull in scientific/GUI stack resources and dynamic imports used at runtime.
-for package_name in ("PyQt5", "matplotlib", "numpy", "scipy", "pandas", "astropy", "PIL"):
+for package_name in ("PyQt5", "matplotlib", "numpy", "scipy", "pandas", "astropy", "PIL", "h5py", "openpyxl"):
     pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package_name)
     datas += pkg_datas
     binaries += pkg_binaries
