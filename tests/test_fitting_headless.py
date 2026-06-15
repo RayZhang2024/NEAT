@@ -125,6 +125,38 @@ class _HeadlessFitting(FittingMixin):
 
 
 class TestFittingHeadless(unittest.TestCase):
+    def test_default_bragg_edge_windows_use_current_formula_without_neighbors(self):
+        windows = _HeadlessFitting._default_bragg_edge_windows(2.0)
+
+        self.assertAlmostEqual(windows["lower_min"], 1.8)
+        self.assertAlmostEqual(windows["lower_max"], 1.96)
+        self.assertAlmostEqual(windows["upper_min"], 2.08)
+        self.assertAlmostEqual(windows["upper_max"], 2.24)
+        self.assertTrue(windows["valid"])
+
+    def test_default_bragg_edge_windows_clamp_to_adjacent_midpoints(self):
+        windows = _HeadlessFitting._default_bragg_edge_windows(
+            2.0,
+            lower_midpoint=1.90,
+            upper_midpoint=2.15,
+        )
+
+        self.assertAlmostEqual(windows["lower_min"], 1.90)
+        self.assertAlmostEqual(windows["lower_max"], 1.96)
+        self.assertAlmostEqual(windows["upper_min"], 2.08)
+        self.assertAlmostEqual(windows["upper_max"], 2.15)
+        self.assertTrue(windows["valid"])
+
+    def test_default_bragg_edge_windows_mark_too_close_neighbors_invalid(self):
+        windows = _HeadlessFitting._default_bragg_edge_windows(
+            2.0,
+            upper_midpoint=2.05,
+        )
+
+        self.assertAlmostEqual(windows["upper_min"], 2.08)
+        self.assertAlmostEqual(windows["upper_max"], 2.05)
+        self.assertFalse(windows["valid"])
+
     def test_build_batch_fit_context_parses_valid_row(self):
         obj = _HeadlessFitting()
         obj.bragg_table = _DummyTable(
@@ -132,12 +164,12 @@ class TestFittingHeadless(unittest.TestCase):
                 [
                     "(1, 1, 0)",
                     "1.697",
-                    "1.40",
-                    "1.55",
                     "1.20",
                     "1.35",
-                    "1.55",
+                    "1.40",
                     "1.95",
+                    "9.99",  # hidden Region 3 min is derived from column 2
+                    "9.99",  # hidden Region 3 max is derived from column 5
                     "0.006",
                     "0.05",
                     "0.35",
@@ -156,6 +188,8 @@ class TestFittingHeadless(unittest.TestCase):
         self.assertEqual(ctx["selected_phase"], "Fe_bcc")
         self.assertEqual(ctx["bragg_rows"][0]["hkl"], (1, 1, 0))
         self.assertTrue(ctx["bragg_rows"][0]["valid"])
+        self.assertEqual(ctx["bragg_rows"][0]["regions"][2]["min_wavelength"], 1.20)
+        self.assertEqual(ctx["bragg_rows"][0]["regions"][2]["max_wavelength"], 1.95)
         self.assertIn("(1; 1; 0)", ctx["bragg_rows_text"][0])
 
     def test_build_batch_fit_context_marks_invalid_bounds(self):

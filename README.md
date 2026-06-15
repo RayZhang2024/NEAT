@@ -31,7 +31,7 @@ All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil,
 ## 🚀 Run the GUI
 
 ### Standalone executable
-You can download the Windows standalone executable from the [NEAT v4.7.2 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.7.2/NEATv4.7.2.zip).
+You can download the Windows standalone executable from the [NEAT v4.7.4 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.7.4/NEATv4.7.4.zip).
 No installation is needed, just run the executable by doule clicking.
 
 ### 🚀 Example data
@@ -83,7 +83,7 @@ python -m NEAT.app
 ```
 
 ✅ The main window titled
-**“NEAT Neutron Bragg Edge Analysis Toolkit v4.7.2”**
+**“NEAT Neutron Bragg Edge Analysis Toolkit v4.7.4”**
 will appear, with tabs for:
 
 * **Data Preprocessing**

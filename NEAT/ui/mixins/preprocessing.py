@@ -6,8 +6,6 @@ import os
 import time
 
 import numpy as np
-from astropy.io import fits
-from PIL import Image
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QEventLoop
 from PyQt5.QtWidgets import (
@@ -41,7 +39,7 @@ from PyQt5.QtWidgets import (
     QShortcut,
 )
 
-from ...workers.batch import ImageLoadWorker, OpenBeamLoadWorker, get_raden_tiff_stack_info
+from ...workers.batch import ImageLoadWorker, OpenBeamLoadWorker, get_raden_tiff_stack_info, load_image_file
 from ...workers.preprocessing import (
     FilteringWorker,
     FullProcessWorker,
@@ -235,7 +233,7 @@ class PreprocessingMixin:
 
         # "Add Data" and "Remove Data" buttons to load and remove folder of data images
         normalisation_data_buttons_layout = QHBoxLayout()
-        self.normalisation_add_data_button = QPushButton("Add Data")
+        self.normalisation_add_data_button = QPushButton("Add sample data")
         self.normalisation_add_data_button.clicked.connect(self.add_normalisation_data_images)
         # self.normalisation_remove_data_button = QPushButton("Remove Data")
         # self.normalisation_remove_data_button.clicked.connect(self.remove_normalisation_data_images)
@@ -424,6 +422,21 @@ class PreprocessingMixin:
         full_process_group = QGroupBox("Full Process")
         full_process_layout = QVBoxLayout()
 
+        # "Add Data" and "Add Open Beam" mirror the Normalisation workflow.
+        full_process_data_buttons_layout = QHBoxLayout()
+        self.full_process_add_data_button = QPushButton("Add sample data")
+        self.full_process_add_data_button.clicked.connect(self.add_full_process_data_folder)
+        full_process_data_buttons_layout.addWidget(self.full_process_add_data_button)
+        full_process_layout.addLayout(full_process_data_buttons_layout)
+
+        full_process_openbeam_buttons_layout = QHBoxLayout()
+        self.full_process_add_open_beam_button = QPushButton("Add Open Beam")
+        self.full_process_add_open_beam_button.clicked.connect(
+            self.add_full_process_open_beam_folder
+        )
+        full_process_openbeam_buttons_layout.addWidget(self.full_process_add_open_beam_button)
+        full_process_layout.addLayout(full_process_openbeam_buttons_layout)
+
         # Output folder
         full_process_output_layout = QHBoxLayout()
         self.full_process_output_input = QLineEdit()
@@ -445,9 +458,9 @@ class PreprocessingMixin:
         self.full_process_window_half_input.setToolTip('Set binning pixel size, i.e. "n", size will be (2n+1)x(2n+1)')
         full_process_window_layout.addWidget(self.full_process_window_half_input)
 
-        # self.full_process_adjacent_input = QLineEdit("10")
-        # self.full_process_adjacent_input.setToolTip('Set moving frame window size, i.e. "10", size will be 21 (10x2+1)')
-        # full_process_window_layout.addWidget(self.full_process_adjacent_input)
+        self.full_process_adjacent_input = QLineEdit("0")
+        self.full_process_adjacent_input.setToolTip('Set moving frame window size, i.e. "m", size will be (2m+1)')
+        full_process_window_layout.addWidget(self.full_process_adjacent_input)
         full_process_layout.addLayout(full_process_window_layout)
 
         # "Run Full Process" + "Stop" buttons
@@ -574,6 +587,8 @@ class PreprocessingMixin:
             "_current_overlap_run",
             "_combined_run_2",
             "_combined_run_3",
+            "full_process_sample_folder",
+            "full_process_open_beam_folder",
         ):
             value = getattr(self, attr, None)
             cleared_images += _count_run_images(value)
@@ -628,6 +643,34 @@ class PreprocessingMixin:
             except Exception as e:
                 self.preproc_message_box.append("Error saving messages: " + str(e))
 
+    def add_full_process_data_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(
+            self, "Select Sample Folder for Full Process", ""
+        )
+        if not folder_path:
+            return
+        self.full_process_sample_folder = folder_path
+        short_path = self.get_short_path(folder_path)
+        self.preproc_message_box.append(
+            f"Selected Full Process data folder: <b>\\{short_path}</b>"
+        )
+        self.full_process_load_progress.setValue(0)
+        self.full_process_progress.setValue(0)
+
+    def add_full_process_open_beam_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(
+            self, "Select Open Beam Folder for Full Process", ""
+        )
+        if not folder_path:
+            return
+        self.full_process_open_beam_folder = folder_path
+        short_path = self.get_short_path(folder_path)
+        self.preproc_message_box.append(
+            f"Selected Full Process open beam folder: <b>\\{short_path}</b>"
+        )
+        self.full_process_load_progress.setValue(0)
+        self.full_process_progress.setValue(0)
+
     def run_full_process(self):
         """
         Orchestrates the entire pipeline:
@@ -637,18 +680,14 @@ class PreprocessingMixin:
         4) Normalisation
         """
         # -- Grab needed UI values from the 'Full Process' block --
-        sample_folder = QFileDialog.getExistingDirectory(
-            self, "Select Sample Folder for Full Process", ""
-        )
-        if not sample_folder:
-            self.preproc_message_box.append("No sample folder selected. Aborting full process.")
+        sample_folder = getattr(self, "full_process_sample_folder", None)
+        if not sample_folder or not os.path.isdir(sample_folder):
+            self.preproc_message_box.append("Please add a valid data folder for the full process.")
             return
 
-        open_beam_folder = QFileDialog.getExistingDirectory(
-            self, "Select Open Beam Folder for Full Process", ""
-        )
-        if not open_beam_folder:
-            self.preproc_message_box.append("No open beam folder selected. Aborting full process.")
+        open_beam_folder = getattr(self, "full_process_open_beam_folder", None)
+        if not open_beam_folder or not os.path.isdir(open_beam_folder):
+            self.preproc_message_box.append("Please add a valid open beam folder for the full process.")
             return
 
         output_folder = self.full_process_output_input.text().strip()
@@ -665,12 +704,10 @@ class PreprocessingMixin:
         except ValueError:
             window_half = 10
 
-
-        # try:
-        #     adjacent_sum = int(self.full_process_adjacent_input.text().strip())
-        # except ValueError:
-        #     adjacent_sum = 10
-        adjacent_sum = 0
+        try:
+            adjacent_sum = int(self.full_process_adjacent_input.text().strip())
+        except ValueError:
+            adjacent_sum = 0
 
         # Disable the button to prevent duplicates; enable the Stop button
         self.full_process_start_button.setEnabled(False)
@@ -2185,17 +2222,7 @@ class PreprocessingMixin:
         file_path_short = self.get_short_path(file_path, levels=2)
         if file_path:
             try:
-                ext = os.path.splitext(file_path)[1].lower()
-                if ext in (".fits", ".fit", ".fts"):
-                    with fits.open(file_path) as hdul:
-                        if hdul[0].data is None:
-                            raise ValueError("No data found in FITS primary HDU.")
-                        raw_mask = hdul[0].data
-                elif ext in (".tif", ".tiff"):
-                    raw_mask = np.array(Image.open(file_path))
-                else:
-                    raise ValueError("Unsupported mask format. Use FITS or TIFF.")
-
+                raw_mask = load_image_file(file_path)
                 mask_data = np.asarray(raw_mask)
                 mask_data = np.squeeze(mask_data)
                 if mask_data.ndim == 3:

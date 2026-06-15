@@ -29,23 +29,44 @@ if imageio is None and Image is None:  # pragma: no cover
         Image = None
 
 
+def _flip_vertical_image_axis(data):
+    """Flip the image row axis while preserving leading stack dimensions."""
+    arr = np.asarray(data)
+    if arr.ndim < 2:
+        return arr
+    return np.flip(arr, axis=-2)
+
+
 def load_image_file(file_path):
     ext = os.path.splitext(file_path)[1].lower()
-    if ext in (".fits", ".fit"):
-        return fits.getdata(file_path)
+    if ext in (".fits", ".fit", ".fts"):
+        # FITS viewers such as ImageJ display the detector row axis opposite to
+        # NumPy/Matplotlib's default row order. Keep NEAT's in-memory arrays in
+        # the same top-to-bottom orientation users see in ImageJ.
+        return _flip_vertical_image_axis(fits.getdata(file_path, memmap=False))
     if imageio is not None:
         arr = imageio.imread(file_path)
-        # TIFFs are read with inverted vertical axis compared to FITS; flip to match FITS orientation.
+        # Keep TIFFs aligned with NEAT's ImageJ-style display orientation.
         if ext in (".tiff", ".tif"):
-            arr = np.flipud(arr)
+            arr = _flip_vertical_image_axis(arr)
         return arr
     if Image is not None:
         with Image.open(file_path) as img:
             arr = np.array(img)
         if ext in (".tiff", ".tif"):
-            arr = np.flipud(arr)
+            arr = _flip_vertical_image_axis(arr)
         return arr
     raise ImportError("Neither imageio nor Pillow is available to read TIFF files.")
+
+
+def write_fits_image_file(file_path, data, header=None, overwrite=True):
+    """Write a NEAT display-oriented image so ImageJ renders it the same way."""
+    fits.writeto(
+        file_path,
+        _flip_vertical_image_axis(data),
+        header=header,
+        overwrite=overwrite,
+    )
 from PyQt5.QtCore import QThread, pyqtSignal
 from scipy.interpolate import griddata
 from scipy.optimize import curve_fit, least_squares

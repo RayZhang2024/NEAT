@@ -4,6 +4,72 @@ import numpy as np
 from scipy import special
 
 
+UNCERTAINTY_ESTIMATOR_TARGETS = (
+    "macro_pixel_size",
+    "uamp",
+    "fitting_uncertainty",
+)
+
+
+def _validate_positive_parameter(name, value):
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive finite number") from exc
+
+    if not np.isfinite(numeric_value) or numeric_value <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return numeric_value
+
+
+def calculate_uncertainty_estimator_constant(
+    macro_pixel_size,
+    uamp,
+    fitting_uncertainty,
+):
+    """Return K = macro pixel size * Uamp * fitting uncertainty squared."""
+    macro_pixel_size = _validate_positive_parameter("Macro pixel size", macro_pixel_size)
+    uamp = _validate_positive_parameter("Uamp", uamp)
+    fitting_uncertainty = _validate_positive_parameter(
+        "Fitting uncertainty", fitting_uncertainty
+    )
+    return macro_pixel_size * uamp * fitting_uncertainty**2
+
+
+def estimate_uncertainty_parameter(
+    constant,
+    target,
+    *,
+    macro_pixel_size=None,
+    uamp=None,
+    fitting_uncertainty=None,
+):
+    """Estimate one parameter from K = macro pixel size * Uamp * uncertainty^2."""
+    constant = _validate_positive_parameter("Estimator constant", constant)
+    if target not in UNCERTAINTY_ESTIMATOR_TARGETS:
+        raise ValueError(f"Unknown uncertainty estimator target: {target}")
+
+    if target == "macro_pixel_size":
+        uamp = _validate_positive_parameter("Uamp", uamp)
+        fitting_uncertainty = _validate_positive_parameter(
+            "Fitting uncertainty", fitting_uncertainty
+        )
+        return constant / (uamp * fitting_uncertainty**2)
+
+    if target == "uamp":
+        macro_pixel_size = _validate_positive_parameter(
+            "Macro pixel size", macro_pixel_size
+        )
+        fitting_uncertainty = _validate_positive_parameter(
+            "Fitting uncertainty", fitting_uncertainty
+        )
+        return constant / (macro_pixel_size * fitting_uncertainty**2)
+
+    macro_pixel_size = _validate_positive_parameter("Macro pixel size", macro_pixel_size)
+    uamp = _validate_positive_parameter("Uamp", uamp)
+    return np.sqrt(constant / (macro_pixel_size * uamp))
+
+
 def calculate_d_spacing_general(structure_type, lattice_params, hkl):
     """Return d_hkl for the given structure/lattice; np.nan if invalid."""
     try:
@@ -193,6 +259,9 @@ PHASE_DATA = {
 
 
 __all__ = [
+    "UNCERTAINTY_ESTIMATOR_TARGETS",
+    "calculate_uncertainty_estimator_constant",
+    "estimate_uncertainty_parameter",
     "fitting_function_1",
     "fitting_function_2",
     "fitting_function_3",

@@ -192,6 +192,81 @@ class CheckableBraggHeader(QHeaderView):
 
 
 class FittingMixin:
+    BRAGG_REGION3_SOURCE_MIN_COL = 2
+    BRAGG_REGION3_SOURCE_MAX_COL = 5
+    BRAGG_REGION3_MIN_COL = 6
+    BRAGG_REGION3_MAX_COL = 7
+
+    @staticmethod
+    def _default_bragg_edge_windows(x_hkl, lower_midpoint=None, upper_midpoint=None):
+        """Return default edge windows, clamped by adjacent-edge midpoints."""
+        lower_window_min = max(x_hkl * 0.90, x_hkl - 0.3)
+        lower_window_max = x_hkl * 0.98
+        upper_window_min = x_hkl * 1.04
+        upper_window_max = min(x_hkl * 1.12, x_hkl + 0.4)
+
+        if lower_midpoint is not None and np.isfinite(lower_midpoint):
+            lower_window_min = max(lower_window_min, float(lower_midpoint))
+        if upper_midpoint is not None and np.isfinite(upper_midpoint):
+            upper_window_max = min(upper_window_max, float(upper_midpoint))
+
+        return {
+            "lower_min": lower_window_min,
+            "lower_max": lower_window_max,
+            "upper_min": upper_window_min,
+            "upper_max": upper_window_max,
+            "valid": lower_window_min < lower_window_max and upper_window_min < upper_window_max,
+        }
+
+    def _bragg_cell_text(self, row, col):
+        table = getattr(self, "bragg_table", None)
+        if table is None:
+            return ""
+        item = table.item(row, col)
+        return item.text().strip() if item is not None else ""
+
+    def _set_bragg_cell_text_if_changed(self, row, col, text):
+        table = getattr(self, "bragg_table", None)
+        if table is None:
+            return
+        item = table.item(row, col)
+        if item is None:
+            item = QtWidgets.QTableWidgetItem()
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            table.setItem(row, col, item)
+        if item.text() != text:
+            item.setText(text)
+
+    def _sync_derived_region3_bounds(self, row):
+        """
+        Keep hidden Region 3 bounds derived from the visible edge-window bounds.
+
+        The UI no longer exposes independent Region 3 inputs. Region 3 spans
+        visible "1 Min" through visible "2 Max", preserving existing internal
+        columns for fitting and saved-configuration compatibility.
+        """
+        table = getattr(self, "bragg_table", None)
+        if table is None or row < 0 or row >= table.rowCount():
+            return
+        if not hasattr(table, "setItem") or not hasattr(table, "blockSignals"):
+            return
+
+        r3_min_text = self._bragg_cell_text(row, self.BRAGG_REGION3_SOURCE_MIN_COL)
+        r3_max_text = self._bragg_cell_text(row, self.BRAGG_REGION3_SOURCE_MAX_COL)
+        previous_blocked = table.blockSignals(True)
+        try:
+            self._set_bragg_cell_text_if_changed(row, self.BRAGG_REGION3_MIN_COL, r3_min_text)
+            self._set_bragg_cell_text_if_changed(row, self.BRAGG_REGION3_MAX_COL, r3_max_text)
+        finally:
+            table.blockSignals(previous_blocked)
+
+    def _sync_all_derived_region3_bounds(self):
+        table = getattr(self, "bragg_table", None)
+        if table is None:
+            return
+        for row in range(table.rowCount()):
+            self._sync_derived_region3_bounds(row)
+
     def _build_batch_fit_context(self):
         """Snapshot fit inputs from UI so worker threads do not read widgets directly."""
         def _safe_float_text(text):
@@ -206,10 +281,22 @@ class FittingMixin:
         bragg_rows_text = []
 
         for row_idx in range(table.rowCount()):
+            self._sync_derived_region3_bounds(row_idx)
             row_items = []
             for col_idx in range(table.columnCount()):
                 cell_item = table.item(row_idx, col_idx)
                 row_items.append(cell_item.text() if cell_item else "")
+            if len(row_items) > self.BRAGG_REGION3_MAX_COL:
+                row_items[self.BRAGG_REGION3_MIN_COL] = (
+                    row_items[self.BRAGG_REGION3_SOURCE_MIN_COL]
+                    if len(row_items) > self.BRAGG_REGION3_SOURCE_MIN_COL
+                    else ""
+                )
+                row_items[self.BRAGG_REGION3_MAX_COL] = (
+                    row_items[self.BRAGG_REGION3_SOURCE_MAX_COL]
+                    if len(row_items) > self.BRAGG_REGION3_SOURCE_MAX_COL
+                    else ""
+                )
             bragg_rows_text.append("|".join(v.replace(",", ";") for v in row_items))
 
             hkl_tuple = None
@@ -459,6 +546,8 @@ class FittingMixin:
             "3 Min", "3 Max",
             "  s", "  t", "  eta"
         ])
+        self.bragg_table.setColumnHidden(self.BRAGG_REGION3_MIN_COL, True)
+        self.bragg_table.setColumnHidden(self.BRAGG_REGION3_MAX_COL, True)
         self.bragg_header.setSectionResizeMode(QHeaderView.Stretch)
         self.bragg_header.set_checkable_column(8, self.fix_s)
         self.bragg_header.set_checkable_column(9, self.fix_t)
@@ -468,6 +557,7 @@ class FittingMixin:
         self.bragg_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.bragg_table.setSelectionMode(QTableWidget.SingleSelection)
         self.bragg_table.itemSelectionChanged.connect(self.on_bragg_edge_selected)
+        self.bragg_table.itemChanged.connect(self._on_bragg_table_item_changed)
         lower_left_layout.addWidget(self.bragg_table)
 
         # 1) Define the tooltip text, in the same order as the columns
@@ -671,6 +761,17 @@ class FittingMixin:
         # Connect wavelength input changes to update plots
         self.min_wavelength_input.editingFinished.connect(self.update_plots)
         self.max_wavelength_input.editingFinished.connect(self.update_plots)
+
+    def _on_bragg_table_item_changed(self, item):
+        if item is None:
+            return
+        if item.column() in (
+            self.BRAGG_REGION3_SOURCE_MIN_COL,
+            self.BRAGG_REGION3_SOURCE_MAX_COL,
+        ):
+            self._sync_derived_region3_bounds(item.row())
+            if item.row() == self.bragg_table.currentRow():
+                self._sync_current_bragg_edge_from_row(item.row())
 
     def _normalize_fitting_plot_layout_mode(self, mode):
         """Return the canonical fitting plot layout mode."""
@@ -1551,6 +1652,8 @@ class FittingMixin:
 
         bragg_edges = []
         for row in range(total_edges):
+            if source_rows is None:
+                self._sync_derived_region3_bounds(row)
             if source_rows is not None:
                 row_data = source_rows[row]
                 if not row_data.get("valid"):
@@ -2531,8 +2634,20 @@ class FittingMixin:
             self._fits_progress_dialog.setWindowTitle("Loading Images")
             self._fits_progress_dialog.setAutoClose(False)
             self._fits_progress_dialog.setAutoReset(False)
+            self._fits_progress_dialog.setMinimumDuration(0)
             self._fits_progress_dialog.canceled.connect(self._cancel_fits_loading)
         return self._fits_progress_dialog
+
+    def _show_load_progress_dialog(self, title, label_text="Loading images..."):
+        """Reset and show the reused image-loading progress dialog."""
+        dialog = self._ensure_load_progress_dialog()
+        dialog.setWindowTitle(title)
+        dialog.setLabelText(label_text)
+        dialog.setRange(0, 100)
+        dialog.setValue(0)
+        dialog.show()
+        dialog.raise_()
+        return dialog
 
     def _hide_load_progress_dialog(self):
         """Hide the image-loading progress dialog without treating completion as cancellation."""
@@ -2981,13 +3096,7 @@ class FittingMixin:
         add_aligned_row(roi_layout, "Y Max:", max_y_edit)
         dialog_layout.addWidget(mapping_group)
 
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.button(QDialogButtonBox.Ok).setText("Apply")
-        dialog_layout.addWidget(button_box)
-        button_box.accepted.connect(dialog.accept)
-        button_box.rejected.connect(dialog.reject)
-
-        if dialog.exec_() == QDialog.Accepted:
+        def apply_mapping_settings():
             try:
                 box_width = int(width_edit.text())
                 box_height = int(height_edit.text())
@@ -2999,7 +3108,7 @@ class FittingMixin:
                 max_y = int(max_y_edit.text())
             except ValueError:
                 QMessageBox.warning(self, "Invalid Input", "All values must be integers.")
-                return
+                return False
 
             self.box_width_input.setText(str(box_width))
             self.box_height_input.setText(str(box_height))
@@ -3014,6 +3123,20 @@ class FittingMixin:
 
             # Do NOT overwrite the current picked ROI (selected_area); batch settings
             # should not change the spectra used for single-pixel fits.
+            return True
+
+        def apply_and_close():
+            if apply_mapping_settings():
+                dialog.accept()
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Apply | QDialogButtonBox.Cancel
+        )
+        dialog_layout.addWidget(button_box)
+        button_box.button(QDialogButtonBox.Apply).clicked.connect(apply_mapping_settings)
+        button_box.button(QDialogButtonBox.Ok).clicked.connect(apply_and_close)
+        button_box.rejected.connect(dialog.reject)
+        dialog.exec_()
 
     def _apply_mapping_settings_from_inputs(self, redraw=True, persist=True):
         """Apply current mapping input fields to the active mapping ROI state."""
@@ -3278,6 +3401,7 @@ class FittingMixin:
                     val = parts[col_idx] if col_idx < len(parts) else ""
                     item = QTableWidgetItem(val)
                     self.bragg_table.setItem(row_idx, col_idx, item)
+                self._sync_derived_region3_bounds(row_idx)
             self._bragg_table_ready = True
 
         mapping_keys = {
@@ -3379,6 +3503,7 @@ class FittingMixin:
             if existing_worker is not None and existing_worker.isRunning():
                 self.message_box.append("Image loading is already in progress.")
                 return
+            self.clear_loaded_fits_images()
             self.fits_image_load_worker = None
 
             self.folder_path = folder_path
@@ -3387,7 +3512,7 @@ class FittingMixin:
 
             # Disable the load button to prevent multiple concurrent loads
             self._set_fits_image_button_states(is_loading=True)
-            self._ensure_load_progress_dialog().setWindowTitle("Loading Images")
+            self._show_load_progress_dialog("Loading Images")
 
             # Start image loading in a separate thread using ImageLoadWorker
             self.fits_image_load_worker = ImageLoadWorker(folder_path)
@@ -3424,11 +3549,12 @@ class FittingMixin:
             self.message_box.append("NeXus image-stack loading cancelled.")
             return
 
+        self.clear_loaded_fits_images()
         self.fits_image_load_worker = None
         self.folder_path = os.path.dirname(file_name)
         self.work_directory = os.path.dirname(file_name)
         self._set_fits_image_button_states(is_loading=True)
-        self._ensure_load_progress_dialog().setWindowTitle("Loading NeXus Image Stack")
+        self._show_load_progress_dialog("Loading NeXus Image Stack", "Loading NeXus image stack...")
 
         self.fits_image_load_worker = NexusImageStackLoadWorker(file_name, flight_path)
         self.fits_image_load_worker.progress_updated.connect(self.update_fits_load_progress)
@@ -3505,11 +3631,12 @@ class FittingMixin:
             self.message_box.append("RADEN TIFF stack loading cancelled.")
             return
 
+        self.clear_loaded_fits_images()
         self.fits_image_load_worker = None
         self.folder_path = os.path.dirname(info["file_path"])
         self.work_directory = os.path.dirname(info["file_path"])
         self._set_fits_image_button_states(is_loading=True)
-        self._ensure_load_progress_dialog().setWindowTitle("Loading RADEN TIFF Stack")
+        self._show_load_progress_dialog("Loading RADEN TIFF Stack", "Loading RADEN TIFF stack...")
 
         self.fits_image_load_worker = RadenTiffStackLoadWorker(info["file_path"], flight_path)
         self.fits_image_load_worker.progress_updated.connect(self.update_fits_load_progress)
@@ -4603,6 +4730,7 @@ class FittingMixin:
         if row < 0:
             row = 0
 
+        self._sync_derived_region3_bounds(row)
         try:
             bounds = (
                 float(table.item(row, 4).text()),
@@ -5404,6 +5532,7 @@ class FittingMixin:
             return min(xmins), max(xmaxs)
 
         # Start each run from clean result canvases so previous fits do not accumulate.
+        self._sync_all_derived_region3_bounds()
         max_rows = min(5, self.bragg_table.rowCount())
         region_ranges = {
             "Region 1": _range_from_rows(2, 3, max_rows),  # plotted on canvas_b
@@ -5541,6 +5670,7 @@ class FittingMixin:
         """
         # Example: columns 0..9 are all relevant. 
         # If you want to skip 'd' or 'hkl' checks, remove them from required_columns. 
+        self._sync_derived_region3_bounds(row_index)
         required_columns = [0,1,2,3,4,5,6,7,8,9,10]
 
         for col in required_columns:
@@ -5635,6 +5765,7 @@ class FittingMixin:
                 t_val = float(row_data.get("t"))
                 eta_val = float(row_data.get("eta"))
             else:
+                self._sync_derived_region3_bounds(row_number)
                 r1_min = float(self.bragg_table.item(row_number, 4).text())
                 r1_max = float(self.bragg_table.item(row_number, 5).text())
                 r2_min = float(self.bragg_table.item(row_number, 2).text())

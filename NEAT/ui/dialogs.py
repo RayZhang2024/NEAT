@@ -11,12 +11,14 @@ from PyQt5.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
-    QComboBox,
-    QDesktopWidget,
-    QDialog,
-    QDoubleSpinBox,
+        QComboBox,
+        QDesktopWidget,
+        QDialog,
+        QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -33,9 +35,16 @@ from PyQt5.QtWidgets import (
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-from matplotlib.patches import Circle, Rectangle
+from matplotlib.path import Path
+from matplotlib.patches import Circle, Polygon, Rectangle
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import zoom
+
+from ..core import (
+    calculate_uncertainty_estimator_constant,
+    estimate_uncertainty_parameter,
+)
+from ..workers.batch import load_image_file, write_fits_image_file
 
 
 def _scaled_geometry(width_factor: float, height_factor: float) -> tuple[int, int]:
@@ -82,6 +91,10 @@ class MaskGeneratorDialog(QDialog):
         self._painting = False
         self._brush_outline = None
         self._last_cursor = None
+        self._rectangle_start = None
+        self._rectangle_preview = None
+        self._polygon_points = []
+        self._polygon_preview = None
         self._undo_stack = deque(maxlen=50)
         self._overlay_colors = {
             "Green": (0.0, 1.0, 0.0),
@@ -191,11 +204,17 @@ class MaskGeneratorDialog(QDialog):
         left_layout.addLayout(controls_row_5)
 
         controls_row_6 = QHBoxLayout()
-        controls_row_6.addWidget(QLabel("Brush size:"))
+        controls_row_6.addWidget(QLabel("Tool:"))
+        self.mask_tool_combo = QComboBox()
+        self.mask_tool_combo.addItems(["Brush", "Rectangle", "Polygon"])
+        self.mask_tool_combo.setMaximumWidth(160)
+        self.mask_tool_combo.currentTextChanged.connect(self._on_mask_tool_changed)
+        controls_row_6.addWidget(self.mask_tool_combo)
         controls_row_6.addStretch()
         left_layout.addLayout(controls_row_6)
 
         controls_row_7 = QHBoxLayout()
+        controls_row_7.addWidget(QLabel("Brush size:"))
         self.brush_size_slider = QSlider(Qt.Horizontal)
         self.brush_size_slider.setRange(1, 40)
         self.brush_size_slider.setValue(8)
@@ -237,6 +256,18 @@ class MaskGeneratorDialog(QDialog):
         controls_row_9.addStretch()
         left_layout.addLayout(controls_row_9)
 
+        controls_row_polygon = QHBoxLayout()
+        self.finish_polygon_button = QPushButton("Finish Polygon")
+        self.finish_polygon_button.clicked.connect(self.finish_polygon_selection)
+        self.finish_polygon_button.setEnabled(False)
+        self.cancel_polygon_button = QPushButton("Cancel Polygon")
+        self.cancel_polygon_button.clicked.connect(self.cancel_polygon_selection)
+        self.cancel_polygon_button.setEnabled(False)
+        controls_row_polygon.addWidget(self.finish_polygon_button)
+        controls_row_polygon.addWidget(self.cancel_polygon_button)
+        controls_row_polygon.addStretch()
+        left_layout.addLayout(controls_row_polygon)
+
         self.canvas = MplCanvas(self, width=8, height=6, dpi=100)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.fig.subplots_adjust(left=0.02, right=0.99, top=0.95, bottom=0.03)
@@ -249,6 +280,10 @@ class MaskGeneratorDialog(QDialog):
         right_layout.addWidget(self.toolbar)
 
         controls_row_10 = QHBoxLayout()
+        self.apply_mask_button = QPushButton("Preview Mask")
+        self.apply_mask_button.setCheckable(True)
+        self.apply_mask_button.toggled.connect(lambda _: self._draw_mask_preview())
+        controls_row_10.addWidget(self.apply_mask_button)
         self.save_mask_button = QPushButton("Save Mask")
         self.save_mask_button.clicked.connect(self.save_mask)
         controls_row_10.addWidget(self.save_mask_button)
@@ -298,17 +333,7 @@ class MaskGeneratorDialog(QDialog):
             return
 
         try:
-            ext = os.path.splitext(file_path)[1].lower()
-            if ext in (".fits", ".fit", ".fts"):
-                with fits.open(file_path) as hdul:
-                    if hdul[0].data is None:
-                        raise ValueError("No image data found in primary FITS HDU.")
-                    raw = hdul[0].data
-            elif ext in (".tif", ".tiff"):
-                raw = np.array(Image.open(file_path))
-            else:
-                raise ValueError("Unsupported file format. Use FITS or TIFF.")
-
+            raw = load_image_file(file_path)
             self.source_image = self._to_grayscale(raw)
             finite = np.isfinite(self.source_image)
             if not np.any(finite):
@@ -330,15 +355,22 @@ class MaskGeneratorDialog(QDialog):
         if self._threshold_min is None or self._threshold_max is None:
             return
 
+        self._painting = False
+        self._rectangle_start = None
+        self._polygon_points = []
+        self._remove_rectangle_preview()
+        self._remove_polygon_preview()
+        self._update_polygon_button_state()
+
         slider_value = self.threshold_slider.value() / 1000.0
         threshold = self._threshold_min + slider_value * (self._threshold_max - self._threshold_min)
         self.threshold_value_label.setText(self._format_threshold_value(threshold))
 
         finite = np.isfinite(self.source_image)
         if self.invert_threshold_checkbox.isChecked():
-            mask = (self.source_image <= threshold) & finite
-        else:
             mask = (self.source_image >= threshold) & finite
+        else:
+            mask = (self.source_image <= threshold) & finite
 
         self.current_mask = mask.astype(np.uint8)
         # Threshold-based mask rebuilds are intentionally non-undoable.
@@ -363,6 +395,8 @@ class MaskGeneratorDialog(QDialog):
             saved_ylim = ax.get_ylim()
         ax.clear()
         self._brush_outline = None
+        self._rectangle_preview = None
+        self._polygon_preview = None
 
         if self.source_image is None:
             ax.set_title("Load an image to generate a mask", fontsize=10)
@@ -380,8 +414,18 @@ class MaskGeneratorDialog(QDialog):
         else:
             vmin, vmax = 0.0, 1.0
 
-        ax.imshow(self.source_image, cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
-        if self.current_mask is not None:
+        apply_mask_preview = (
+            hasattr(self, "apply_mask_button")
+            and self.apply_mask_button.isChecked()
+            and self.current_mask is not None
+        )
+        if apply_mask_preview:
+            display_image = np.where(self.current_mask > 0, self.source_image, np.nan)
+            ax.imshow(display_image, cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
+        else:
+            ax.imshow(self.source_image, cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
+
+        if self.current_mask is not None and not apply_mask_preview:
             color_name = self.overlay_color_combo.currentText()
             r, g, b = self._overlay_colors.get(color_name, self._overlay_colors["Green"])
             overlay = np.zeros((*self.current_mask.shape, 4), dtype=np.float32)
@@ -395,7 +439,10 @@ class MaskGeneratorDialog(QDialog):
             ax.set_xlim(saved_xlim)
             ax.set_ylim(saved_ylim)
         ax.set_position([0.01, 0.05, 0.98, 0.90])
-        ax.set_title("Mask preview (highlight = kept / value 1)", fontsize=10)
+        if apply_mask_preview:
+            ax.set_title("Mask-applied preview (visible = kept / value 1)", fontsize=10)
+        else:
+            ax.set_title("Mask preview (highlight = kept / value 1)", fontsize=10)
         ax.set_axis_off()
         self.canvas.draw_idle()
 
@@ -461,7 +508,66 @@ class MaskGeneratorDialog(QDialog):
     def _refresh_brush_outline_style(self):
         if self._brush_outline is not None:
             self._brush_outline.set_edgecolor(self._brush_outline_color())
+        if self._rectangle_preview is not None:
+            self._rectangle_preview.set_edgecolor(self._selection_preview_color())
+        if self._polygon_preview is not None:
+            self._polygon_preview.set_edgecolor(self._selection_preview_color())
+        if (
+            self._brush_outline is not None
+            or self._rectangle_preview is not None
+            or self._polygon_preview is not None
+        ):
             self.canvas.draw_idle()
+
+    def _on_mask_tool_changed(self, tool_name):
+        self._painting = False
+        self._rectangle_start = None
+        self._remove_brush_outline()
+        self._remove_rectangle_preview()
+        self.cancel_polygon_selection()
+        is_brush = tool_name == "Brush"
+        self.brush_size_slider.setEnabled(is_brush)
+        self.brush_shape_combo.setEnabled(is_brush)
+        self._update_polygon_button_state()
+        self.canvas.draw_idle()
+
+    def _mask_edit_value(self):
+        if self.keep_radio.isChecked():
+            return 1
+        if self.exclude_radio.isChecked():
+            return 0
+        self.status_label.setText("Select Brush or Erase to edit mask.")
+        return None
+
+    def _active_mask_tool(self):
+        return self.mask_tool_combo.currentText()
+
+    def _remove_rectangle_preview(self):
+        if self._rectangle_preview is not None:
+            try:
+                self._rectangle_preview.remove()
+            except Exception:
+                pass
+            self._rectangle_preview = None
+
+    def _remove_polygon_preview(self):
+        if self._polygon_preview is not None:
+            try:
+                self._polygon_preview.remove()
+            except Exception:
+                pass
+            self._polygon_preview = None
+
+    def _selection_preview_color(self):
+        return self._brush_outline_color()
+
+    def _update_polygon_button_state(self):
+        is_polygon = getattr(self, "mask_tool_combo", None) is not None and self._active_mask_tool() == "Polygon"
+        has_points = bool(self._polygon_points)
+        if hasattr(self, "finish_polygon_button"):
+            self.finish_polygon_button.setEnabled(is_polygon and len(self._polygon_points) >= 3)
+        if hasattr(self, "cancel_polygon_button"):
+            self.cancel_polygon_button.setEnabled(is_polygon and has_points)
 
     def _refresh_brush_outline_geometry(self, *_args):
         if self._last_cursor is not None:
@@ -471,6 +577,10 @@ class MaskGeneratorDialog(QDialog):
         if self.source_image is None or xdata is None or ydata is None:
             self._remove_brush_outline()
             self._last_cursor = None
+            self.canvas.draw_idle()
+            return
+        if self._active_mask_tool() != "Brush":
+            self._remove_brush_outline()
             self.canvas.draw_idle()
             return
         if self._is_navigation_mode_active():
@@ -538,12 +648,8 @@ class MaskGeneratorDialog(QDialog):
         if self.current_mask is None or xdata is None or ydata is None:
             return
 
-        if self.keep_radio.isChecked():
-            brush_value = 1
-        elif self.exclude_radio.isChecked():
-            brush_value = 0
-        else:
-            self.status_label.setText("Select Brush or Erase to edit mask.")
+        brush_value = self._mask_edit_value()
+        if brush_value is None:
             return
 
         h, w = self.current_mask.shape
@@ -568,6 +674,140 @@ class MaskGeneratorDialog(QDialog):
         self._draw_mask_preview()
         self._update_brush_outline(x, y)
 
+    def _image_point_from_event(self, event):
+        if event.xdata is None or event.ydata is None or self.current_mask is None:
+            return None
+        h, w = self.current_mask.shape
+        x = int(round(event.xdata))
+        y = int(round(event.ydata))
+        x = max(0, min(w - 1, x))
+        y = max(0, min(h - 1, y))
+        return x, y
+
+    def _start_rectangle_selection(self, event):
+        point = self._image_point_from_event(event)
+        if point is None:
+            return
+        self._rectangle_start = point
+        self._update_rectangle_preview(point)
+        self.status_label.setText("Drag to size the rectangle, then release to apply.")
+
+    def _update_rectangle_preview(self, current_point):
+        if self._rectangle_start is None or current_point is None:
+            return
+        x0, y0 = self._rectangle_start
+        x1, y1 = current_point
+        left = min(x0, x1) - 0.5
+        top = min(y0, y1) - 0.5
+        width = abs(x1 - x0) + 1
+        height = abs(y1 - y0) + 1
+        if self._rectangle_preview is None:
+            self._rectangle_preview = Rectangle(
+                (left, top),
+                width,
+                height,
+                fill=False,
+                linewidth=1.4,
+                edgecolor=self._selection_preview_color(),
+                linestyle="-",
+            )
+            self.canvas.axes.add_patch(self._rectangle_preview)
+        else:
+            self._rectangle_preview.set_xy((left, top))
+            self._rectangle_preview.set_width(width)
+            self._rectangle_preview.set_height(height)
+            self._rectangle_preview.set_edgecolor(self._selection_preview_color())
+        self.canvas.draw_idle()
+
+    def _finish_rectangle_selection(self, event):
+        if self._rectangle_start is None or self.current_mask is None:
+            return
+        end_point = self._image_point_from_event(event)
+        if end_point is None:
+            self._rectangle_start = None
+            self._remove_rectangle_preview()
+            self.canvas.draw_idle()
+            return
+
+        edit_value = self._mask_edit_value()
+        if edit_value is None:
+            return
+
+        x0, y0 = self._rectangle_start
+        x1, y1 = end_point
+        x_min, x_max = sorted((x0, x1))
+        y_min, y_max = sorted((y0, y1))
+        self._push_undo_snapshot()
+        self.current_mask[y_min : y_max + 1, x_min : x_max + 1] = edit_value
+        self._rectangle_start = None
+        self._remove_rectangle_preview()
+        self._draw_mask_preview(preserve_view=True)
+        self.status_label.setText("Rectangle applied to mask.")
+
+    def _add_polygon_point(self, event):
+        point = self._image_point_from_event(event)
+        if point is None:
+            return
+        self._polygon_points.append(point)
+        self._update_polygon_preview()
+        self._update_polygon_button_state()
+        self.status_label.setText(f"Polygon points: {len(self._polygon_points)}")
+
+    def _update_polygon_preview(self, cursor_point=None):
+        self._remove_polygon_preview()
+        preview_points = list(self._polygon_points)
+        if cursor_point is not None and preview_points:
+            preview_points.append(cursor_point)
+        if not preview_points:
+            self.canvas.draw_idle()
+            return
+        self._polygon_preview = Polygon(
+            preview_points,
+            closed=len(preview_points) >= 3 and cursor_point is None,
+            fill=False,
+            linewidth=1.4,
+            edgecolor=self._selection_preview_color(),
+            linestyle="-",
+        )
+        self.canvas.axes.add_patch(self._polygon_preview)
+        self.canvas.draw_idle()
+
+    def finish_polygon_selection(self):
+        if self.current_mask is None or len(self._polygon_points) < 3:
+            return
+        edit_value = self._mask_edit_value()
+        if edit_value is None:
+            return
+
+        points = np.asarray(self._polygon_points, dtype=float)
+        h, w = self.current_mask.shape
+        x_min = max(0, int(np.floor(np.min(points[:, 0]))))
+        x_max = min(w - 1, int(np.ceil(np.max(points[:, 0]))))
+        y_min = max(0, int(np.floor(np.min(points[:, 1]))))
+        y_max = min(h - 1, int(np.ceil(np.max(points[:, 1]))))
+        if x_max < x_min or y_max < y_min:
+            return
+
+        yy, xx = np.mgrid[y_min : y_max + 1, x_min : x_max + 1]
+        pixel_centres = np.column_stack((xx.ravel(), yy.ravel()))
+        inside = Path(points).contains_points(pixel_centres).reshape(yy.shape)
+        self._push_undo_snapshot()
+        submask = self.current_mask[y_min : y_max + 1, x_min : x_max + 1]
+        submask[inside] = edit_value
+        self.current_mask[y_min : y_max + 1, x_min : x_max + 1] = submask
+        self._polygon_points = []
+        self._remove_polygon_preview()
+        self._update_polygon_button_state()
+        self._draw_mask_preview(preserve_view=True)
+        self.status_label.setText("Polygon applied to mask.")
+
+    def cancel_polygon_selection(self):
+        self._polygon_points = []
+        self._remove_polygon_preview()
+        self._update_polygon_button_state()
+        if hasattr(self, "canvas"):
+            self.canvas.draw_idle()
+
     def _on_canvas_press(self, event):
         if event.button != 1 or event.inaxes != self.canvas.axes:
             return
@@ -581,6 +821,22 @@ class MaskGeneratorDialog(QDialog):
             self._painting = False
             self.status_label.setText("Select Brush or Erase to edit mask.")
             return
+
+        tool = self._active_mask_tool()
+        if tool == "Rectangle":
+            self._remove_brush_outline()
+            self._start_rectangle_selection(event)
+            return
+        if tool == "Polygon":
+            self._remove_brush_outline()
+            if getattr(event, "dblclick", False):
+                if len(self._polygon_points) >= 2:
+                    self._add_polygon_point(event)
+                    self.finish_polygon_selection()
+                return
+            self._add_polygon_point(event)
+            return
+
         # Save one snapshot per stroke for incremental undo.
         self._push_undo_snapshot()
         self._update_brush_outline(event.xdata, event.ydata)
@@ -592,12 +848,27 @@ class MaskGeneratorDialog(QDialog):
             self._remove_brush_outline()
             self.canvas.draw_idle()
             return
+
+        tool = self._active_mask_tool()
+        if tool == "Rectangle":
+            self._remove_brush_outline()
+            if self._rectangle_start is not None:
+                self._update_rectangle_preview(self._image_point_from_event(event))
+            return
+        if tool == "Polygon":
+            self._remove_brush_outline()
+            if self._polygon_points:
+                self._update_polygon_preview(self._image_point_from_event(event))
+            return
+
         self._update_brush_outline(event.xdata, event.ydata)
         if not self._painting or self._is_navigation_mode_active():
             return
         self._apply_brush(event.xdata, event.ydata)
 
     def _on_canvas_release(self, event):
+        if event.button == 1 and self._active_mask_tool() == "Rectangle":
+            self._finish_rectangle_selection(event)
         if event.button == 1:
             self._painting = False
 
@@ -641,6 +912,16 @@ class MaskGeneratorDialog(QDialog):
         active = getattr(self.toolbar, "_active", None)
         return bool(str(active).strip()) if active is not None else False
 
+    def keyPressEvent(self, event):
+        if self._active_mask_tool() == "Polygon":
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self.finish_polygon_selection()
+                return
+            if event.key() == Qt.Key_Escape:
+                self.cancel_polygon_selection()
+                return
+        super().keyPressEvent(event)
+
     def _emit_mask_ready(self):
         """Emit the current mask to preprocessing if available."""
         if self.current_mask is not None:
@@ -677,7 +958,7 @@ class MaskGeneratorDialog(QDialog):
                     ext = ".tif"
 
             if ext in (".fits", ".fit", ".fts"):
-                fits.writeto(file_path, self.current_mask.astype(np.uint8), overwrite=True)
+                write_fits_image_file(file_path, self.current_mask.astype(np.uint8), overwrite=True)
             elif ext in (".tif", ".tiff"):
                 Image.fromarray((self.current_mask.astype(np.uint8) * 255)).save(file_path)
             else:
@@ -1240,9 +1521,8 @@ class ParameterPlotDialog(QDialog):
                 return  # User canceled
     
             try:
-                # Load the mask from the FITS file
-                with fits.open(file_path) as hdulist:
-                    mask_data = hdulist[0].data  # Assuming the mask is in the primary HDU
+                # Load the mask in the same orientation as the displayed map.
+                mask_data = load_image_file(file_path)
     
                 if mask_data is None:
                     raise ValueError("No data found in the selected FITS file.")
@@ -1337,25 +1617,22 @@ class ParameterPlotDialog(QDialog):
     
         try:
             # ------------------------------------------------------------------
-            # 2. Prepare data (resize 鈫?float32 鈫?flip vertically)
+            # 2. Prepare data (resize -> float32)
             # ------------------------------------------------------------------
             resized_Z = self.resize_parameter_map(self.Z, (512, 512)).astype(np.float32)
     
-            # Flip rows so that (row 0, col 0) becomes the *bottom-left* pixel
-            fits_Z = np.flipud(resized_Z)          # or resized_Z[::-1, :]
-    
             # ------------------------------------------------------------------
-            # 3. Build FITS header  (optional: note we flipped Y)
+            # 3. Build FITS header
             # ------------------------------------------------------------------
             header = fits.Header()
             header["PARAM"]  = self.parameter_name
             header["COMMENT"] = "Parameter map saved from the application"
-            header["HISTORY"] = "Array flipped in Y so FITS shows same orientation as GUI"
+            header["HISTORY"] = "FITS row axis stored so ImageJ matches NEAT display"
     
             # ------------------------------------------------------------------
             # 4. Write file
             # ------------------------------------------------------------------
-            fits.PrimaryHDU(data=fits_Z, header=header).writeto(file_path, overwrite=True)
+            write_fits_image_file(file_path, resized_Z, header=header, overwrite=True)
     
             QMessageBox.information(
                 self, "Success",
@@ -1979,6 +2256,532 @@ class LineProfileDialog(QDialog):
             except Exception as e:
                 QMessageBox.warning(self, "Save Plot", f"Failed to save plot:\n{e}")
 
+
+class UncertaintyEstimatorDialog(QDialog):
+    """Estimate macro-pixel, Uamp, or fitting uncertainty from an empirical constant."""
+
+    PARAMETER_SETTINGS = {
+        "macro_pixel_size": {
+            "label": "Macro pixel size",
+            "input_minimum": 1.0,
+            "input_maximum": 1e9,
+            "plot_minimum": 1.0,
+            "plot_maximum": 1000.0,
+            "default": 900.0,
+            "step": 1.0,
+            "decimals": 0,
+        },
+        "uamp": {
+            "label": "Uamp",
+            "input_minimum": 1.0,
+            "input_maximum": 1e9,
+            "plot_minimum": 1.0,
+            "plot_maximum": 120.0,
+            "default": 10.0,
+            "step": 0.1,
+            "decimals": 1,
+        },
+        "fitting_uncertainty": {
+            "label": "Fitting uncertainty",
+            "input_minimum": 1.0,
+            "input_maximum": 1e9,
+            "plot_minimum": 50.0,
+            "plot_maximum": 500.0,
+            "default": 100.0,
+            "step": 10.0,
+            "decimals": 0,
+        },
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Uncertainty Estimator")
+        self.setWindowFlags(
+            (self.windowFlags() | Qt.WindowSystemMenuHint)
+            & ~Qt.WindowContextHelpButtonHint
+        )
+        self.setMinimumSize(920, 540)
+        self._is_updating = False
+        self._plot_x_values = np.array([])
+        self._plot_y_values = np.array([])
+        self._plot_x_name = ""
+        self._plot_y_name = ""
+        self._plot_axes_initialized = False
+        self._plot_update_locked = False
+        self._plot_xlim_callback_id = None
+
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(0)
+
+        splitter = QSplitter(Qt.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
+        main_layout.addWidget(splitter)
+
+        controls_panel = QWidget(self)
+        controls_panel.setMinimumWidth(320)
+        controls_panel.setMaximumWidth(430)
+        controls_layout = QVBoxLayout(controls_panel)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(10)
+
+        plot_panel = QWidget(self)
+        plot_layout_outer = QVBoxLayout(plot_panel)
+        plot_layout_outer.setContentsMargins(0, 0, 0, 0)
+        plot_layout_outer.setSpacing(0)
+
+        splitter.addWidget(controls_panel)
+        splitter.addWidget(plot_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 560])
+
+        reference_group = QGroupBox("Reference measurement")
+        reference_layout = QGridLayout(reference_group)
+        reference_layout.setHorizontalSpacing(8)
+        reference_layout.setVerticalSpacing(6)
+
+        self.reference_macro_pixel_size_input = self._create_spinbox("macro_pixel_size")
+        self.reference_uamp_input = self._create_spinbox("uamp")
+        self.reference_fitting_uncertainty_input = self._create_spinbox(
+            "fitting_uncertainty"
+        )
+        self.reference_inputs = {
+            "macro_pixel_size": self.reference_macro_pixel_size_input,
+            "uamp": self.reference_uamp_input,
+            "fitting_uncertainty": self.reference_fitting_uncertainty_input,
+        }
+        self._add_parameter_row(
+            reference_layout,
+            0,
+            self.reference_macro_pixel_size_input,
+            self.reference_uamp_input,
+            self.reference_fitting_uncertainty_input,
+        )
+        self.constant_label = QLabel("K = 300000")
+        reference_layout.addWidget(QLabel("Constant:"), 2, 0)
+        reference_layout.addWidget(self.constant_label, 2, 1, 1, 2)
+        controls_layout.addWidget(reference_group)
+
+        prediction_group = QGroupBox("Prediction")
+        prediction_layout = QGridLayout(prediction_group)
+        prediction_layout.setHorizontalSpacing(8)
+        prediction_layout.setVerticalSpacing(6)
+
+        self.target_combo = QComboBox()
+        for target, settings in self.PARAMETER_SETTINGS.items():
+            self.target_combo.addItem(settings["label"], target)
+        self.target_combo.setCurrentIndex(2)
+        prediction_layout.addWidget(QLabel("Estimate:"), 0, 0)
+        prediction_layout.addWidget(self.target_combo, 0, 1, 1, 2)
+
+        self.prediction_macro_pixel_size_input = self._create_spinbox("macro_pixel_size")
+        self.prediction_uamp_input = self._create_spinbox("uamp")
+        self.prediction_fitting_uncertainty_input = self._create_spinbox(
+            "fitting_uncertainty"
+        )
+        self.prediction_macro_pixel_size_input.setValue(100.0)
+        self.prediction_uamp_input.setValue(80.0)
+        self.prediction_inputs = {
+            "macro_pixel_size": self.prediction_macro_pixel_size_input,
+            "uamp": self.prediction_uamp_input,
+            "fitting_uncertainty": self.prediction_fitting_uncertainty_input,
+        }
+        self._add_parameter_row(
+            prediction_layout,
+            1,
+            self.prediction_macro_pixel_size_input,
+            self.prediction_uamp_input,
+            self.prediction_fitting_uncertainty_input,
+        )
+        controls_layout.addWidget(prediction_group)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        controls_layout.addWidget(self.status_label)
+
+        plot_group = QGroupBox("Curve plot")
+        plot_layout = QVBoxLayout(plot_group)
+        plot_layout.setSpacing(6)
+
+        plot_controls_layout = QHBoxLayout()
+        plot_controls_layout.addWidget(QLabel("Fixed parameter:"))
+        self.plot_fixed_parameter_combo = QComboBox()
+        for target, settings in self.PARAMETER_SETTINGS.items():
+            self.plot_fixed_parameter_combo.addItem(settings["label"], target)
+        plot_controls_layout.addWidget(self.plot_fixed_parameter_combo)
+        self.plot_fixed_value_label = QLabel("Value:")
+        plot_controls_layout.addWidget(self.plot_fixed_value_label)
+        self.plot_fixed_value_input = self._create_spinbox("macro_pixel_size")
+        plot_controls_layout.addWidget(self.plot_fixed_value_input)
+        plot_controls_layout.addStretch()
+        plot_layout.addLayout(plot_controls_layout)
+
+        self.plot_canvas = MplCanvas(self, width=6, height=3.5, dpi=100)
+        self.plot_canvas.axes.set_title("Uncertainty estimator curve")
+        self.plot_canvas.axes.set_xlabel("Fitting uncertainty")
+        self.plot_canvas.axes.set_ylabel("Uamp")
+        self._apply_plot_font_size()
+        self.plot_canvas.fig.tight_layout()
+        plot_layout.addWidget(self.plot_canvas)
+
+        self.plot_toolbar = NavigationToolbar(self.plot_canvas, self)
+        self.plot_toolbar.setIconSize(QSize(16, 16))
+        plot_layout.addWidget(self.plot_toolbar)
+
+        self.curve_reader_label = QLabel("Move cursor over curve to read values.")
+        self.curve_reader_label.setWordWrap(True)
+        self._apply_curve_reader_font()
+        plot_layout.addWidget(self.curve_reader_label)
+        self.curve_annotation = self.plot_canvas.axes.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(12, 12),
+            textcoords="offset points",
+            bbox={"boxstyle": "round", "fc": "white", "ec": "#777777", "alpha": 0.9},
+            arrowprops={"arrowstyle": "->", "color": "#777777"},
+            fontsize=self._curve_reader_font_size(),
+        )
+        self.curve_annotation.set_visible(False)
+        self.plot_canvas.mpl_connect("motion_notify_event", self.on_plot_motion)
+        plot_layout_outer.addWidget(plot_group)
+
+        controls_layout.addStretch()
+
+        all_input_spinboxes = (
+            list(self.reference_inputs.values()) + list(self.prediction_inputs.values())
+        )
+        for spinbox in all_input_spinboxes:
+            spinbox.valueChanged.connect(self.update_estimate)
+        self.target_combo.currentIndexChanged.connect(self.on_target_changed)
+        self.plot_fixed_parameter_combo.currentIndexChanged.connect(
+            self.on_plot_fixed_parameter_changed
+        )
+        self.plot_fixed_value_input.valueChanged.connect(self.plot_curve)
+
+        self.on_target_changed()
+        self.on_plot_fixed_parameter_changed()
+        self.update_estimate()
+
+    def _create_spinbox(self, parameter_name):
+        settings = self.PARAMETER_SETTINGS[parameter_name]
+        spinbox = QDoubleSpinBox()
+        spinbox.setRange(settings["input_minimum"], settings["input_maximum"])
+        spinbox.setDecimals(settings["decimals"])
+        spinbox.setValue(settings["default"])
+        spinbox.setSingleStep(settings["step"])
+        spinbox.setKeyboardTracking(False)
+        return spinbox
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
+    def _add_parameter_row(
+        self,
+        layout,
+        start_row,
+        macro_input,
+        uamp_input,
+        uncertainty_input,
+    ):
+        labels = [
+            "Macro pixel size",
+            "Uamp",
+            "Fitting uncertainty",
+        ]
+        inputs = [
+            macro_input,
+            uamp_input,
+            uncertainty_input,
+        ]
+        for column, label in enumerate(labels):
+            header = QLabel(label)
+            header.setAlignment(Qt.AlignCenter)
+            layout.addWidget(header, start_row, column)
+            layout.addWidget(inputs[column], start_row + 1, column)
+
+    def on_target_changed(self):
+        target = self.target_combo.currentData()
+        for name, spinbox in self.prediction_inputs.items():
+            settings = self.PARAMETER_SETTINGS[name]
+            spinbox.blockSignals(True)
+            spinbox.setRange(settings["input_minimum"], settings["input_maximum"])
+            spinbox.blockSignals(False)
+            spinbox.setEnabled(name != target)
+        self.update_estimate()
+
+    def update_estimate(self):
+        if self._is_updating:
+            return
+
+        self._is_updating = True
+        try:
+            constant = calculate_uncertainty_estimator_constant(
+                self.reference_macro_pixel_size_input.value(),
+                self.reference_uamp_input.value(),
+                self.reference_fitting_uncertainty_input.value(),
+            )
+            self.constant_label.setText(f"K = {self._format_value(constant)}")
+
+            target = self.target_combo.currentData()
+            estimated_value = estimate_uncertainty_parameter(
+                constant,
+                target,
+                macro_pixel_size=self.prediction_macro_pixel_size_input.value(),
+                uamp=self.prediction_uamp_input.value(),
+                fitting_uncertainty=self.prediction_fitting_uncertainty_input.value(),
+            )
+            target_spinbox = self.prediction_inputs[target]
+            target_settings = self.PARAMETER_SETTINGS[target]
+            target_spinbox.blockSignals(True)
+            target_spinbox.setRange(
+                min(target_settings["input_minimum"], float(estimated_value)),
+                max(target_settings["input_maximum"], float(estimated_value)),
+            )
+            target_spinbox.setValue(float(estimated_value))
+            target_spinbox.blockSignals(False)
+            label = self.PARAMETER_SETTINGS[target]["label"]
+            self.status_label.setText(
+                f"{label} = {self._format_value(estimated_value)}"
+            )
+            self.plot_curve()
+        except ValueError as exc:
+            self.status_label.setText(str(exc))
+        finally:
+            self._is_updating = False
+
+    def on_plot_fixed_parameter_changed(self):
+        parameter_name = self.plot_fixed_parameter_combo.currentData()
+        settings = self.PARAMETER_SETTINGS[parameter_name]
+        self.plot_fixed_value_label.setText(f"{settings['label']}:")
+        self.plot_fixed_value_input.blockSignals(True)
+        self.plot_fixed_value_input.setRange(
+            settings["input_minimum"],
+            settings["input_maximum"],
+        )
+        self.plot_fixed_value_input.setDecimals(settings["decimals"])
+        self.plot_fixed_value_input.setSingleStep(settings["step"])
+        self.plot_fixed_value_input.setValue(settings["default"])
+        self.plot_fixed_value_input.blockSignals(False)
+        self._plot_axes_initialized = False
+        self.plot_curve()
+
+    def plot_curve(self):
+        if not hasattr(self, "plot_canvas"):
+            return
+
+        fixed_name = self.plot_fixed_parameter_combo.currentData()
+        remaining_names = [name for name in self.PARAMETER_SETTINGS if name != fixed_name]
+        if "fitting_uncertainty" in remaining_names:
+            x_name = "fitting_uncertainty"
+            y_name = next(name for name in remaining_names if name != x_name)
+        else:
+            x_name, y_name = remaining_names
+
+        x_settings = self.PARAMETER_SETTINGS[x_name]
+        y_settings = self.PARAMETER_SETTINGS[y_name]
+        axes = self.plot_canvas.axes
+        preserve_view = (
+            self._plot_axes_initialized
+            and self._plot_x_name == x_name
+            and self._plot_y_name == y_name
+        )
+        if preserve_view:
+            x_limits = axes.get_xlim()
+            y_limits = axes.get_ylim()
+        else:
+            x_limits = self._default_axis_limits(x_name)
+            y_limits = self._default_axis_limits(y_name)
+
+        x_min = min(x_limits)
+        x_max = max(x_limits)
+        positive_minimum = x_settings["input_minimum"]
+        if x_max <= 0:
+            x_values = np.array([])
+        else:
+            x_start = max(positive_minimum, x_min)
+            x_stop = max(x_start, x_max)
+            x_values = np.linspace(x_start, x_stop, 1200)
+
+        try:
+            constant = calculate_uncertainty_estimator_constant(
+                self.reference_macro_pixel_size_input.value(),
+                self.reference_uamp_input.value(),
+                self.reference_fitting_uncertainty_input.value(),
+            )
+            fixed_value = self.plot_fixed_value_input.value()
+            estimates = {
+                fixed_name: fixed_value,
+                x_name: x_values,
+            }
+            if x_values.size:
+                y_values = self._estimate_curve_parameter(constant, y_name, estimates)
+                y_values = np.asarray(y_values, dtype=float)
+                visible = np.isfinite(y_values)
+                self._plot_x_values = x_values[visible]
+                self._plot_y_values = y_values[visible]
+            else:
+                self._plot_x_values = np.array([])
+                self._plot_y_values = np.array([])
+            self._plot_x_name = x_name
+            self._plot_y_name = y_name
+
+            self._plot_update_locked = True
+            self._disconnect_plot_axes_callbacks()
+            axes.clear()
+            if self._plot_x_values.size:
+                axes.plot(self._plot_x_values, self._plot_y_values, color="#1f77b4")
+                self.curve_reader_label.setText(
+                    "Move cursor over curve to read values."
+                )
+            else:
+                axes.text(
+                    0.5,
+                    0.5,
+                    "No curve values within the current axes.",
+                    ha="center",
+                    va="center",
+                    transform=axes.transAxes,
+                )
+                self.curve_reader_label.setText(
+                    "No curve values within the current axes."
+                )
+            axes.set_xlim(x_limits)
+            axes.set_ylim(y_limits)
+            axes.set_xlabel(x_settings["label"])
+            axes.set_ylabel(y_settings["label"])
+            axes.set_title(
+                f"{y_settings['label']} vs {x_settings['label']} "
+                f"at {self.PARAMETER_SETTINGS[fixed_name]['label']} "
+                f"= {self._format_value(fixed_value)}"
+            )
+            axes.grid(True, alpha=0.3)
+            self._apply_plot_font_size()
+            self.curve_annotation = axes.annotate(
+                "",
+                xy=(0, 0),
+                xytext=(12, 12),
+                textcoords="offset points",
+                bbox={
+                    "boxstyle": "round",
+                    "fc": "white",
+                    "ec": "#777777",
+                    "alpha": 0.9,
+                },
+                arrowprops={"arrowstyle": "->", "color": "#777777"},
+                fontsize=self._curve_reader_font_size(),
+            )
+            self.curve_annotation.set_visible(False)
+            self._apply_plot_font_size()
+            self.plot_canvas.fig.tight_layout()
+            self._connect_plot_axes_callbacks()
+            self.plot_canvas.draw_idle()
+            self._plot_axes_initialized = True
+        except ValueError as exc:
+            self.curve_reader_label.setText(str(exc))
+        finally:
+            self._plot_update_locked = False
+
+    def _default_axis_limits(self, parameter_name):
+        settings = self.PARAMETER_SETTINGS[parameter_name]
+        return settings["plot_minimum"], settings["plot_maximum"]
+
+    def on_plot_axes_changed(self, axes):
+        if self._plot_update_locked or not self._plot_axes_initialized:
+            return
+        self.plot_curve()
+
+    def _connect_plot_axes_callbacks(self):
+        self._plot_xlim_callback_id = self.plot_canvas.axes.callbacks.connect(
+            "xlim_changed",
+            self.on_plot_axes_changed,
+        )
+
+    def _disconnect_plot_axes_callbacks(self):
+        if self._plot_xlim_callback_id is None:
+            return
+        try:
+            self.plot_canvas.axes.callbacks.disconnect(self._plot_xlim_callback_id)
+        except (KeyError, ValueError):
+            pass
+        self._plot_xlim_callback_id = None
+
+    def _apply_plot_font_size(self):
+        point_size = self.font().pointSizeF()
+        if point_size <= 0:
+            point_size = 9.0
+        axes = self.plot_canvas.axes
+        axes.title.set_fontsize(point_size)
+        axes.xaxis.label.set_fontsize(point_size)
+        axes.yaxis.label.set_fontsize(point_size)
+        axes.tick_params(axis="both", labelsize=point_size)
+
+    def _curve_reader_font_size(self):
+        point_size = self.font().pointSizeF()
+        if point_size <= 0:
+            point_size = 9.0
+        return max(7.0, point_size - 2.0)
+
+    def _apply_curve_reader_font(self):
+        font = self.curve_reader_label.font()
+        font.setPointSizeF(self._curve_reader_font_size())
+        self.curve_reader_label.setFont(font)
+
+    def _estimate_curve_parameter(self, constant, target, estimates):
+        macro_pixel_size = estimates.get("macro_pixel_size")
+        uamp = estimates.get("uamp")
+        fitting_uncertainty = estimates.get("fitting_uncertainty")
+
+        if target == "macro_pixel_size":
+            return constant / (uamp * fitting_uncertainty**2)
+        if target == "uamp":
+            return constant / (macro_pixel_size * fitting_uncertainty**2)
+        return np.sqrt(constant / (macro_pixel_size * uamp))
+
+    def on_plot_motion(self, event):
+        if event.inaxes != self.plot_canvas.axes or self._plot_x_values.size == 0:
+            self.curve_annotation.set_visible(False)
+            self.plot_canvas.draw_idle()
+            return
+
+        curve_points = np.column_stack((self._plot_x_values, self._plot_y_values))
+        display_points = self.plot_canvas.axes.transData.transform(curve_points)
+        distances = np.hypot(
+            display_points[:, 0] - event.x,
+            display_points[:, 1] - event.y,
+        )
+        nearest_index = int(np.argmin(distances))
+        if distances[nearest_index] > 12:
+            self.curve_annotation.set_visible(False)
+            self.curve_reader_label.setText("Move cursor over curve to read values.")
+            self.plot_canvas.draw_idle()
+            return
+
+        x_value = self._plot_x_values[nearest_index]
+        y_value = self._plot_y_values[nearest_index]
+        x_label = self.PARAMETER_SETTINGS[self._plot_x_name]["label"]
+        y_label = self.PARAMETER_SETTINGS[self._plot_y_name]["label"]
+        readout = (
+            f"{x_label} = {self._format_integer_readout(x_value)}, "
+            f"{y_label} = {self._format_integer_readout(y_value)}"
+        )
+        self.curve_reader_label.setText(readout)
+        self.curve_annotation.xy = (x_value, y_value)
+        self.curve_annotation.set_text(readout)
+        self.curve_annotation.set_visible(True)
+        self.plot_canvas.draw_idle()
+
+    def _format_value(self, value):
+        return f"{float(value):.8g}"
+
+    def _format_integer_readout(self, value):
+        return f"{int(round(float(value)))}"
+
+
 class OpenBeamPlotDialog(QDialog):
     def __init__(self, wavelengths, intensities, parent=None):
         super().__init__(parent)
@@ -2004,6 +2807,7 @@ __all__ = [
     "AdjustmentsDialog",
     "ParameterPlotDialog",
     "LineProfileDialog",
+    "UncertaintyEstimatorDialog",
     "OpenBeamPlotDialog",
 ]
 

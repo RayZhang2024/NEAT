@@ -8,11 +8,10 @@ import shutil
 import numpy as np
 import pandas as pd
 import psutil
-from astropy.io import fits
 from PIL import Image, TiffImagePlugin
 from PyQt5.QtCore import Qt, QEventLoop, QThread, pyqtSignal
 
-from .batch import get_raden_tiff_stack_info, load_image_file
+from .batch import get_raden_tiff_stack_info, load_image_file, write_fits_image_file
 
 class OutlierFilteringWorker(QThread):
     progress_updated = pyqtSignal(int)
@@ -125,7 +124,7 @@ class OutlierFilteringWorker(QThread):
         # Write FITS
         out_fits = os.path.join(self.output_folder, f"{self.base_name}_{suffix}.fits")
         try:
-            fits.writeto(out_fits, img, overwrite=True)
+            write_fits_image_file(out_fits, img, overwrite=True)
         except Exception as exc:  # astropy throws its own subclass of OSError
             raise RuntimeError(f"Cannot write FITS {out_fits}: {exc}") from exc
 
@@ -301,7 +300,7 @@ class SummationWorker(QThread):
                 out_name = f"{self.base_name}_Summed_{suffix}.fits"
                 out_path = os.path.join(self.output_folder, out_name)
                 try:
-                    fits.writeto(out_path, summed, overwrite=True)
+                    write_fits_image_file(out_path, summed, overwrite=True)
                     # self.message.emit(f"Saved summed image '{out_name}'.")
                 except Exception as exc:
                     self.message.emit(f"[ERROR] Could not save '{out_name}': {exc}")
@@ -655,7 +654,7 @@ class OverlapCorrectionWorker(QThread):
                         continue
 
                     # Save corrected image
-                    fits.writeto(output_path, corrected_intensity, overwrite=True)
+                    write_fits_image_file(output_path, corrected_intensity, overwrite=True)
 
                     # Update progress
                     overall_progress = int(((img_idx + 1) / total_imgs) * 100)
@@ -876,8 +875,8 @@ class NormalisationWorker(QThread):
                         normed = np.nan_to_num(normed, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
                         out_fname = f"{self.base_name}_{suffix}.fits"
-                        fits.writeto(os.path.join(self.output_folder, out_fname),
-                                     normed, overwrite=True)
+                        write_fits_image_file(os.path.join(self.output_folder, out_fname),
+                                              normed, overwrite=True)
 
                         del data_imgs[suffix]
                         processed_images += 1
@@ -1466,7 +1465,7 @@ class FilteringWorker(QThread):
                         filtered_filename = f"{self.base_name}_{suffix}.fits"
                         filtered_path = os.path.join(self.output_folder, filtered_filename)
                         try:
-                            fits.writeto(filtered_path, filtered_image, overwrite=True)
+                            write_fits_image_file(filtered_path, filtered_image, overwrite=True)
                         except Exception as e:
                             self.message.emit(f"Image {suffix}: Failed to save '{filtered_filename}': {e}. Skipping.")
                             continue

@@ -62,6 +62,7 @@ from ..core import (
 from .mixins.fitting import FittingMixin
 from .mixins.postprocessing import PostProcessingMixin
 from .mixins.preprocessing import PreprocessingMixin
+from .dialogs import UncertaintyEstimatorDialog
 from .utils import update_all_widget_fonts
 
 
@@ -229,6 +230,8 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.scaling_image_runs = []     # List to store scaling image runs. Each run is a dict.
         self.normalisation_image_runs = []  # List to store normalisation data image runs. Each run is a dict.
         self.normalisation_open_beam_runs = []  # List to store normalisation open beam runs. Each run is a dict.
+        self.full_process_sample_folder = None
+        self.full_process_open_beam_folder = None
         self.open_beam_plot_dialogs = []  # List to keep references to open beam plot dialogs
         self.stack_image_runs = []  # List to store stack image runs. Each run is a dict.
         self.overlap_correction_image_runs = []
@@ -432,6 +435,12 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         view_menu.addAction(manual_adjust_action)
         view_menu.addSeparator()
 
+        uncertainty_estimator_action = QAction("Uncertainty Estimator...", self)
+        uncertainty_estimator_action.triggered.connect(
+            self.open_uncertainty_estimator_from_menu
+        )
+        view_menu.addAction(uncertainty_estimator_action)
+
         symbol_size_action = QAction("Symbol Size...", self)
         symbol_size_action.triggered.connect(self.open_symbol_size_dialog)
         view_menu.addAction(symbol_size_action)
@@ -566,6 +575,11 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
     def open_manual_adjust_from_menu(self):
         self.tabs.setCurrentWidget(self.FittingTab)
         self.open_adjustments_dialog()
+
+    def open_uncertainty_estimator_from_menu(self):
+        self.tabs.setCurrentWidget(self.FittingTab)
+        dialog = UncertaintyEstimatorDialog(self)
+        dialog.exec_()
 
     def open_phase_management_from_menu(self):
         self.tabs.setCurrentWidget(self.FittingTab)
@@ -703,6 +717,11 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
                     self.structure_type = phase_info.get("structure", "fcc")
                     self.lattice_params = phase_info.get("lattice_params", {})
                     self.hkl_list = phase_info.get("hkl_list", [])
+                    self.theoretical_bragg_edges = calculate_theoretical_bragg_edges(
+                        self.structure_type,
+                        self.lattice_params,
+                        self.hkl_list,
+                    )
                     self.update_plots()
             else:
                 self.message_box.append(f"No data found for phase: {selected_phase}")
@@ -762,14 +781,13 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             r2_max_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 3, r2_max_item)
     
-            # Region 3 Min Wavelength - Editable
+            # Region 3 bounds are hidden and derived from the visible bounds.
             r3_min_item = QTableWidgetItem("")
-            r3_min_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            r3_min_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 6, r3_min_item)
     
-            # Region 3 Max Wavelength - Editable
             r3_max_item = QTableWidgetItem("")
-            r3_max_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            r3_max_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 7, r3_max_item)
     
             # Parameter 's' - Editable
@@ -833,6 +851,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         if row_index < 0 or row_index >= self.bragg_table.rowCount():
             return False
 
+        self._sync_derived_region3_bounds(row_index)
         try:
             d_item = self.bragg_table.item(row_index, 1)
             d_text = d_item.text().strip() if d_item else ""
@@ -934,7 +953,20 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             self._reset_current_bragg_edge_state()
             self.message_box.append("No Bragg edges found within the specified wavelength range.")
             return
-    
+
+        edges_in_range = sorted(edges_in_range, key=lambda item: item[1])
+        edge_midpoints = {}
+        for index, (hkl, x_hkl) in enumerate(edges_in_range):
+            lower_midpoint = None
+            upper_midpoint = None
+            if index > 0:
+                lower_midpoint = (edges_in_range[index - 1][1] + x_hkl) / 2.0
+            if index + 1 < len(edges_in_range):
+                upper_midpoint = (x_hkl + edges_in_range[index + 1][1]) / 2.0
+            edge_midpoints[hkl] = (lower_midpoint, upper_midpoint)
+
+        invalid_default_windows = 0
+     
         # Insert each edge as a new row in the table
         for (hkl, x_hkl) in edges_in_range:
             row_position = self.bragg_table.rowCount()
@@ -963,23 +995,28 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             # Arbitrary logic for how you set defaults:
             # region 1 might be a small offset above x_hkl, etc.
             # ---------------------------------------------
-            r1_min = x_hkl * 1.04
+            lower_midpoint, upper_midpoint = edge_midpoints.get(hkl, (None, None))
+            windows = self._default_bragg_edge_windows(x_hkl, lower_midpoint, upper_midpoint)
+            if not windows["valid"]:
+                invalid_default_windows += 1
+
+            r1_min = windows["upper_min"]
             r1_min_item = QTableWidgetItem(f"{r1_min:.2f}")
             r1_min_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 4, r1_min_item)
-    
-            r1_max = min(x_hkl * 1.12, x_hkl + 0.4)
+     
+            r1_max = windows["upper_max"]
             r1_max_item = QTableWidgetItem(f"{r1_max:.2f}")
             r1_max_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 5, r1_max_item)
-    
+     
             # Region 2
-            r2_min = max(x_hkl * 0.90, x_hkl - 0.3)
+            r2_min = windows["lower_min"]
             r2_min_item = QTableWidgetItem(f"{r2_min:.2f}")
             r2_min_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 2, r2_min_item)
-    
-            r2_max = x_hkl * 0.98
+     
+            r2_max = windows["lower_max"]
             r2_max_item = QTableWidgetItem(f"{r2_max:.2f}")
             r2_max_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 3, r2_max_item)
@@ -987,12 +1024,12 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             # Region 3
             r3_min = r2_min
             r3_min_item = QTableWidgetItem(f"{r3_min:.2f}")
-            r3_min_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            r3_min_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 6, r3_min_item)
     
             r3_max = r1_max
             r3_max_item = QTableWidgetItem(f"{r3_max:.2f}")
-            r3_max_item.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            r3_max_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.bragg_table.setItem(row_position, 7, r3_max_item)
     
             # s parameter
@@ -1033,6 +1070,11 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.message_box.append(
             f"Updated Bragg edges table with {self.bragg_table.rowCount()} edge(s)."
         )
+        if invalid_default_windows:
+            self.message_box.append(
+                f"{invalid_default_windows} edge window(s) were constrained by adjacent-edge midpoints "
+                "until a default baseline range became empty; adjust those bounds manually."
+            )
 
 
     def on_bragg_edge_selected(self):

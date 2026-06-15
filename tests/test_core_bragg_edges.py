@@ -6,7 +6,9 @@ import numpy as np
 from NEAT.core import (
     calculate_d_spacing_general,
     calculate_theoretical_bragg_edges,
+    calculate_uncertainty_estimator_constant,
     calculate_x_hkl_general,
+    estimate_uncertainty_parameter,
 )
 
 
@@ -32,7 +34,52 @@ class TestCoreBraggEdges(unittest.TestCase):
         for x, (_, edge) in zip(x_vals, edges):
             self.assertAlmostEqual(x, edge, places=12)
 
+    def test_uncertainty_estimator_solves_each_parameter(self):
+        constant = calculate_uncertainty_estimator_constant(30.0, 4.0, 0.2)
+        self.assertAlmostEqual(constant, 4.8, places=12)
+
+        self.assertAlmostEqual(
+            estimate_uncertainty_parameter(
+                constant,
+                "macro_pixel_size",
+                uamp=4.0,
+                fitting_uncertainty=0.2,
+            ),
+            30.0,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            estimate_uncertainty_parameter(
+                constant,
+                "uamp",
+                macro_pixel_size=30.0,
+                fitting_uncertainty=0.2,
+            ),
+            4.0,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            estimate_uncertainty_parameter(
+                constant,
+                "fitting_uncertainty",
+                macro_pixel_size=30.0,
+                uamp=4.0,
+            ),
+            0.2,
+            places=12,
+        )
+
+    def test_uncertainty_estimator_rejects_non_positive_values(self):
+        with self.assertRaises(ValueError):
+            calculate_uncertainty_estimator_constant(0.0, 4.0, 0.2)
+        with self.assertRaises(ValueError):
+            estimate_uncertainty_parameter(
+                4.8,
+                "fitting_uncertainty",
+                macro_pixel_size=-30.0,
+                uamp=4.0,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
-
