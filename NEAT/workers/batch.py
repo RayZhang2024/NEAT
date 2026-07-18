@@ -511,7 +511,7 @@ class BatchFitEdgesWorker(QThread):
         self.image_height, self.image_width = self.images[0].shape
 
         all_rows = list(self.fit_context.get("bragg_rows", []))
-        self.valid_row_configs = [row for row in all_rows[:5] if row.get("valid")]
+        self.valid_row_configs = [row for row in all_rows if row.get("valid")]
         self.num_edges = len(self.valid_row_configs)
         if self.num_edges == 0:
             self.message.emit("No valid edge rows available. Aborting.")
@@ -658,6 +658,13 @@ class BatchFitEdgesWorker(QThread):
                         # Also store the edge height
                         self.height_array[center_row, center_col, i] = edge_height
 
+        # A stop can be requested while the final box is being fitted. Check
+        # again before writing so cancellation never produces partial files.
+        if self.stop_requested:
+            self.message.emit("Batch fit edges stopped by user. Partial results were not saved.")
+            self.finished.emit("")
+            return
+
         # Check if we got any success
         if np.all(np.isnan(self.a_array)):
             self.message.emit("No successful fits performed. No results to save.")
@@ -665,16 +672,17 @@ class BatchFitEdgesWorker(QThread):
             return
 
         # Save ungridded
-        self.save_results_to_csv_ungrid()
+        ungridded_path = self.save_results_to_csv_ungrid()
 
         # Interpolate if desired
         if self.interpolation_enabled:
             self.interpolate_results()
 
         # Save gridded
-        self.save_results_to_csv()
+        gridded_path = self.save_results_to_csv()
 
-        self.finished.emit("Batch fit edges completed.")
+        output_paths = [path for path in (ungridded_path, gridded_path) if path]
+        self.finished.emit("\n".join(output_paths))
 
     def stop(self):
         self.stop_requested = True
@@ -746,7 +754,7 @@ class BatchFitEdgesWorker(QThread):
         data_dict = {"x": X_flat, "y": Y_flat}
 
         for i in range(e):
-            (h_val, k_val, *rest) = self.hkl_list[i]
+            hkl_str = "".join(str(index) for index in self.hkl_list[i])
             # Flatten out a, s, t
             a_i = flat_a[:, i]
             s_i = flat_s[:, i]
@@ -761,16 +769,16 @@ class BatchFitEdgesWorker(QThread):
              # <--- new
 
             # Build column names
-            a_col_name = f"d_{h_val}{k_val}"
-            s_col_name = f"s_{h_val}{k_val}"
-            t_col_name = f"t_{h_val}{k_val}"
-            eta_col_name = f"eta_{h_val}{k_val}"
-            width_col_name = f"fwhm_{h_val}{k_val}"
-            height_col = f"height_{h_val}{k_val}"
-            a_unc_col = f"d_unc_{h_val}{k_val}"
-            s_unc_col = f"s_unc_{h_val}{k_val}"
-            t_unc_col = f"t_unc_{h_val}{k_val}"
-            eta_unc_col = f"eta_unc_{h_val}{k_val}"
+            a_col_name = f"d_{hkl_str}"
+            s_col_name = f"s_{hkl_str}"
+            t_col_name = f"t_{hkl_str}"
+            eta_col_name = f"eta_{hkl_str}"
+            width_col_name = f"fwhm_{hkl_str}"
+            height_col = f"height_{hkl_str}"
+            a_unc_col = f"d_unc_{hkl_str}"
+            s_unc_col = f"s_unc_{hkl_str}"
+            t_unc_col = f"t_unc_{hkl_str}"
+            eta_unc_col = f"eta_unc_{hkl_str}"
               # <--- new
 
             data_dict[a_col_name] = a_i
@@ -828,8 +836,10 @@ class BatchFitEdgesWorker(QThread):
                 df.to_csv(f, index=False)
 
             self.message.emit(f"Ungridded results (edges) saved to {file_path_short}")
+            return os.path.abspath(file_path)
         except Exception as e:
             self.message.emit(f"Failed to save ungridded edges results: {e}")
+            return None
 
     def save_results_to_csv(self):
         """
@@ -953,8 +963,10 @@ class BatchFitEdgesWorker(QThread):
                 df.to_csv(f, index=False)
 
             self.message.emit(f"Gridded edges results saved to {filepath_short}")
+            return os.path.abspath(filepath)
         except Exception as e:
             self.message.emit(f"Failed to save gridded edges results: {e}")
+            return None
 
    
     def interpolate_results(self):
@@ -1250,6 +1262,13 @@ class BatchFitWorker(QThread):
                 #    (region1 - region2) at the final x_edge => store in self.height_array
                 self.compute_and_store_heights(center_row, center_col, bragg_edges, lattice_params, fitted_s_dict, fitted_t_dict, fitted_eta_dict, ab_fits)
 
+        # A stop can be requested while the final box is being fitted. Check
+        # again before writing so cancellation never produces partial files.
+        if self.stop_requested:
+            self.message.emit("Batch fitting stopped by user. Partial results were not saved.")
+            self.finished.emit("")
+            return
+
         # Done => if never initialized => no success
         if not params_initialized:
             self.message.emit("No successful fits performed. No results to save.")
@@ -1258,17 +1277,18 @@ class BatchFitWorker(QThread):
             return
 
         # Save ungridded
-        self.save_results_to_csv_ungrid()
+        ungridded_path = self.save_results_to_csv_ungrid()
 
         # Interpolate if needed
         if self.interpolation_enabled:
             self.interpolate_results()
 
         # Save gridded
-        self.save_results_to_csv()
+        gridded_path = self.save_results_to_csv()
 
         gc.collect()
-        self.finished.emit("Batch fitting completed.")
+        output_paths = [path for path in (ungridded_path, gridded_path) if path]
+        self.finished.emit("\n".join(output_paths))
 
     def stop(self):
         self.stop_requested = True
@@ -1485,8 +1505,10 @@ class BatchFitWorker(QThread):
                 df.to_csv(f, index=False)
 
             self.message.emit(f"Ungridded results saved to {file_path}")
+            return os.path.abspath(file_path)
         except Exception as e:
             self.message.emit(f"Failed to save ungridded results: {e}")
+            return None
 
     def save_results_to_csv(self):
         """
@@ -1497,7 +1519,7 @@ class BatchFitWorker(QThread):
 
         H, W = self.image_height, self.image_width
         if self.num_edges is None:
-            return
+            return None
 
         N = H * W
         X_coords = np.tile(np.arange(self.image_width), self.image_height)
@@ -1585,8 +1607,10 @@ class BatchFitWorker(QThread):
                 df.to_csv(f, index=False)
 
             self.message.emit(f"Gridded results saved to {file_path}")
+            return os.path.abspath(file_path)
         except Exception as e:
             self.message.emit(f"Failed to save gridded results: {e}")
+            return None
 
     def interpolate_results(self):
         """

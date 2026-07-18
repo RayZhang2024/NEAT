@@ -14,6 +14,7 @@
   - [2.1 Data Preprocessing Tab](#21-data-preprocessing-tab)
   - [2.2 Bragg Edge Fitting Tab](#22-bragg-edge-fitting-tab)
   - [2.3 Data Post Processing Tab](#23-data-post-processing-tab)
+  - [2.4 AI Assistant](#24-ai-assistant)
 - [3 Data Preprocessing](#3-data-preprocessing)
   - [3.1 Summation](#31-summation)
   - [3.2 Clean](#32-clean)
@@ -157,6 +158,40 @@ Each panel corresponds to a specific operation in the preprocessing chain, and u
 ![Data Post Processing Tab](docs/images/Data_Post-Processing_Tab.png)
 
 ---
+
+## 2.4 AI Assistant
+
+NEAT 4.8 includes a dockable support assistant for questions about using the
+software and understanding its documented controls and algorithms. Open **AI
+Assistant > AI Assistant** or press `Ctrl+Shift+A` to show or hide the panel.
+Open **AI Assistant > AI Assistant Settings...** to configure access.
+
+The assistant can use:
+
+- a personal API key for OpenAI, Anthropic, Google Gemini, DeepSeek or
+  Kimi/Moonshot;
+- another OpenAI-compatible endpoint configured manually;
+- a local model running through Ollama or LM Studio; or
+- NEAT shared access when it has been configured for that installation.
+
+Personal API keys are stored in the operating-system credential manager. They
+are not stored in the project files or ordinary NEAT settings. Local Ollama and
+LM Studio operation does not require an API key, but the selected local server
+must remain running.
+
+Ask questions in the panel or use **Explain current screen** for an overview of
+the active workflow. Answers are grounded in approved NEAT documentation and
+display verified source headings. The assistant may receive the question,
+retrieved documentation, recent conversation turns and a small allow-listed set
+of visible settings. NEAT does not automatically send raw images or file paths.
+
+Generated answers can still be incomplete or wrong. Review analysis settings,
+fitted curves, uncertainties and scientific assumptions independently. Dataset-
+specific interpretation and publication conclusions require appropriate domain
+review.
+
+---
+
 # 3 Data Preprocessing
 ## 3.1 Summation
 

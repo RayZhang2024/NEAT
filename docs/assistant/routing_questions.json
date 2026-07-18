@@ -1,0 +1,38 @@
+[
+  {"id": "ROUTE-001", "question": "What is the normal workflow for analysing data in NEAT?", "expected_route": "how_to"},
+  {"id": "ROUTE-002", "question": "How do I define wavelength manually when there is no spectra file?", "expected_route": "how_to"},
+  {"id": "ROUTE-003", "question": "How do I calculate strain from a spacing map?", "expected_route": "how_to"},
+  {"id": "ROUTE-004", "question": "How can I extract a line profile?", "expected_route": "how_to"},
+  {"id": "ROUTE-005", "question": "Which data should I load before Bragg-edge fitting?", "expected_route": "how_to"},
+
+  {"id": "ROUTE-006", "question": "What is a macro-pixel?", "expected_route": "parameter_explanation"},
+  {"id": "ROUTE-007", "question": "What does Window half mean?", "expected_route": "parameter_explanation"},
+  {"id": "ROUTE-008", "question": "What does eta represent in the edge model?", "expected_route": "parameter_explanation"},
+  {"id": "ROUTE-009", "question": "What is the difference between Fit edges and Fit pattern?", "expected_route": "parameter_explanation"},
+  {"id": "ROUTE-010", "question": "What happens if Adjacent is set to two?", "expected_route": "parameter_explanation"},
+
+  {"id": "ROUTE-011", "question": "Why does NEAT reject my mixed folder structure?", "expected_route": "troubleshooting"},
+  {"id": "ROUTE-012", "question": "Summation failed because one run has a different image count.", "expected_route": "troubleshooting"},
+  {"id": "ROUTE-013", "question": "Why was my FITS mask rejected?", "expected_route": "troubleshooting"},
+  {"id": "ROUTE-014", "question": "No theoretical Bragg edges appear in the table.", "expected_route": "troubleshooting"},
+  {"id": "ROUTE-015", "question": "My extracted spectrum is very noisy.", "expected_route": "troubleshooting"},
+  {"id": "ROUTE-016", "question": "The test fit is unstable. What should I check?", "expected_route": "troubleshooting"},
+  {"id": "ROUTE-017", "question": "The post-processing ROI mean reports no data.", "expected_route": "troubleshooting"},
+
+  {"id": "ROUTE-018", "question": "How should I physically interpret a red tensile region in the strain map?", "expected_route": "scientific_interpretation"},
+  {"id": "ROUTE-019", "question": "Can the fitted edge width be interpreted as a change in microstructure?", "expected_route": "scientific_interpretation"},
+  {"id": "ROUTE-020", "question": "How should I choose d0 as the reference for my material?", "expected_route": "scientific_interpretation"},
+  {"id": "ROUTE-021", "question": "Can I convert this strain map directly into residual stress?", "expected_route": "scientific_interpretation"},
+  {"id": "ROUTE-022", "question": "What scientific conclusions can I draw from the lattice-spacing map?", "expected_route": "scientific_interpretation"},
+
+  {"id": "ROUTE-023", "question": "NEAT shows a ModuleNotFoundError traceback when I launch it.", "expected_route": "bug_report"},
+  {"id": "ROUTE-024", "question": "The application crashes every time I load this dataset.", "expected_route": "bug_report"},
+  {"id": "ROUTE-025", "question": "The interface freezes when batch fitting starts.", "expected_route": "bug_report"},
+  {"id": "ROUTE-026", "question": "The fitting window closes unexpectedly with an exception.", "expected_route": "bug_report"},
+
+  {"id": "ROUTE-027", "question": "Give me settings that guarantee my strain map is scientifically correct.", "expected_route": "escalation"},
+  {"id": "ROUTE-028", "question": "Tell me the exact fitting parameters that always work for every dataset.", "expected_route": "escalation"},
+  {"id": "ROUTE-029", "question": "Is this strain map safe to publish without expert review?", "expected_route": "escalation"},
+  {"id": "ROUTE-030", "question": "Does this map definitively prove residual stress in the sample?", "expected_route": "escalation"},
+  {"id": "ROUTE-031", "question": "My detector was binned. Can I trust the mm scale and infer stress directly from the strain map?", "expected_route": "scientific_interpretation"}
+]

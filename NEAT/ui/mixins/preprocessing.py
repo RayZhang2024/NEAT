@@ -48,6 +48,7 @@ from ...workers.preprocessing import (
     OverlapCorrectionWorker,
     RadenNormalisationWorker,
     SummationWorker,
+    validate_normalisation_windows,
 )
 from ..dialogs import MaskGeneratorDialog, OpenBeamPlotDialog
 
@@ -700,14 +701,13 @@ class PreprocessingMixin:
             base_name = "FullProcess"
 
         try:
-            window_half = int(self.full_process_window_half_input.text().strip())
-        except ValueError:
-            window_half = 10
-
-        try:
-            adjacent_sum = int(self.full_process_adjacent_input.text().strip())
-        except ValueError:
-            adjacent_sum = 0
+            window_half, adjacent_sum = validate_normalisation_windows(
+                self.full_process_window_half_input.text().strip(),
+                self.full_process_adjacent_input.text().strip(),
+            )
+        except ValueError as exc:
+            self.preproc_message_box.append(str(exc))
+            return
 
         # Disable the button to prevent duplicates; enable the Stop button
         self.full_process_start_button.setEnabled(False)
@@ -1781,15 +1781,13 @@ class PreprocessingMixin:
 
         # Read UI parameters.
         try:
-            self._window_half = int(self.normalisation_window_half_input.text().strip())
-        except ValueError:
-            self._window_half = 10
-
-        try:
-            self._adjacent_sum = int(self.normalisation_adjacent_input.text().strip())
-            self._adjacent_sum = max(0, self._adjacent_sum)
-        except ValueError:
-            self._adjacent_sum = 0
+            self._window_half, self._adjacent_sum = validate_normalisation_windows(
+                self.normalisation_window_half_input.text().strip(),
+                self.normalisation_adjacent_input.text().strip(),
+            )
+        except ValueError as exc:
+            self.preproc_message_box.append(str(exc))
+            return
 
         # self._adjacent_sum = 0
 

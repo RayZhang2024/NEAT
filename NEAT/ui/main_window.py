@@ -63,6 +63,7 @@ from .mixins.fitting import FittingMixin
 from .mixins.postprocessing import PostProcessingMixin
 from .mixins.preprocessing import PreprocessingMixin
 from .dialogs import UncertaintyEstimatorDialog
+from .assistant_panel import AssistantDockWidget, collect_neat_context
 from .utils import update_all_widget_fonts
 
 
@@ -179,6 +180,8 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         
         # Set up the layout for PostProcessingTab (Data Post-Processing)
         self.setup_PostProcessingTab()
+        self.assistant_visible = True
+        self.setup_assistant_dock()
         self.setup_menu_bar()
 
         # Variables for storing image data and auto-adjust parameters
@@ -316,6 +319,18 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self._menu_bar_ready = True
         self.refresh_menu_bar_for_current_tab()
 
+    def setup_assistant_dock(self):
+        """Create the dockable NEAT support assistant."""
+        self.assistant_dock = AssistantDockWidget(
+            context_provider=self.build_assistant_context,
+            parent=self,
+        )
+        self.addDockWidget(Qt.RightDockWidgetArea, self.assistant_dock)
+
+    def build_assistant_context(self):
+        """Return only allow-listed, non-file NEAT state for support answers."""
+        return collect_neat_context(self)
+
     def refresh_menu_bar_for_current_tab(self):
         """Rebuild the native menu bar so it matches the active top-level tab."""
         if not getattr(self, "_menu_bar_ready", False):
@@ -336,6 +351,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         else:
             self._build_preprocessing_menu_bar(menu_bar)
 
+        self._add_assistant_menu(menu_bar)
         self._add_about_menu(menu_bar)
 
     def _build_preprocessing_menu_bar(self, menu_bar):
@@ -496,6 +512,21 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
         menu.addAction(exit_action)
+
+    def _add_assistant_menu(self, menu_bar):
+        """Add application-wide assistant controls to their own menu."""
+        if not hasattr(self, "assistant_dock"):
+            return
+        assistant_menu = menu_bar.addMenu("AI Assistant")
+        assistant_menu.addAction(self.assistant_dock.toggleViewAction())
+        assistant_settings_action = QAction(
+            "AI Assistant Settings...",
+            self,
+        )
+        assistant_settings_action.triggered.connect(
+            self.assistant_dock.open_settings_dialog
+        )
+        assistant_menu.addAction(assistant_settings_action)
 
     def _add_about_menu(self, menu_bar):
         about_menu = menu_bar.addMenu("About")
@@ -1473,6 +1504,11 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             updates.get("ignored_version", self.ignored_update_version)
         )
         self.sync_update_check_controls()
+        self.assistant_visible = bool(
+            data.get("assistant_visible", self.assistant_visible)
+        )
+        if hasattr(self, "assistant_dock"):
+            self.assistant_dock.setVisible(self.assistant_visible)
 
     def save_user_settings(self):
         """Persist key GUI parameters to disk."""
@@ -1500,6 +1536,11 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             "live_fit_preview_enabled": bool(getattr(self, "live_fit_preview_enabled", True)),
             "fitting_plot_layout_mode": getattr(self, "fitting_plot_layout_mode", "single"),
             "last_open_tab_index": self.tabs.currentIndex() if hasattr(self, "tabs") else 0,
+            "assistant_visible": (
+                self.assistant_dock.isVisible()
+                if hasattr(self, "assistant_dock")
+                else self.assistant_visible
+            ),
             "manual_wavelength": {
                 "mode": getattr(self, "manual_anchor_mode", "wavelength"),
                 "anchors": getattr(self, "manual_wavelength_anchors", []),
@@ -1530,6 +1571,16 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             pass
 
     def closeEvent(self, event):
+        assistant_dock = getattr(self, "assistant_dock", None)
+        if assistant_dock is not None and not assistant_dock.shutdown():
+            QMessageBox.information(
+                self,
+                "AI Assistant Busy",
+                "The AI Assistant is finishing a request. Please close NEAT again "
+                "after the answer or error appears.",
+            )
+            event.ignore()
+            return
         self.save_user_settings()
         self.cleanup_resources()
         super().closeEvent(event)

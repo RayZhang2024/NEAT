@@ -125,6 +125,38 @@ class _HeadlessFitting(FittingMixin):
 
 
 class TestFittingHeadless(unittest.TestCase):
+    def test_manual_wavelength_anchors_interpolate_and_extend_to_stack_edges(self):
+        obj = _HeadlessFitting()
+        obj.images = [object()] * 5
+        obj.message_box = _DummyMessageBox()
+        obj.manual_anchor_mode = "wavelength"
+        obj.manual_wavelength_anchors = [
+            {"index": 2, "value": 1.0},
+            {"index": 4, "value": 3.0},
+        ]
+        obj.flight_path = 10.0
+        obj.delay = 0.0
+
+        obj.update_manual_wavelengths()
+
+        np.testing.assert_allclose(obj.wavelengths, [1.0, 1.0, 2.0, 3.0, 3.0])
+        self.assertEqual(obj.start_wavelength, 1.0)
+        self.assertEqual(obj.end_wavelength, 3.0)
+
+    def test_manual_tof_anchor_uses_milliseconds_flight_path_and_delay(self):
+        obj = _HeadlessFitting()
+        obj.images = [object()] * 3
+        obj.message_box = _DummyMessageBox()
+        obj.manual_anchor_mode = "tof"
+        obj.manual_wavelength_anchors = [{"index": 1, "value": 1.0}]
+        obj.flight_path = 10.0
+        obj.delay = 0.5
+
+        obj.update_manual_wavelengths()
+
+        expected = (1.0 + 0.5) * 3.956 / 10.0 * 1000.0
+        np.testing.assert_allclose(obj.wavelengths, np.full(3, expected))
+
     def test_default_bragg_edge_windows_use_current_formula_without_neighbors(self):
         windows = _HeadlessFitting._default_bragg_edge_windows(2.0)
 
@@ -644,6 +676,22 @@ class TestFittingHeadless(unittest.TestCase):
         self.assertIn(hkl, result["edge_widths"])
         self.assertTrue(np.isfinite(result["edge_heights"][hkl]))
         self.assertTrue(np.isfinite(result["edge_widths"][hkl]))
+
+        fixed_result, fixed_error = obj.fit_full_pattern_core(
+            fix_s=True,
+            fix_t=True,
+            fix_eta=True,
+            max_nfev=200,
+            curve_fit_maxfev=5000,
+            fit_context=fit_context,
+            wavelengths=wavelengths,
+            intensities=intensities,
+            apply_lattice_update=False,
+        )
+        self.assertIsNone(fixed_error)
+        self.assertTrue(np.isnan(fixed_result["s_uncertainties"][hkl]))
+        self.assertTrue(np.isnan(fixed_result["t_uncertainties"][hkl]))
+        self.assertTrue(np.isnan(fixed_result["eta_uncertainties"][hkl]))
 
     def test_canvas_corner_press_without_ctrl_moves_small_roi(self):
         obj = _HeadlessFitting()

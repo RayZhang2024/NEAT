@@ -145,6 +145,13 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local NEAT assistant vector indexes and downloaded runtime state
+.assistant_cache/
+.assistant_server/
+.env
+.env.*
+!.env.example
+
 # Spyder project settings
 .spyderproject
 .spyproject

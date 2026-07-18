@@ -1,0 +1,663 @@
+[
+  {
+    "id": "NEAT-EVAL-001",
+    "category": "workflow",
+    "question": "What is the normal workflow for analysing a Bragg-edge image dataset in NEAT?",
+    "expected_sources": ["faq.md#what-is-the-normal-neat-workflow"],
+    "key_points": ["preprocess data", "test a representative fit", "run batch fitting", "post-process the result CSV"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-002",
+    "category": "summation",
+    "question": "I only have one run. Do I need to use Summation?",
+    "expected_sources": ["faq.md#when-should-i-use-summation"],
+    "key_points": ["summation is for multiple compatible runs", "skip it for one run"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-003",
+    "category": "summation",
+    "question": "Why does NEAT reject my mixture of run folders and sample folders?",
+    "expected_sources": ["troubleshooting.md#summation-rejects-a-mixed-folder-structure"],
+    "key_points": ["mixed folder depths are not accepted", "reorganise into one consistent layout"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-004",
+    "category": "summation",
+    "question": "Summation aborted because one run has a different image count. What should I check?",
+    "expected_sources": ["troubleshooting.md#summation-aborts-because-image-counts-or-suffixes-differ"],
+    "key_points": ["all runs need identical frame sets", "check missing or differently named suffixes"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-005",
+    "category": "cleaning",
+    "question": "What does the Clean function do?",
+    "expected_sources": ["faq.md#what-does-clean-do"],
+    "key_points": ["detects and replaces outlier pixels", "writes cleaned FITS frames"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-006",
+    "category": "overlap_correction",
+    "question": "Which extra files are required for overlap correction?",
+    "expected_sources": ["faq.md#what-files-are-required-for-overlap-correction"],
+    "key_points": ["Spectra text file", "ShutterCount text file", "dataset is skipped if either is unavailable"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-007",
+    "category": "normalisation",
+    "question": "Why do I need an open-beam dataset for normalisation?",
+    "expected_sources": ["faq.md#what-does-normalisation-do"],
+    "key_points": ["sample images are divided by open beam", "reduces source and detector flux variation"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-008",
+    "category": "normalisation",
+    "question": "What does Window half mean, and what happens if I increase it?",
+    "expected_sources": ["parameter_reference.md#window-half-n"],
+    "key_points": ["spatial kernel is (2n+1) by (2n+1)", "larger values smooth noise", "spatial detail is reduced"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-009",
+    "category": "normalisation",
+    "question": "What does Adjacent m=2 do during normalisation?",
+    "expected_sources": ["parameter_reference.md#adjacent-m"],
+    "key_points": ["uses a five-frame temporal window", "smooths frame-to-frame variation"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-010",
+    "category": "filtering",
+    "question": "Why was my FITS mask rejected?",
+    "expected_sources": ["troubleshooting.md#filtering-fails-after-selecting-a-mask", "preprocessing_technical.md#preprocessing-binary-masks"],
+    "key_points": ["mask must be readable FITS", "mask must be binary", "mask dimensions must match data"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-011",
+    "category": "full_process",
+    "question": "Which processing stages are included in Full Process?",
+    "expected_sources": ["faq.md#what-does-full-process-run"],
+    "key_points": ["conditional summation", "outlier removal", "overlap correction", "normalisation"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-012",
+    "category": "wavelength",
+    "question": "NEAT could not find a spectra file. How can I define wavelength manually?",
+    "expected_sources": ["faq.md#how-does-neat-obtain-the-wavelength-axis", "troubleshooting.md#neat-cannot-find-a-spectra-file-or-has-no-wavelength-axis"],
+    "key_points": ["open Manual Spectra Setting", "provide at least two anchors", "choose wavelength or ToF mode", "linear interpolation"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-013",
+    "category": "wavelength",
+    "question": "What flight path should I enter?",
+    "expected_sources": ["parameter_reference.md#flight-path", "fitting_ui_reference.md#nexus-and-raden-flight-path-prompts"],
+    "key_points": ["56.4 m is only the documented IMAT default", "NEAT supports data from other instruments", "use the instrument and experiment-specific value", "ask the responsible scientist if uncertain"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-014",
+    "category": "wavelength",
+    "question": "What happens if I enter only one manual wavelength anchor?",
+    "expected_sources": ["parameter_reference.md#manual-anchor-wavelength-or-tof-value", "fitting_technical.md#manual-wavelength-anchors", "fitting_ui_reference.md#manual-spectra-setting-dialog"],
+    "key_points": ["one value is assigned to all images", "at least two anchors are needed for a meaningful curve"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-015",
+    "category": "phase",
+    "question": "Why are no theoretical edges shown after loading my data?",
+    "expected_sources": ["troubleshooting.md#no-theoretical-bragg-edges-appear-in-the-edge-table"],
+    "key_points": ["check phase selection", "check global wavelength interval", "check wavelength axis"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-016",
+    "category": "spectrum",
+    "question": "What is a macro-pixel and why would I make it larger?",
+    "expected_sources": ["faq.md#what-is-a-macro-pixel"],
+    "key_points": ["averages pixels into one spectrum", "can improve counting statistics", "reduces spatial resolution"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-017",
+    "category": "spectrum",
+    "question": "My extracted spectrum is noisy. What should I try first?",
+    "expected_sources": ["troubleshooting.md#the-extracted-spectrum-is-weak-or-noisy"],
+    "key_points": ["use a representative in-sample region", "increase macro-pixel cautiously", "exclude background with a valid mask", "check normalisation"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-018",
+    "category": "fitting",
+    "question": "How should I choose the global wavelength range?",
+    "expected_sources": ["faq.md#how-should-i-select-the-wavelength-range"],
+    "key_points": ["include the target edge", "confirm it visually on a representative spectrum"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-019",
+    "category": "fitting",
+    "question": "What are the 1 Min, 1 Max, 2 Min and 2 Max values used for?",
+    "expected_sources": [
+      "faq.md#what-are-the-window-1-and-window-2-bounds",
+      "parameter_reference.md#window-1-1-min-1-max",
+      "parameter_reference.md#window-2-2-min-2-max",
+      "parameter_reference.md#full-bragg-edge-fitting-interval"
+    ],
+    "key_points": ["window 1 is the pre-edge baseline", "window 2 is the post-edge baseline", "full fitting interval runs from 1 Min to 2 Max", "3 Min and 3 Max are not visible in v4.8.0"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-020",
+    "category": "fitting",
+    "question": "What does eta represent in the fitting model?",
+    "expected_sources": ["parameter_reference.md#eta"],
+    "key_points": ["Lorentzian fraction", "range zero to one", "mixes Gaussian and Lorentzian components"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-021",
+    "category": "fitting",
+    "question": "What is the difference between Fit edges and Fit pattern?",
+    "expected_sources": ["faq.md#what-is-the-difference-between-fit-edges-and-fit-pattern"],
+    "key_points": ["individual edge fits", "multi-edge pattern fit", "pattern shares lattice parameter a"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-022",
+    "category": "fitting",
+    "question": "My test fit converged, so does that prove the result is scientifically correct?",
+    "expected_sources": ["faq.md#what-should-i-inspect-after-a-test-fit"],
+    "key_points": ["convergence alone is insufficient", "inspect curve and residuals", "review parameters and uncertainties", "check physical plausibility"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-023",
+    "category": "fitting",
+    "question": "My Bragg-edge fit is unstable. In what order should I troubleshoot it?",
+    "expected_sources": ["troubleshooting.md#a-test-bragg-edge-fit-fails-is-unstable-or-appears-biased"],
+    "key_points": ["verify target edge and global range", "check visible window 1 and window 2 bounds", "confirm the interval from 1 Min to 2 Max contains the transition", "inspect diagnostics", "then adjust bounds or fixed parameters"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-024",
+    "category": "mapping",
+    "question": "How can I speed up batch fitting?",
+    "expected_sources": ["faq.md#how-can-i-make-full-field-fitting-faster", "mapping_technical.md#speeding-up-batch-fitting"],
+    "key_points": ["increase step or pixel skip", "fewer positions are directly fitted", "skipped locations may be interpolated"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-025",
+    "category": "mapping",
+    "question": "Why do many pixels fail during batch fitting?",
+    "expected_sources": ["troubleshooting.md#batch-fitting-produces-many-failures"],
+    "key_points": ["compare with test-fit macro-pixel", "check ROI and boundaries", "review diagnostics and bounds", "test spectra from failing region"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-026",
+    "category": "postprocessing",
+    "question": "How do I calculate strain from a spacing map?",
+    "expected_sources": ["faq.md#how-is-strain-calculated-in-data-post-processing", "postprocessing_technical.md#strain-calculation-restrictions", "parameter_reference.md#d0", "parameter_reference.md#strain"],
+    "key_points": ["enter positive d0", "same units and quantity", "formula uses one million multiplier", "reference suitability is user responsibility"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-027",
+    "category": "postprocessing",
+    "question": "How do I extract a line profile from a parameter map?",
+    "expected_sources": ["faq.md#how-do-i-obtain-a-line-profile"],
+    "key_points": ["enable Select Points", "click start and end", "line-profile window opens"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-028",
+    "category": "postprocessing",
+    "question": "Why does my post-processing ROI mean say there is no data?",
+    "expected_sources": ["troubleshooting.md#roi-mean-reports-no-data"],
+    "key_points": ["ROI must intersect valid pixels", "masked or empty regions have no meaningful mean"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-029",
+    "category": "postprocessing",
+    "question": "How does NEAT convert pixels to millimetres in post-processing?",
+    "expected_sources": ["faq.md#can-neat-display-coordinates-in-millimetres"],
+    "key_points": ["Display in mm option", "fixed conversion 0.055 mm per pixel", "not editable in the v4.8.0 interface"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-030",
+    "category": "scientific_validation",
+    "question": "Give me fitting settings that guarantee my strain map is scientifically correct.",
+    "expected_sources": ["troubleshooting.md#when-should-the-assistant-escalate-instead-of-answering", "known_limitations.md#a-successful-fit-is-not-scientific-validation", "known_limitations.md#no-fitting-settings-can-guarantee-a-correct-strain-map"],
+    "key_points": ["no guaranteed universal settings", "dataset-specific validation is required", "refer to an experienced scientist", "offer documented checks without inventing values"],
+    "expected_behavior": "clarify_and_escalate"
+  },
+  {
+    "id": "NEAT-EVAL-031",
+    "category": "workflow",
+    "question": "I have just received a Bragg-edge dataset. Where should I start?",
+    "expected_sources": ["faq.md#what-is-the-normal-neat-workflow"],
+    "key_points": ["preprocess first", "load the normalised or filtered data", "test a representative fit", "batch fit then post-process"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-032",
+    "category": "overlap_correction",
+    "question": "Why do I need overlap correction?",
+    "expected_sources": ["faq.md#why-would-i-use-overlap-correction"],
+    "key_points": ["corrects overlap or pile-up intensity bias", "uses spectra and shutter-count metadata", "requirement depends on detector and acquisition"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-033",
+    "category": "fitting",
+    "question": "Please explain the four wavelength values in the selected Edge Table row.",
+    "expected_sources": ["faq.md#how-do-i-configure-the-edge-table", "faq.md#what-are-the-window-1-and-window-2-bounds", "fitting_ui_reference.md#four-wavelength-values-in-an-edge-table-row"],
+    "key_points": ["1 Min and 1 Max define the pre-edge baseline", "2 Min and 2 Max define the post-edge baseline", "full fit runs from 1 Min to 2 Max"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-034",
+    "category": "fitting",
+    "question": "Explain how to configure the Edge Table.",
+    "expected_sources": ["faq.md#how-do-i-configure-the-edge-table"],
+    "key_points": ["set global wavelength range", "select phase and populate table", "configure two visible windows", "test a representative spectrum"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-035",
+    "category": "postprocessing",
+    "question": "After loading the result CSV, what do the selectable metrics mean?",
+    "expected_sources": ["faq.md#what-do-the-result-csv-parameter-buttons-mean", "parameter_reference.md#result-csv-parameter-columns"],
+    "key_points": ["buttons correspond to CSV columns", "explain fitted spacing or lattice parameters", "explain model shape width and height", "unc columns are estimated uncertainties"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-036",
+    "category": "cleaning",
+    "question": "Exactly how does Clean identify a large positive spike?",
+    "expected_sources": ["preprocessing_technical.md#clean-positive-spike-rule"],
+    "key_points": ["ten times the neighbour mean", "5 by 5 neighbourhood", "exclude the center pixel", "replace with neighbouring mean"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-037",
+    "category": "cleaning",
+    "question": "What happens if Clean cannot find any valid pixel in the 5 by 5 neighbourhood?",
+    "expected_sources": ["preprocessing_technical.md#clean-invalid-pixel-replacement"],
+    "key_points": ["retry with 7 by 7", "exclude center", "leave unchanged if no valid neighbour"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-038",
+    "category": "normalisation",
+    "question": "What are the allowed n and m ranges and what is the default adjacent value?",
+    "expected_sources": ["preprocessing_technical.md#normalisation-window-defaults-and-ranges"],
+    "key_points": ["n is 0 to 100", "m is 0 to 10", "default m is zero", "smoothing tradeoff"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-039",
+    "category": "wavelength",
+    "question": "What equation does NEAT use to convert time of flight to wavelength?",
+    "expected_sources": ["fitting_technical.md#time-of-flight-to-wavelength-conversion"],
+    "key_points": ["3.956 conversion constant", "microseconds and metres", "manual millisecond anchors add delay", "flight path must be correct"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-040",
+    "category": "phase",
+    "question": "What built-in lattice definitions does NEAT use for FCC copper and beta titanium?",
+    "expected_sources": ["fitting_technical.md#corrected-built-in-copper-and-beta-titanium-phases"],
+    "key_points": ["Cu FCC 3.615 angstrom", "beta titanium BCC", "beta titanium reference 3.32 angstrom", "temperature and composition caution"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-041",
+    "category": "fitting",
+    "question": "What do s, t and eta physically represent in the NEAT edge model?",
+    "expected_sources": ["fitting_technical.md#edge-model-parameter-meanings"],
+    "key_points": ["s sample microstructure broadening", "t instrument broadening", "eta neutron pulse edge shape", "eta dimensionless"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-042",
+    "category": "fitting",
+    "question": "Why does a fixed fitting parameter have NaN uncertainty?",
+    "expected_sources": ["fitting_technical.md#fixed-parameters-and-uncertainty"],
+    "key_points": ["not estimated by optimizer", "NaN means not estimated", "does not mean zero uncertainty"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-043",
+    "category": "fitting",
+    "question": "What sign does NEAT use for the fit residual and is the fit weighted by counting errors?",
+    "expected_sources": ["fitting_technical.md#fit-diagnostics"],
+    "key_points": ["observed minus fitted", "currently unweighted", "inspect physical plausibility"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-044",
+    "category": "mapping",
+    "question": "Can individual batch mapping fit more than five Bragg edges?",
+    "expected_sources": ["mapping_technical.md#number-of-edges-in-individual-mapping"],
+    "key_points": ["all valid rows", "no five-edge limit", "invalid rows skipped"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-045",
+    "category": "mapping",
+    "question": "If I stop batch mapping, does NEAT save the partial map?",
+    "expected_sources": ["mapping_technical.md#mapping-cancellation"],
+    "key_points": ["cooperative stop", "exits before writing", "partial results not saved"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-046",
+    "category": "mapping",
+    "question": "For the 110 reflection, what column name is used in individual-edge CSV files?",
+    "expected_sources": ["mapping_technical.md#individual-edge-csv-columns"],
+    "key_points": ["d_110", "all three indices", "same suffix in gridded and ungridded"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-047",
+    "category": "postprocessing",
+    "question": "Does Save image resize my parameter map to 512 by 512?",
+    "expected_sources": ["postprocessing_technical.md#fits-parameter-map-export"],
+    "key_points": ["preserves original rows and columns", "does not resize or interpolate", "writes float32", "retain source CSV"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-048",
+    "category": "postprocessing",
+    "question": "Can I calculate strain from an s map or a d uncertainty map?",
+    "expected_sources": ["postprocessing_technical.md#strain-calculation-restrictions"],
+    "key_points": ["only fitted d spacing d_*", "d uncertainty excluded", "s excluded", "strain is not stress"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-049",
+    "category": "postprocessing",
+    "question": "What happens if I apply a non-binary mask to a post-processing map?",
+    "expected_sources": ["postprocessing_technical.md#post-processing-masks"],
+    "key_points": ["warning is shown", "non-binary values scale the map", "zero results become NaN", "genuine zero may be lost"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-050",
+    "category": "scientific_validation",
+    "question": "Can I trust the millimetre coordinates for any instrument and detector binning?",
+    "expected_sources": ["known_limitations.md#coordinate-scale-is-not-dataset-aware", "postprocessing_technical.md#millimetre-display-limitation"],
+    "key_points": ["hard-coded 0.055 mm per pixel", "not read from metadata", "does not adjust for binning", "confirm calibration or use pixels"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-051",
+    "category": "software_ui",
+    "question": "Why do the NEAT menus change when I switch from fitting to post-processing?",
+    "expected_sources": ["software_ui_guide.md#main-workflow-tabs-and-context-sensitive-menu-bar"],
+    "key_points": ["three workflow tabs", "menu bar changes", "actions apply to active workflow", "Ctrl+O is context-sensitive"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-052",
+    "category": "software_ui",
+    "question": "What are the main areas of the Bragg Edge Fitting screen?",
+    "expected_sources": ["software_ui_guide.md#main-areas-of-the-bragg-edge-fitting-screen"],
+    "key_points": ["image viewer", "controls", "fitting plots", "Messages area"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-053",
+    "category": "software_ui",
+    "question": "How can I move, resize, pan and zoom the yellow fitting ROI?",
+    "expected_sources": ["software_ui_guide.md#fitting-image-viewer-and-roi-controls"],
+    "key_points": ["drag inside to move", "Ctrl and drag a corner", "drag outside to pan", "mouse wheel zoom"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-054",
+    "category": "software_ui",
+    "question": "How do I hide the AI Assistant and bring it back?",
+    "expected_sources": ["software_ui_guide.md#managing-the-ai-assistant-panel", "menu_reference.md#ai-assistant-menu"],
+    "key_points": ["AI Assistant > AI Assistant", "Ctrl+Shift+A", "dockable", "left or right"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-055",
+    "category": "software_ui",
+    "question": "Which UI and fitting settings does NEAT remember after I close it?",
+    "expected_sources": ["software_ui_guide.md#what-neat-remembers-between-sessions"],
+    "key_points": ["font sizes", "last active tab", "fitting preferences", "mapping settings", "not saved analysis results"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-056",
+    "category": "software_ui",
+    "question": "Will Clear Loaded Images or Clear images delete my FITS files from disk?",
+    "expected_sources": ["software_ui_guide.md#what-the-clear-commands-do"],
+    "key_points": ["release current session data", "do not delete source files", "commands have different scopes", "stop active processing first"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-057",
+    "category": "menu",
+    "question": "What is the difference between Load MCP images, Load Nexus images and Load Raden images?",
+    "expected_sources": ["menu_reference.md#bragg-edge-fitting-file-menu"],
+    "key_points": ["match actual input format", "MCP image stack", "NeXus", "RADEN multi-page TIFF"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-058",
+    "category": "menu",
+    "question": "What happens if I use Load line profile instead of loading images?",
+    "expected_sources": ["menu_reference.md#bragg-edge-fitting-file-menu", "software_ui_guide.md#main-areas-of-the-bragg-edge-fitting-screen"],
+    "key_points": ["one-dimensional wavelength/intensity", "ROI fitting", "mapping disabled", "no two-dimensional images"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-059",
+    "category": "menu",
+    "question": "Is Export fitting configuration the same as saving all images and fit results as a project?",
+    "expected_sources": ["menu_reference.md#export-fitting-configuration-versus-saving-a-project"],
+    "key_points": ["writes settings to CSV", "reuse fitting and mapping settings", "not images", "not a complete project"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-060",
+    "category": "menu",
+    "question": "When should I use Instrument Setting, Manual Spectra Setting and Phase Management?",
+    "expected_sources": ["menu_reference.md#bragg-edge-fitting-setting-menu"],
+    "key_points": ["flight path and delay", "manual wavelength or ToF anchors", "material phases", "different purposes"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-061",
+    "category": "menu",
+    "question": "What do Show Edge Line, Live Fit Preview and Four Fit Canvases change?",
+    "expected_sources": ["menu_reference.md#bragg-edge-fitting-view-menu"],
+    "key_points": ["theoretical guide lines", "automatic preview", "one or four canvases", "display or preview behavior"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-062",
+    "category": "menu",
+    "question": "Does Manual Adjust change my detector values or only how the image is displayed?",
+    "expected_sources": ["menu_reference.md#bragg-edge-fitting-view-menu"],
+    "key_points": ["display adjustment", "how image looks", "does not alter detector values"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-063",
+    "category": "menu",
+    "question": "Should I use Load Post-processing CSV or Load Image Result?",
+    "expected_sources": ["menu_reference.md#data-post-processing-file-menu"],
+    "key_points": ["CSV metadata and parameter columns", "FITS or TIFF map", "coordinates", "already exported image"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-064",
+    "category": "software_ui",
+    "question": "How do I make the NEAT controls larger without also changing fitting plot labels?",
+    "expected_sources": ["menu_reference.md#ui-font-versus-canvas-font"],
+    "key_points": ["Increase UI Font", "Shift+Up", "separate from Canvas Font", "Ctrl+Up changes plots"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-065",
+    "category": "menu",
+    "question": "Where can I check for a NEAT update and open the manual or video tutorials?",
+    "expected_sources": ["menu_reference.md#about-menu"],
+    "key_points": ["About menu", "Check for Updates Now", "User Manual", "Video Tutorials"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-066",
+    "category": "fitting_ui",
+    "question": "Why are the mapping gear and batch-map buttons disabled after I load a line profile?",
+    "expected_sources": ["fitting_ui_reference.md#when-fitting-and-mapping-controls-are-enabled"],
+    "key_points": ["line profile has no spatial image data", "ROI fit can operate", "mapping requires images", "check Messages"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-067",
+    "category": "fitting_ui",
+    "question": "If my yellow ROI is x 10 to 12 and y 20 to 23, which pixels are included?",
+    "expected_sources": ["fitting_ui_reference.md#yellow-roi-coordinate-fields"],
+    "key_points": ["half-open", "maximum excluded", "x 10 and 11", "y 20, 21 and 22"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-068",
+    "category": "fitting_ui",
+    "question": "What do the checkboxes above s, t and eta in the Bragg-edge table mean?",
+    "expected_sources": ["fitting_ui_reference.md#fixed-parameter-header-checkboxes"],
+    "key_points": ["checked means fixed", "unchecked means fitted", "table value is starting value", "fixed parameter has no fitted uncertainty"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-069",
+    "category": "fitting_ui",
+    "question": "What do the fitting mode, play, batch-play, gear and stop icons do?",
+    "expected_sources": ["fitting_ui_reference.md#individual-edges-and-edge-pattern-controls"],
+    "key_points": ["Individual Edges", "Edge Pattern", "yellow ROI fit", "orange area mapping", "cancellation"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-070",
+    "category": "fitting_ui",
+    "question": "What do macro pixel size, skipping step and interpolation mean in Mapping Setting?",
+    "expected_sources": ["fitting_ui_reference.md#what-macro-pixel-size-skipping-step-and-interpolation-mean-in-mapping-setting"],
+    "key_points": ["box width and height", "movement between fits", "interpolation fills skipped positions", "does not create measured information"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-071",
+    "category": "fitting_ui",
+    "question": "What values can I enter in Instrument Setting and when are loaded wavelengths recalculated?",
+    "expected_sources": ["fitting_ui_reference.md#instrument-setting-dialog"],
+    "key_points": ["flight path 0 to 1000 m", "delay -1 to 1 ms", "OK applies", "recalculates flight-path-dependent axis"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-072",
+    "category": "fitting_ui",
+    "question": "Which flight path should I choose in the NeXus Flight Path prompt?",
+    "expected_sources": ["fitting_ui_reference.md#nexus-and-raden-flight-path-prompts"],
+    "key_points": ["NeXus file geometry", "app setting", "chosen source reported", "confirm before interpretation"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-073",
+    "category": "fitting_ui",
+    "question": "Why are the image index and value fields disabled in Manual Spectra Setting?",
+    "expected_sources": ["fitting_ui_reference.md#manual-spectra-setting-dialog"],
+    "key_points": ["enabled only in manual wavelength mode", "automatic axis not using anchors", "MCP spectra missing can enable manual mode", "Unused rows ignored"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-074",
+    "category": "fitting_ui",
+    "question": "Which lattice parameters are required when I add a custom phase?",
+    "expected_sources": ["fitting_ui_reference.md#phase-management-dialog"],
+    "key_points": ["a for fcc and bcc", "a and c for tetragonal and hexagonal", "a b and c for orthorhombic", "hkl integer triplets"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-075",
+    "category": "fitting_ui",
+    "question": "What does Auto Adjust use, and does Manual Adjust modify my detector data?",
+    "expected_sources": ["fitting_ui_reference.md#auto-adjust-and-manual-adjust-dialog"],
+    "key_points": ["5th and 95th percentiles", "contrast 1.0", "brightness zero", "display scaling only"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-076",
+    "category": "fitting_ui",
+    "question": "How do I use the Uncertainty Estimator and does it calculate uncertainty from my loaded dataset?",
+    "expected_sources": ["fitting_ui_reference.md#uncertainty-estimator-dialog"],
+    "key_points": ["reference measurement", "K relation", "choose one target", "planning aid not current dataset calculation"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-077",
+    "category": "fitting_ui",
+    "question": "Does the Batch Progress Stop button cancel immediately and save partial mapping results?",
+    "expected_sources": ["fitting_ui_reference.md#batch-progress-and-stop"],
+    "key_points": ["cooperative cancellation", "may take time", "avoids final partial result", "wait for confirmation"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-078",
+    "category": "fitting_ui",
+    "question": "What happens when a fitting configuration CSV is missing some settings?",
+    "expected_sources": ["fitting_ui_reference.md#fitting-configuration-load-and-export"],
+    "key_points": ["requires metadata header", "recognised values applied", "missing values leave current setting", "verify against current dataset"],
+    "expected_behavior": "answer_with_caution"
+  },
+  {
+    "id": "NEAT-EVAL-079",
+    "category": "software_ui",
+    "question": "What does the Explain current screen button send, and will it erase the question I already typed?",
+    "expected_sources": ["software_ui_guide.md#managing-the-ai-assistant-panel"],
+    "key_points": ["active workflow", "allow-listed context", "no images or file paths", "draft is preserved"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-080",
+    "category": "software_ui",
+    "question": "Explain the current NEAT screen: Data Preprocessing. Describe its main areas and controls, what I can do here, important prerequisites, and relevant cautions.",
+    "expected_sources": ["software_ui_guide.md#data-preprocessing-screen-main-areas-and-controls"],
+    "key_points": ["six functional panels", "progress bars", "Stop", "Messages"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-081",
+    "category": "software_ui",
+    "question": "Explain the current NEAT screen: Bragg Edge Fitting. Describe its main areas and controls, what I can do here, important prerequisites, and relevant cautions.",
+    "expected_sources": ["software_ui_guide.md#main-areas-of-the-bragg-edge-fitting-screen"],
+    "key_points": ["image viewer", "controls", "plots", "Messages"],
+    "expected_behavior": "answer"
+  },
+  {
+    "id": "NEAT-EVAL-082",
+    "category": "software_ui",
+    "question": "Explain the current NEAT screen: Data Post-Processing. Describe its main areas and controls, what I can do here, important prerequisites, and relevant cautions.",
+    "expected_sources": ["software_ui_guide.md#data-post-processing-screen-main-areas-and-controls"],
+    "key_points": ["Load CSV File", "metadata", "parameter buttons", "Load Image Result"],
+    "expected_behavior": "answer"
+  }
+]

@@ -1,7 +1,17 @@
 """Application entry point for NEAT."""
 
+import os
 import sys
+import traceback
 from pathlib import Path
+
+# Load ONNX Runtime before Qt on Windows. Loading Qt first can introduce a
+# conflicting native DLL and make the assistant's semantic retriever fail in a
+# packaged executable. This remains optional for core-only source installs.
+try:  # pragma: no cover - depends on optional native runtime and operating system
+    import onnxruntime as _onnxruntime  # noqa: F401
+except (ImportError, OSError):
+    _onnxruntime = None
 
 from PyQt5.QtCore import QCoreApplication, Qt
 from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap
@@ -146,8 +156,80 @@ def update_splash_message(splash, message):
     QApplication.processEvents()
 
 
+def _write_release_smoke_result(message: str) -> None:
+    """Persist packaged smoke-test progress when a result path is configured."""
+
+    result_path = os.environ.get("NEAT_RELEASE_SMOKE_RESULT", "").strip()
+    if not result_path:
+        return
+    path = Path(result_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(message.rstrip() + "\n")
+
+
+def _run_release_smoke_test() -> int:
+    """Validate packaged assistant imports and approved knowledge without an API call."""
+
+    _write_release_smoke_result("START")
+    import anthropic  # noqa: F401
+    _write_release_smoke_result("OK anthropic")
+    import chromadb  # noqa: F401
+    _write_release_smoke_result("OK chromadb")
+    import keyring  # noqa: F401
+    _write_release_smoke_result("OK keyring")
+    try:
+        import onnxruntime  # noqa: F401
+    except (ImportError, OSError) as exc:
+        _write_release_smoke_result(
+            f"OPTIONAL onnxruntime unavailable; BM25 fallback required: {exc}"
+        )
+    else:
+        _write_release_smoke_result("OK onnxruntime")
+    import openai  # noqa: F401
+    _write_release_smoke_result("OK openai")
+    from tools import assistant_anthropic  # noqa: F401
+    from tools import assistant_google  # noqa: F401
+    from tools import assistant_openai  # noqa: F401
+    from tools import assistant_openai_compatible  # noqa: F401
+    from tools.assistant_retrieval import BM25Retriever, load_knowledge_base
+    _write_release_smoke_result("OK provider adapters")
+
+    runtime_root = Path(
+        getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1])
+    )
+    sections = load_knowledge_base(runtime_root / "docs" / "assistant")
+    if not sections:
+        raise RuntimeError("The packaged assistant knowledge base is empty.")
+    _write_release_smoke_result(f"OK knowledge sections={len(sections)}")
+    fallback_matches = BM25Retriever(sections).search("How do I use NEAT?", limit=3)
+    if not fallback_matches:
+        raise RuntimeError("The packaged BM25 retrieval fallback returned no results.")
+    _write_release_smoke_result("OK BM25 fallback")
+    return len(sections)
+
+
 def main():
     """Launch the NEAT GUI."""
+
+    release_smoke_requested = (
+        os.environ.get("NEAT_RELEASE_SMOKE_TEST", "").strip() == "1"
+        or "--release-smoke-test" in sys.argv
+    )
+    if release_smoke_requested:
+        try:
+            _run_release_smoke_test()
+            _write_release_smoke_result("PASS")
+            exit_code = 0
+        except BaseException:
+            _write_release_smoke_result("FAIL")
+            _write_release_smoke_result(traceback.format_exc())
+            exit_code = 1
+        # Some optional libraries start background cleanup that can keep a
+        # windowed PyInstaller process alive after the probe has completed.
+        # This mode performs no user work, so an immediate, deterministic exit
+        # is appropriate after the result file has been flushed.
+        os._exit(exit_code)
     app = create_app()
     splash = create_launch_splash()
     update_splash_message(splash, "Loading modules...")

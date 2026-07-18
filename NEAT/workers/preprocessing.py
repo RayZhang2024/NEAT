@@ -13,6 +13,31 @@ from PyQt5.QtCore import Qt, QEventLoop, QThread, pyqtSignal
 
 from .batch import get_raden_tiff_stack_info, load_image_file, write_fits_image_file
 
+NORMALISATION_WINDOW_HALF_RANGE = (0, 100)
+NORMALISATION_ADJACENT_RANGE = (0, 10)
+
+
+def validate_normalisation_windows(window_half, adjacent_sum):
+    """Return validated normalisation window settings."""
+    try:
+        window_half = int(window_half)
+        adjacent_sum = int(adjacent_sum)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Normalisation n and m must be integers.") from exc
+
+    n_min, n_max = NORMALISATION_WINDOW_HALF_RANGE
+    m_min, m_max = NORMALISATION_ADJACENT_RANGE
+    if not n_min <= window_half <= n_max:
+        raise ValueError(
+            f"Normalisation n must be between {n_min} and {n_max}."
+        )
+    if not m_min <= adjacent_sum <= m_max:
+        raise ValueError(
+            f"Normalisation m must be between {m_min} and {m_max}."
+        )
+    return window_half, adjacent_sum
+
+
 class OutlierFilteringWorker(QThread):
     progress_updated = pyqtSignal(int)
     finished = pyqtSignal()
@@ -24,6 +49,8 @@ class OutlierFilteringWorker(QThread):
         self.output_folder = output_folder
         self.base_name = base_name
         self._is_running = True
+        self.succeeded = False
+        self.failed_frames = []
         self.report_path = os.path.join(output_folder, f"{base_name}_outlier_report.csv")
 
     # ────────────────────────────────────────────────────────────────────────────
@@ -55,14 +82,21 @@ class OutlierFilteringWorker(QThread):
                         self._update_progress(processed, total_images)
 
                     except Exception as exc:
+                        self.failed_frames.append(str(suffix))
                         self.message.emit(f"[ERROR] Frame {suffix}: {exc}")
 
+            self.succeeded = (
+                self._is_running
+                and not self.failed_frames
+                and processed == total_images
+            )
             self.message.emit(
                 f"[SUCCESS] Processed {processed} frame(s) • "
                 f"Total cleaned pixels: {total_cleaned} • "
                 f"Report: {os.path.basename(self.report_path)}"
             )
         except Exception as exc:
+            self.succeeded = False
             self.message.emit(f"[FATAL] {exc}")
         finally:
             self.finished.emit()
@@ -85,25 +119,20 @@ class OutlierFilteringWorker(QThread):
         invalid_mask = (img <= 0) | np.isnan(img) | np.isinf(img)
         bad_pixels   = np.argwhere(invalid_mask)
 
-        if bad_pixels.size == 0:
-            self.message.emit(f"Frame {suffix}: no outliers detected")
-            return 0
-
         records = []
         cleaned = 0
 
+        # Replace invalid pixels first. Search the confirmed 5x5 neighborhood,
+        # then expand to 7x7 only when no positive finite neighbor exists.
         for y, x in bad_pixels:
             original = img[y, x]
+            replacement = self._positive_neighbor_mean(img, y, x, radius=2)
+            if replacement is None:
+                replacement = self._positive_neighbor_mean(
+                    img, y, x, radius=3
+                )
 
-            y0, y1 = max(0, y - 2), min(img.shape[0], y + 3)
-            x0, x1 = max(0, x - 2), min(img.shape[1], x + 3)
-
-            nbhood      = img[y0:y1, x0:x1]
-            valid_mask  = (nbhood > 0) & np.isfinite(nbhood)
-            valid_values = nbhood[valid_mask]
-
-            if valid_values.size:          # We have something to average
-                replacement = float(np.mean(valid_values))
+            if replacement is not None:
                 img[y, x]   = replacement
             else:
                 replacement = np.nan       # Do not inject a hard zero
@@ -113,6 +142,28 @@ class OutlierFilteringWorker(QThread):
                 f"{suffix},{x},{y},{original:.4f},{replacement:.4f}"
             )
             cleaned += 1
+
+        # Detect positive spikes after invalid-value repair. The scan is
+        # sequential, matching the existing replacement behavior.
+        height, width = img.shape
+        for y in range(height):
+            for x in range(width):
+                original = float(img[y, x])
+                if not np.isfinite(original) or original <= 0:
+                    continue
+                neighbor_mean = self._positive_neighbor_mean(
+                    img, y, x, radius=2
+                )
+                if neighbor_mean is None or original < 10.0 * neighbor_mean:
+                    continue
+                img[y, x] = neighbor_mean
+                records.append(
+                    f"{suffix},{x},{y},{original:.4f},{neighbor_mean:.4f}"
+                )
+                cleaned += 1
+
+        if cleaned == 0:
+            self.message.emit(f"Frame {suffix}: no outliers detected")
 
         # Append to CSV
         try:
@@ -129,6 +180,25 @@ class OutlierFilteringWorker(QThread):
             raise RuntimeError(f"Cannot write FITS {out_fits}: {exc}") from exc
 
         return cleaned
+
+    @staticmethod
+    def _positive_neighbor_mean(
+        img: np.ndarray,
+        y: int,
+        x: int,
+        *,
+        radius: int,
+    ):
+        """Return the positive finite neighbor mean, excluding the center."""
+        y0, y1 = max(0, y - radius), min(img.shape[0], y + radius + 1)
+        x0, x1 = max(0, x - radius), min(img.shape[1], x + radius + 1)
+        neighborhood = img[y0:y1, x0:x1]
+        valid = (neighborhood > 0) & np.isfinite(neighborhood)
+        valid[y - y0, x - x0] = False
+        values = neighborhood[valid]
+        if values.size == 0:
+            return None
+        return float(np.mean(values))
 
     def _update_progress(self, processed: int, total: int) -> None:
         progress = int((processed / total) * 100) if total else 0
@@ -169,6 +239,8 @@ class SummationWorker(QThread):
         self.base_name            = base_name
         self.output_folder        = output_folder
         self._is_running          = True     # Cooperative‑cancel flag
+        self.succeeded            = False
+        self._validated_shutter_lists = None
 
     # ───────────────────────────────────────────────────────────────
     # Public API
@@ -182,13 +254,16 @@ class SummationWorker(QThread):
     # ───────────────────────────────────────────────────────────────
     def run(self):
         try:
+            self._validated_shutter_lists = self._validate_inputs()
             self._prepare_output()
             self._sum_images()
             if self._is_running:
                 self._sum_and_save_shuttercounts()
             if self._is_running:
                 self._copy_spectra_files()
+            self.succeeded = self._is_running
         except Exception as exc:
+            self.succeeded = False
             self.message.emit(f"[FATAL] Summation aborted: {exc}")
         finally:
             gc.collect()
@@ -205,6 +280,89 @@ class SummationWorker(QThread):
 
         parts = os.path.normpath(self.output_folder).split(os.sep)
         self._short_path = os.path.join(*parts[-2:]) if len(parts) >= 2 else self.output_folder
+
+    def _validate_inputs(self):
+        """Validate every image and shutter table before writing output."""
+        if not self.summation_image_runs:
+            raise ValueError("No summation runs were supplied.")
+
+        first_images = self.summation_image_runs[0].get("images", {})
+        first_keys = set(first_images)
+        if not first_keys:
+            raise ValueError("The first summation run contains no images.")
+        reference_shapes = {
+            suffix: np.asarray(image).shape
+            for suffix, image in first_images.items()
+        }
+
+        for run_idx, run in enumerate(self.summation_image_runs, start=1):
+            load_errors = run.get("load_errors") or []
+            if load_errors:
+                raise ValueError(
+                    f"Run {run_idx} contains load errors: {load_errors[0]}"
+                )
+            images = run.get("images", {})
+            keys = set(images)
+            if keys != first_keys:
+                raise ValueError(
+                    f"Run {run_idx} image suffix mismatch; "
+                    f"missing={sorted(first_keys - keys)[:3]}, "
+                    f"extra={sorted(keys - first_keys)[:3]}."
+                )
+            for suffix, image in images.items():
+                shape = np.asarray(image).shape
+                if len(shape) != 2:
+                    raise ValueError(
+                        f"Run {run_idx} frame {suffix} is not a 2D image."
+                    )
+                if shape != reference_shapes[suffix]:
+                    raise ValueError(
+                        f"Run {run_idx} frame {suffix} has shape {shape}; "
+                        f"expected {reference_shapes[suffix]}."
+                    )
+
+        shutter_lists = []
+        for run_idx, run in enumerate(self.summation_image_runs, start=1):
+            combined = None
+            folders = run.get("run_folders", [run.get("folder_path")])
+            if not folders or any(not folder for folder in folders):
+                raise ValueError(f"Run {run_idx} has no valid source folder.")
+            for folder in folders:
+                sc_file = self._find_file(folder, "_ShutterCount.txt")
+                if not sc_file:
+                    raise ValueError(
+                        f"Run {run_idx} has no ShutterCount file in '{folder}'."
+                    )
+                try:
+                    data = np.loadtxt(sc_file, dtype=np.float32)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Run {run_idx} cannot read '{sc_file}': {exc}"
+                    ) from exc
+                if data.ndim == 1 and data.size == 2:
+                    data = data.reshape(1, 2)
+                if data.ndim != 2 or data.shape[1] != 2:
+                    raise ValueError(
+                        f"Run {run_idx} has malformed ShutterCount data in "
+                        f"'{sc_file}'; exactly two columns are required."
+                    )
+                counts = data[:, 1]
+                if combined is None:
+                    combined = counts.copy()
+                elif len(combined) != len(counts):
+                    raise ValueError(
+                        f"Run {run_idx} has unequal ShutterCount lengths."
+                    )
+                else:
+                    combined += counts
+            shutter_lists.append(combined)
+
+        base_len = len(shutter_lists[0])
+        if any(len(values) != base_len for values in shutter_lists):
+            raise ValueError(
+                "ShutterCount lengths differ between summation runs."
+            )
+        return shutter_lists
 
     # ───────────────────────────────────────────────────────────────
     # Phase 1  –  Image summation
@@ -303,7 +461,9 @@ class SummationWorker(QThread):
                     write_fits_image_file(out_path, summed, overwrite=True)
                     # self.message.emit(f"Saved summed image '{out_name}'.")
                 except Exception as exc:
-                    self.message.emit(f"[ERROR] Could not save '{out_name}': {exc}")
+                    raise RuntimeError(
+                        f"Could not save '{out_name}': {exc}"
+                    ) from exc
 
             self.progress_updated.emit(int((idx / total) * 100))
 
@@ -314,53 +474,11 @@ class SummationWorker(QThread):
         if not self._is_running:
             return
 
-        shutter_lists = []
-        for run_idx, run in enumerate(self.summation_image_runs, start=1):
-            if not self._is_running:
-                break
-
-            combined = None
-            for folder in run.get("run_folders", [run["folder_path"]]):
-                if not self._is_running:
-                    break
-
-                sc_file = self._find_file(folder, "_ShutterCount.txt")
-                if sc_file:
-                    try:
-                        data = np.loadtxt(sc_file, dtype=np.float32)
-                        if data.ndim != 2 or data.shape[1] != 2:
-                            self.message.emit(
-                                f"[WARNING] Run {run_idx}: Bad ShutterCount format in '{sc_file}'."
-                            )
-                            continue
-                        counts = data[:, 1]
-                    except Exception as exc:
-                        self.message.emit(
-                            f"[WARNING] Run {run_idx}: Cannot read '{sc_file}': {exc}"
-                        )
-                        counts = np.zeros(256, np.float32)
-                else:
-                    self.message.emit(
-                        f"Run {run_idx}: No ShutterCount in '{folder}'. Using zeros."
-                    )
-                    counts = np.zeros(256, np.float32)
-
-                combined = counts if combined is None else (
-                    combined + counts if len(combined) == len(counts) else combined
-                )
-
-            shutter_lists.append(combined if combined is not None
-                                 else np.zeros(256, np.float32))
-
+        shutter_lists = self._validated_shutter_lists
         if not shutter_lists:
-            self.message.emit("No ShutterCount data found in any run.")
-            return
+            raise RuntimeError("Validated ShutterCount data are unavailable.")
 
         base_len = len(shutter_lists[0])
-        if any(len(arr) != base_len for arr in shutter_lists):
-            self.message.emit("[WARNING] ShutterCount length mismatch – skipping save.")
-            return
-
         summed   = np.sum(shutter_lists, axis=0)
         out_data = np.column_stack((np.arange(base_len), summed))
         out_name = f"{self.base_name}_summed_ShutterCount.txt"
@@ -372,7 +490,7 @@ class SummationWorker(QThread):
             np.savetxt(out_path, out_data, fmt="%d\t%d")
             self.message.emit(f"Saved summed ShutterCount '{out_name}'.")
         except OSError as exc:
-            self.message.emit(f"[ERROR] Could not write '{out_name}': {exc}")
+            raise RuntimeError(f"Could not write '{out_name}': {exc}") from exc
 
     # ───────────────────────────────────────────────────────────────
     # Phase 3  –  Copy Spectra files
@@ -437,20 +555,22 @@ class OverlapCorrectionWorker(QThread):
             output_folder (str): Folder where corrected images will be saved.
         """
         super().__init__()
-        self.run = run
+        self.run_data = run
         self.base_name = base_name
         self.output_folder = output_folder
         self._is_running = True
+        self.succeeded = False
+        self.failed_frames = []
 
     def run(self):
         """
         Execute the Overlap Correction process.
         """
         try:
-            folder_path = self.run['folder_path']
-            images_dict = self.run['images']
-            spectra_data = self.run['spectra']
-            shutter_count_data = self.run['shutter_count']
+            folder_path = self.run_data['folder_path']
+            images_dict = self.run_data['images']
+            spectra_data = self.run_data['spectra']
+            shutter_count_data = self.run_data['shutter_count']
             
             normalized_path = os.path.normpath(folder_path)
             path_parts = normalized_path.split(os.sep)
@@ -579,6 +699,7 @@ class OverlapCorrectionWorker(QThread):
 
             # 6) Process each image individually
             total_imgs = len(sorted_suffixes)
+            processed_images = 0
             for img_idx, suf in enumerate(sorted_suffixes):
                 if not self._is_running:
                     self.message.emit("Overlap Correction process has been stopped by the user.")
@@ -601,6 +722,7 @@ class OverlapCorrectionWorker(QThread):
 
                     if segment_number is None:
                         self.message.emit(f"Image {img_idx+1}: No matching segment. Skipping.")
+                        self.failed_frames.append(str(suf))
                         continue
 
                     # If it's the first image in that segment, overwrite
@@ -615,6 +737,7 @@ class OverlapCorrectionWorker(QThread):
                         self.message.emit(
                             f"Image {img_idx+1}: Shutter count = 0 for segment {segment_number+1}. Skipping normalisation."
                         )
+                        self.failed_frames.append(str(suf))
                         continue
 
                     # Step 7) Calculate p value
@@ -641,6 +764,7 @@ class OverlapCorrectionWorker(QThread):
                     # Check NaN/Inf
                     if np.isnan(corrected_intensity).any() or np.isinf(corrected_intensity).any():
                         self.message.emit(f"Image {img_idx+1}: NaN or Inf after correction. Skipping.")
+                        self.failed_frames.append(str(suf))
                         continue
 
                     # Construct output path
@@ -651,10 +775,12 @@ class OverlapCorrectionWorker(QThread):
                         output_path = os.path.join(self.output_folder, corrected_filename)
                     except Exception as e:
                         self.message.emit(f"Error constructing filename: {e}. Skipping.")
+                        self.failed_frames.append(str(suf))
                         continue
 
                     # Save corrected image
                     write_fits_image_file(output_path, corrected_intensity, overwrite=True)
+                    processed_images += 1
 
                     # Update progress
                     overall_progress = int(((img_idx + 1) / total_imgs) * 100)
@@ -662,13 +788,22 @@ class OverlapCorrectionWorker(QThread):
 
                 except Exception as e:
                     self.message.emit(f"Error processing image '{suf}': {e}. Skipping.")
+                    self.failed_frames.append(str(suf))
                     continue
 
             # Final messages
-            if self._is_running:
+            self.succeeded = (
+                self._is_running
+                and not self.failed_frames
+                and processed_images == total_imgs
+            )
+            if self.succeeded:
                 self.message.emit("Overlap Correction process completed successfully.")
             else:
-                self.message.emit("Overlap Correction process was stopped before completion.")
+                self.message.emit(
+                    "Overlap Correction failed or stopped before all frames "
+                    "were written."
+                )
 
             # 9) Copy spectra and shuttercount files to output folder
             try:
@@ -702,13 +837,15 @@ class OverlapCorrectionWorker(QThread):
 
         except Exception as e:
             # If a top-level error happened, log and skip gracefully
+            self.succeeded = False
             self.message.emit(f"Error in OverlapCorrectionWorker: {e}")
 
         # Optional: if memory usage is extremely high, you could call gc.collect() once here
         # gc.collect()
 
         # Emit finished signal
-        self.message.emit("Overlap Correction completed successfully.")
+        if not self.succeeded:
+            self.message.emit("Overlap Correction did not complete successfully.")
         self.finished.emit()
 
     def stop(self):
@@ -733,6 +870,9 @@ class NormalisationWorker(QThread):
         adjacent_sum,
     ):
         super().__init__()
+        window_half, adjacent_sum = validate_normalisation_windows(
+            window_half, adjacent_sum
+        )
         self.normalisation_image_runs      = normalisation_image_runs
         self.normalisation_open_beam_runs  = normalisation_open_beam_runs
         self.output_folder                 = output_folder
@@ -740,6 +880,8 @@ class NormalisationWorker(QThread):
         self.window_half                   = window_half
         self.adjacent_sum                  = adjacent_sum
         self._is_running                   = True
+        self.succeeded                     = False
+        self.failed_frames                 = []
 
     @staticmethod
     def _read_shutter_count(folder_path):
@@ -817,6 +959,7 @@ class NormalisationWorker(QThread):
                 common    = sorted(set(data_imgs) & set(ob_imgs))
                 if not common:
                     self.message.emit(f" no matching suffixes—skipping.")
+                    self.failed_frames.append(f"run-{run_idx}:no-matching-suffix")
                     continue
 
                 for i, suffix in enumerate(common):
@@ -844,6 +987,7 @@ class NormalisationWorker(QThread):
                             self.message.emit(
                                 f" {suffix}: shape mismatch—skipping."
                             )
+                            self.failed_frames.append(str(suffix))
                             continue
 
                         h, w = img.shape
@@ -851,6 +995,7 @@ class NormalisationWorker(QThread):
                             self.message.emit(
                                 f" {suffix}: too small for window—skipping."
                             )
+                            self.failed_frames.append(str(suffix))
                             continue
 
                         # integral images
@@ -883,6 +1028,7 @@ class NormalisationWorker(QThread):
                         self.progress_updated.emit(int(100*processed_images/total_images))
 
                     except Exception as e:
+                        self.failed_frames.append(str(suffix))
                         self.message.emit(
                             f" {suffix}: error ({e})—skipping."
                         )
@@ -912,9 +1058,19 @@ class NormalisationWorker(QThread):
                 if self._is_running:
                     QThread.sleep(5)
 
-            self.message.emit(f"All done—{processed_images} images → {short_path}")
+            self.succeeded = (
+                self._is_running
+                and not self.failed_frames
+                and processed_images == total_images
+            )
+            status = "completed" if self.succeeded else "failed or incomplete"
+            self.message.emit(
+                f"Normalisation {status}: {processed_images} of "
+                f"{total_images} images written to {short_path}."
+            )
 
         except Exception as e:
+            self.succeeded = False
             self.message.emit(f"Fatal error in normalisation: {e}")
 
         finally:
@@ -986,6 +1142,9 @@ class FullProcessWorker(QThread):
     def __init__(self, sample_folder: str, open_beam_folder: str, output_folder: str,
                  base_name: str, window_half: int, adjacent_sum: int):
         super().__init__()
+        window_half, adjacent_sum = validate_normalisation_windows(
+            window_half, adjacent_sum
+        )
         self.sample_folder = sample_folder
         self.open_beam_folder = open_beam_folder
         self.output_folder = output_folder
@@ -993,6 +1152,8 @@ class FullProcessWorker(QThread):
         self.window_half = window_half
         self.adjacent_sum = adjacent_sum
         self._is_running = True  # Flag to track whether the user requested a stop
+        self.succeeded = False
+        self._active_child = None
         
     def get_short_path(self, full_path, levels=2):
         """
@@ -1052,9 +1213,11 @@ class FullProcessWorker(QThread):
             if not self._continue("normalisation"): return
             self.progress_updated.emit(0)
 
+            self.succeeded = True
             self.message.emit("=== <b>Full Process Completed Successfully</b> ===")
 
         except Exception as exc:
+            self.succeeded = False
             self.message.emit(f"[ERROR] {exc}")
         finally:
             gc.collect()
@@ -1080,6 +1243,9 @@ class FullProcessWorker(QThread):
         Sets _is_running=False so the while loops in each step can stop the worker.
         """
         self._is_running = False
+        child = self._active_child
+        if child is not None and hasattr(child, "stop"):
+            child.stop()
         self.message.emit("FullProcessWorker: Stop signal received.")
 
     # ---------------------------------------------------------------
@@ -1116,8 +1282,10 @@ class FullProcessWorker(QThread):
                 runs.append(r)
     
         if not runs:
-            self.message.emit(f"0_sumation_{label}: No valid FITS/TIFF images in subfolders of '\\{short_path}'. Summation skipped.")
-            return folder
+            raise RuntimeError(
+                f"0_summation_{label}: no valid FITS/TIFF images were found "
+                f"in subfolders of '\\{short_path}'."
+            )
     
         # Create a modified base name for image naming (e.g., "summed_sample_data")
         modified_base_name = f"summed_{original_folder_name}"
@@ -1130,8 +1298,12 @@ class FullProcessWorker(QThread):
         # block until child finishes, no busy‑wait
         loop = QEventLoop(); 
         worker.finished.connect(loop.quit); 
-        worker.start(); 
-        loop.exec_()     
+        self._active_child = worker
+        worker.start()
+        loop.exec_()
+        self._active_child = None
+        if not worker.succeeded:
+            raise RuntimeError(f"0_summation_{label} failed.")
     
         # Free memory from runs
         del runs
@@ -1160,8 +1332,13 @@ class FullProcessWorker(QThread):
         self.message.emit(f"1_clean_{label}: Starting Outlier Removal on \\{short_path}...")
         run = self.load_run_dict(folder)
         if not run.get("images"):
-            self.message.emit(f"1_clean_{label}: No images found in \\{short_path}. Skipping Clean.")
-            return folder
+            raise RuntimeError(
+                f"1_clean_{label}: no images found in \\{short_path}."
+            )
+        if run.get("load_errors"):
+            raise RuntimeError(
+                f"1_clean_{label}: one or more input frames could not be loaded."
+            )
     
         original_folder_name = os.path.basename(folder.rstrip(os.sep))
         # Output folder: e.g., "1_cleaned_sample_data" or "1_cleaned_openbeam_data"
@@ -1178,8 +1355,12 @@ class FullProcessWorker(QThread):
         # block until child finishes, no busy‑wait
         loop = QEventLoop(); 
         worker.finished.connect(loop.quit); 
-        worker.start(); 
+        self._active_child = worker
+        worker.start()
         loop.exec_()
+        self._active_child = None
+        if not getattr(worker, "succeeded", True):
+            raise RuntimeError(f"1_clean_{label} failed or skipped frames.")
     
         del run
         import gc
@@ -1207,14 +1388,20 @@ class FullProcessWorker(QThread):
         self.message.emit(f"2_correction_{label}: Starting Overlap Correction on \\{short_path}...")
         run = self.load_run_dict(folder)
         if not run.get("images"):
-            self.message.emit(f"2_correction_{label}: No images found in \\{short_path}. Skipping Overlap Correction.")
-            return folder
+            raise RuntimeError(
+                f"2_correction_{label}: no images found in \\{short_path}."
+            )
+        if run.get("load_errors"):
+            raise RuntimeError(
+                f"2_correction_{label}: one or more input frames could not be loaded."
+            )
     
         try:
             all_files = os.listdir(folder)
         except Exception as e:
-            self.message.emit(f"Error accessing \\{short_path}: {e}")
-            return folder
+            raise RuntimeError(
+                f"2_correction_{label}: cannot access \\{short_path}: {e}"
+            ) from e
     
         # Load additional data (Spectra and ShutterCount)
         spectra_file = next((os.path.join(folder, f) for f in all_files if f.endswith("_Spectra.txt")), None)
@@ -1243,8 +1430,10 @@ class FullProcessWorker(QThread):
             run["shutter_count"] = None
     
         if run["spectra"] is None or run["shutter_count"] is None:
-            self.message.emit(f"2_correction_{label}: Spectra or ShutterCount missing => Skipping Overlap Correction.")
-            return folder
+            raise RuntimeError(
+                f"2_correction_{label}: Spectra or ShutterCount is missing; "
+                "Full Process requires overlap correction."
+            )
     
         original_folder_name = os.path.basename(folder.rstrip(os.sep))
         # Output folder: e.g., "2_corrected_sample_data"
@@ -1261,8 +1450,12 @@ class FullProcessWorker(QThread):
         # block until child finishes, no busy‑wait
         loop = QEventLoop(); 
         worker.finished.connect(loop.quit); 
-        worker.start(); 
+        self._active_child = worker
+        worker.start()
         loop.exec_()
+        self._active_child = None
+        if not worker.succeeded:
+            raise RuntimeError(f"2_correction_{label} failed.")
     
         del run
         import gc
@@ -1293,8 +1486,14 @@ class FullProcessWorker(QThread):
         sample_run = self.load_run_dict(sample_folder)
         openbeam_run = self.load_run_dict(openbeam_folder)
         if (not sample_run.get("images")) or (not openbeam_run.get("images")):
-            self.message.emit("Normalisation skipped because sample or openbeam has no images.")
-            return
+            raise RuntimeError(
+                "Normalisation cannot start because sample or open beam has no images."
+            )
+        if sample_run.get("load_errors") or openbeam_run.get("load_errors"):
+            raise RuntimeError(
+                "Normalisation cannot start because one or more input frames "
+                "could not be loaded."
+            )
     
         # Set output folder to a fixed name for the merged result
         normalised_output = os.path.join(self.output_folder, "3_normalised_original")
@@ -1317,8 +1516,12 @@ class FullProcessWorker(QThread):
         # block until child finishes, no busy‑wait
         loop = QEventLoop(); 
         worker.finished.connect(loop.quit); 
-        worker.start(); 
+        self._active_child = worker
+        worker.start()
         loop.exec_()
+        self._active_child = None
+        if not worker.succeeded:
+            raise RuntimeError("3_normalisation failed or skipped one or more frames.")
     
         del sample_run, openbeam_run
         import gc
@@ -1332,12 +1535,15 @@ class FullProcessWorker(QThread):
   
     def load_run_dict(self, folder: str) -> dict:
         """
-        Scans the folder for FITS/TIFF files with a 5-digit suffix and returns a dictionary:
+        Scan a folder for FITS/TIFF files and use the final underscore-delimited
+        stem component as the frame suffix. The suffix need not contain five
+        digits.
+
+        Returns a dictionary:
             { 'folder_path': folder, 'images': {suffix: data} }.
         Also emits loading progress via load_progress_updated.
         """
-        # import re
-        run = {"folder_path": folder, "images": {}}
+        run = {"folder_path": folder, "images": {}, "load_errors": []}
         if not os.path.isdir(folder):
             self.message.emit(f"Folder not found: {folder}")
             return run
@@ -1349,32 +1555,46 @@ class FullProcessWorker(QThread):
                 f for f in os.listdir(folder)
                 if f.lower().endswith((".fits", ".fit", ".tiff", ".tif"))
             ]
-            # Filter only files with the proper 5-digit suffix format:
-            pattern = re.compile(r'^.+_(\d{5})\.(fits|fit|tiff|tif)$', re.IGNORECASE)
             total_files = len(image_files)
             processed_files = 0
 
             for f in image_files:
                 processed_files += 1
-                match = pattern.match(f)
-                if not match:
-                    # self.message.emit(f"Skipping file '{f}' because it does not have a 5-digit suffix.")
-                    # Emit progress update even if skipped
-                    self.load_progress_updated.emit(int((processed_files / total_files) * 100))
+                stem = os.path.splitext(f)[0]
+                suffix = stem.rsplit("_", 1)[-1].strip()
+                if not suffix:
+                    error = f"File '{f}' has an empty frame suffix."
+                    run["load_errors"].append(error)
+                    self.message.emit(error)
+                    self.load_progress_updated.emit(
+                        int((processed_files / total_files) * 100)
+                    )
                     continue
-
-                # Use the captured 5-digit group as the suffix
-                suffix = match.group(1)
+                if suffix in run["images"]:
+                    error = (
+                        f"File '{f}' duplicates frame suffix '{suffix}'. "
+                        "Frame names must be unique."
+                    )
+                    run["load_errors"].append(error)
+                    self.message.emit(error)
+                    self.load_progress_updated.emit(
+                        int((processed_files / total_files) * 100)
+                    )
+                    continue
                 try:
                     path = os.path.join(folder, f)
                     data = load_image_file(path)
                     run["images"][suffix] = data.astype(np.float32)
                 except Exception as e:
-                    self.message.emit(f"Error loading file {f} in \\{short_path}: {e}")
+                    error = f"Error loading file {f} in \\{short_path}: {e}"
+                    run["load_errors"].append(error)
+                    self.message.emit(error)
                 # Update loading progress after processing each file
                 self.load_progress_updated.emit(int((processed_files / total_files) * 100))
         except Exception as e:
-            self.message.emit(f"Error reading folder \\{short_path}: {e}")
+            error = f"Error reading folder \\{short_path}: {e}"
+            run["load_errors"].append(error)
+            self.message.emit(error)
         return run
 
 class FilteringWorker(QThread):
@@ -1389,6 +1609,8 @@ class FilteringWorker(QThread):
         self.output_folder = output_folder
         self.base_name = base_name
         self._is_running = True
+        self.succeeded = False
+        self.failed_frames = []
 
     def run(self):
         """
@@ -1406,11 +1628,16 @@ class FilteringWorker(QThread):
                 self.finished.emit()
                 return
 
-            # 2) Convert the mask to float32 or bool (if not already), only once
-            if self.filtering_mask.dtype != np.float32 and self.filtering_mask.dtype != bool:
-                # If it's an integer or float32, consider converting
-                # Example: let's keep it float32 for consistency:
-                self.filtering_mask = self.filtering_mask.astype(np.float32)
+            # A filtering mask is explicitly binary: 1 keeps and 0 discards.
+            mask_values = np.asarray(self.filtering_mask)
+            if not np.isfinite(mask_values).all():
+                raise ValueError("Filtering mask contains NaN or infinite values.")
+            unique_values = np.unique(mask_values)
+            if not np.isin(unique_values, (0, 1)).all():
+                raise ValueError(
+                    "Filtering mask must be binary and contain only 0 and 1."
+                )
+            self.filtering_mask = mask_values.astype(np.float32, copy=False)
 
             mask_shape = self.filtering_mask.shape
 
@@ -1453,13 +1680,13 @@ class FilteringWorker(QThread):
                                 f"Image {suffix}: Mask shape {mask_shape} "
                                 f"does not match image shape {image_data.shape}. Skipping."
                             )
+                            self.failed_frames.append(str(suffix))
                             continue
 
-                        # Apply the mask
-                        # If your mask is float32, we can do: (mask != 0)
-                        # Or if you kept it as bool, simply: np.where(mask, image_data, 0)
-                        # Example assuming mask != 0 means “keep pixel”:
-                        filtered_image = np.where(self.filtering_mask != 0, image_data, 0)
+                        # Apply the validated binary mask: 1 keeps, 0 discards.
+                        filtered_image = np.where(
+                            self.filtering_mask == 1, image_data, 0
+                        )
 
                         # Save the filtered image
                         filtered_filename = f"{self.base_name}_{suffix}.fits"
@@ -1467,6 +1694,7 @@ class FilteringWorker(QThread):
                         try:
                             write_fits_image_file(filtered_path, filtered_image, overwrite=True)
                         except Exception as e:
+                            self.failed_frames.append(str(suffix))
                             self.message.emit(f"Image {suffix}: Failed to save '{filtered_filename}': {e}. Skipping.")
                             continue
 
@@ -1476,6 +1704,7 @@ class FilteringWorker(QThread):
                         self.progress_updated.emit(overall_progress)
 
                     except Exception as e:
+                        self.failed_frames.append(str(suffix))
                         self.message.emit(f"Error filtering image {suffix}: {e}")
                         continue
 
@@ -1485,11 +1714,19 @@ class FilteringWorker(QThread):
                 
             self.output_folder_short = self.get_short_path(self.output_folder, levels=2)
 
+            self.succeeded = (
+                self._is_running
+                and not self.failed_frames
+                and processed_images == total_images
+            )
+            status = "completed" if self.succeeded else "failed or incomplete"
             self.message.emit(
-                f"Filtering completed. {processed_images} images filtered and saved to {self.output_folder_short}."
+                f"Filtering {status}. {processed_images} of {total_images} "
+                f"images saved to {self.output_folder_short}."
             )
 
         except Exception as e:
+            self.succeeded = False
             self.message.emit(f"Error during filtering: {e}")
 
         finally:
@@ -1503,6 +1740,15 @@ class FilteringWorker(QThread):
         """
         self._is_running = False
         self.message.emit("Stop signal received. Terminating Filtering process.")
+
+    @staticmethod
+    def get_short_path(full_path, levels=2):
+        """Return the final path components for concise progress messages."""
+        normalized_path = os.path.normpath(full_path)
+        path_parts = normalized_path.split(os.sep)
+        if len(path_parts) >= levels:
+            return os.path.join(*path_parts[-levels:])
+        return normalized_path
 
     def copy_related_files(self, run_idx, data_run):
         """
@@ -1564,13 +1810,17 @@ class RadenNormalisationWorker(QThread):
         adjacent_sum,
     ):
         super().__init__()
+        window_half, adjacent_sum = validate_normalisation_windows(
+            window_half, adjacent_sum
+        )
         self.sample_run = sample_run
         self.open_beam_run = open_beam_run
         self.output_folder = output_folder
         self.base_name = base_name
-        self.window_half = int(window_half)
-        self.adjacent_sum = int(adjacent_sum)
+        self.window_half = window_half
+        self.adjacent_sum = adjacent_sum
         self._is_running = True
+        self.succeeded = False
 
     @staticmethod
     def _pulse_count(info):
@@ -1687,6 +1937,7 @@ class RadenNormalisationWorker(QThread):
             output_tiff = os.path.join(self.output_folder, output_stem + ".tiff")
 
             total = int(sample_info["n_frames"])
+            processed_frames = 0
             self.message.emit(
                 f"<b>--- Starting RADEN stack normalisation ---</b> "
                 f"{total} frames, output='{os.path.basename(output_tiff)}'"
@@ -1712,6 +1963,7 @@ class RadenNormalisationWorker(QThread):
 
                         normalised = self._normalise_frame(sample_frame, open_beam_sum, end - start + 1, scale)
                         Image.fromarray(normalised).save(writer, format="TIFF")
+                        processed_frames += 1
                         if index != total - 1:
                             writer.newFrame()
 
@@ -1721,9 +1973,17 @@ class RadenNormalisationWorker(QThread):
 
             if self._is_running:
                 self._copy_sidecars(sample_info, output_tiff)
+            self.succeeded = self._is_running and processed_frames == total
+            if self.succeeded:
                 self.message.emit(f"RADEN stack normalisation complete: {output_tiff}")
+            else:
+                self.message.emit(
+                    f"RADEN normalisation incomplete: {processed_frames} of "
+                    f"{total} frames written."
+                )
 
         except Exception as exc:
+            self.succeeded = False
             self.message.emit(f"Fatal error in RADEN normalisation: {exc}")
         finally:
             gc.collect()
@@ -1742,4 +2002,5 @@ __all__ = [
     "RadenNormalisationWorker",
     "FullProcessWorker",
     "FilteringWorker",
+    "validate_normalisation_windows",
 ]

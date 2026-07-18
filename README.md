@@ -31,8 +31,8 @@ All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil,
 ## 🚀 Run the GUI
 
 ### Standalone executable
-You can download the Windows standalone executable from the [NEAT v4.7.4 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.7.4/NEATv4.7.4.zip).
-No installation is needed, just run the executable by doule clicking.
+You can download the Windows standalone executable from the [NEAT v4.8.0 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.8.0/NEATv4.8.0.zip).
+No installation is needed; extract the ZIP and double-click `NEAT.exe`.
 
 ### 🚀 Example data
 An example dataset is available for Bragg edge fitting tutorial, click to download [Example_dataset](https://github.com/RayZhang2024/NEAT/releases/download/v4.6/5_Ubend_normalised.zip). The dataset has been pre-processed and is ready for Bragg edge fitting, go and have a try!
@@ -60,10 +60,11 @@ python -m venv .venv
 source .venv/bin/activate
 
 python -m pip install --upgrade pip
-python -m pip install .
+python -m pip install ".[assistant]"
 ```
 
-This installs NEAT and all dependencies declared in `pyproject.toml`.
+This installs NEAT together with the optional AI-assistant dependencies. Use
+`python -m pip install .` only when the assistant is not required.
 
 
 ---
@@ -83,13 +84,32 @@ python -m NEAT.app
 ```
 
 ✅ The main window titled
-**“NEAT Neutron Bragg Edge Analysis Toolkit v4.7.4”**
+**“NEAT Neutron Bragg Edge Analysis Toolkit v4.8.0”**
 will appear, with tabs for:
 
 * **Data Preprocessing**
 * **Bragg Edge Fitting**
 * **Data Post-Processing**
-* **About**
+
+### AI Assistant
+
+NEAT 4.8 adds a dockable, retrieval-grounded assistant for questions about the
+software, its controls and documented technical behaviour. Open **AI Assistant
+> AI Assistant** to show or hide the panel and **AI Assistant > AI Assistant
+Settings...** to select access and model settings.
+
+The assistant supports personal API keys for OpenAI, Anthropic, Google Gemini,
+DeepSeek and Kimi/Moonshot; manually configured OpenAI-compatible endpoints;
+and local models through Ollama or LM Studio. API keys are stored in the
+operating-system credential manager and are not saved in the repository or
+ordinary NEAT settings. Shared NEAT access is available only when explicitly
+configured for an installation.
+
+Questions, approved NEAT documentation excerpts, recent chat turns and a small
+allow-listed set of screen settings may be sent to the selected model. Raw
+images and automatically collected file paths are not sent. When the semantic
+search runtime is unavailable, NEAT falls back to its bundled lexical search so
+the approved knowledge base remains usable.
 
 ---
 

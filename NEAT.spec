@@ -7,7 +7,7 @@ Build:
     pyinstaller --noconfirm --clean NEAT.spec
 """
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 from pathlib import Path
 import sys
 
@@ -19,12 +19,32 @@ binaries = []
 hiddenimports = []
 project_root = Path.cwd()
 
-# Pull in scientific/GUI stack resources and dynamic imports used at runtime.
-for package_name in ("PyQt5", "matplotlib", "numpy", "scipy", "pandas", "astropy", "PIL", "h5py", "openpyxl"):
-    pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package_name)
-    datas += pkg_datas
-    binaries += pkg_binaries
-    hiddenimports += pkg_hiddenimports
+# PyInstaller's standard hooks discover the imported scientific and assistant
+# packages, including their native libraries. Avoid recursive bulk collection,
+# which includes dependency test suites and makes the release needlessly large.
+# Chroma does require its non-Python migration files at runtime.
+datas += collect_data_files(
+    "chromadb",
+    includes=["migrations/**"],
+)
+
+hiddenimports += collect_submodules("google.genai")
+hiddenimports += collect_submodules("keyring.backends")
+hiddenimports += collect_submodules("tools")
+
+for distribution_name in (
+    "anthropic",
+    "chromadb",
+    "keyring",
+    "langchain-anthropic",
+    "langchain-chroma",
+    "langchain-core",
+    "langchain-google-genai",
+    "langchain-openai",
+    "onnxruntime",
+    "openai",
+):
+    datas += copy_metadata(distribution_name)
 
 # Ensure core CPython extension dependencies are available across Python layouts.
 # - python.org layout: <base>/DLLs/*.dll
@@ -75,6 +95,12 @@ for _, candidates in required_runtime_dlls.items():
 launch_splash = project_root / "NEAT" / "assets" / "launch_splash.png"
 if launch_splash.exists():
     datas.append((str(launch_splash), "NEAT/assets"))
+
+# Approved retrieval sources are runtime data, not developer-only documentation.
+assistant_knowledge = project_root / "docs" / "assistant"
+if not assistant_knowledge.exists():
+    raise FileNotFoundError(f"Missing assistant knowledge: {assistant_knowledge}")
+datas.append((str(assistant_knowledge), "docs/assistant"))
 
 # Use project icon for the standalone executable.
 app_icon = project_root / "docs" / "icon" / "NEAT.ico"

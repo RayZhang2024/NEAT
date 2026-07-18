@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "NEAT"
-version = "4.7.4"
+version = "4.8.0"
 description = "Bragg edge imaging data analysis."
 authors = [
     { name = "Ruiyao Zhang", email = "ruiyao.zhang@stfc.ac.uk" }
@@ -24,5 +24,23 @@ dependencies = [
     "Pillow>=10"
 ]
 
+[project.optional-dependencies]
+assistant = [
+    "keyring>=25,<26",
+    "langchain-anthropic>=1,<2",
+    "langchain-chroma>=1.1,<2",
+    "langchain-google-genai>=4,<5",
+    "langchain-openai>=1.1,<2"
+]
+assistant-server = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1"
+]
+
 [project.scripts]
 neat = "NEAT.app:main"
+neat-assistant-server = "tools.assistant_shared_server:main"
+neat-assistant-laptop-setup = "tools.configure_assistant_laptop:main"
+
+[tool.setuptools.packages.find]
+include = ["NEAT*", "tools*"]

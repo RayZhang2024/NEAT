@@ -570,9 +570,9 @@ class FittingMixin:
             "Region 2 upper wavelength bound. Region 2 is the post-edge baseline used in edge fitting.",
             "Region 3 lower wavelength bound. Region 3 is the full edge window used for the fit.",
             "Region 3 upper wavelength bound. Region 3 is the full edge window used for the fit.",
-            "Initial/fixed value for s, the edge broadening parameter. Header checkbox checked = fixed, unchecked = fitted.",
-            "Initial/fixed value for t, the moderator decay parameter. Header checkbox checked = fixed, unchecked = fitted.",
-            "Initial/fixed value for eta, the pseudo-Voigt mixing parameter. Header checkbox checked = fixed, unchecked = fitted; eta=0 is Gaussian-like and eta=1 is Lorentzian-like."
+            "Initial/fixed value for s, edge broadening associated with the sample microstructure. Header checkbox checked = fixed, unchecked = fitted.",
+            "Initial/fixed value for t, edge broadening associated with the instrument. Header checkbox checked = fixed, unchecked = fitted.",
+            "Initial/fixed value for eta, the instrument neutron-pulse edge-shape parameter. Header checkbox checked = fixed, unchecked = fitted; eta=0 is Gaussian-like and eta=1 is Lorentzian-like."
         ]
 
         # 2) Attach each tooltip
@@ -1946,7 +1946,7 @@ class FittingMixin:
             idx += len(bragg_edges)
         else:
             fitted_s_vals        = s_initial
-            s_uncertainties_list = [0.0] * len(bragg_edges)
+            s_uncertainties_list = [np.nan] * len(bragg_edges)
 
         # --- t ---
         if not fix_t:
@@ -1955,7 +1955,7 @@ class FittingMixin:
             idx += len(bragg_edges)
         else:
             fitted_t_vals        = t_initial
-            t_uncertainties_list = [0.0] * len(bragg_edges)
+            t_uncertainties_list = [np.nan] * len(bragg_edges)
 
         # --- eta ---
         if not fix_eta:
@@ -1963,7 +1963,7 @@ class FittingMixin:
             eta_uncertainties_list = param_stderr[idx : idx + len(bragg_edges)]
         else:
             fitted_eta_vals        = eta_initial
-            eta_uncertainties_list = [0.0] * len(bragg_edges)
+            eta_uncertainties_list = [np.nan] * len(bragg_edges)
 
 
 
@@ -5533,7 +5533,7 @@ class FittingMixin:
 
         # Start each run from clean result canvases so previous fits do not accumulate.
         self._sync_all_derived_region3_bounds()
-        max_rows = min(5, self.bragg_table.rowCount())
+        max_rows = self.bragg_table.rowCount()
         region_ranges = {
             "Region 1": _range_from_rows(2, 3, max_rows),  # plotted on canvas_b
             "Region 2": _range_from_rows(4, 5, max_rows),  # plotted on canvas_c

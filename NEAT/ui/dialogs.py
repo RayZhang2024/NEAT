@@ -1352,6 +1352,13 @@ class ParameterPlotDialog(QDialog):
         # Add a button to calculate strain
         self.calculate_strain_button = QPushButton("Calculate Strain")
         self.calculate_strain_button.clicked.connect(self.calculate_strain)
+        self.calculate_strain_button.setEnabled(
+            self.is_d_spacing_parameter(parameter_name)
+        )
+        if not self.calculate_strain_button.isEnabled():
+            self.calculate_strain_button.setToolTip(
+                "Strain can only be calculated from a d-spacing map (d_*)."
+            )
         control_layout_top.addWidget(self.calculate_strain_button)
 
         # Add input fields for x_min, x_max, y_min, y_max
@@ -1532,6 +1539,15 @@ class ParameterPlotDialog(QDialog):
                     raise ValueError(
                         f"Mask shape {mask_data.shape} does not match parameter map shape {self.Z.shape}."
                     )
+
+                if not self.is_binary_mask(mask_data):
+                    QMessageBox.warning(
+                        self,
+                        "Non-binary Mask",
+                        "The selected mask contains values other than 0 and 1. "
+                        "Those values will scale the parameter map. Use a binary "
+                        "mask when the intention is only to keep or exclude pixels.",
+                    )
     
                 # Perform element-wise multiplication
                 filtered_result = self.Z * mask_data
@@ -1616,10 +1632,9 @@ class ParameterPlotDialog(QDialog):
             return
     
         try:
-            # ------------------------------------------------------------------
-            # 2. Prepare data (resize -> float32)
-            # ------------------------------------------------------------------
-            resized_Z = self.resize_parameter_map(self.Z, (512, 512)).astype(np.float32)
+            # Preserve the imported result grid exactly; exporting must not
+            # resample scientific results to an arbitrary image size.
+            export_data = self.prepare_parameter_map_for_export(self.Z)
     
             # ------------------------------------------------------------------
             # 3. Build FITS header
@@ -1632,7 +1647,7 @@ class ParameterPlotDialog(QDialog):
             # ------------------------------------------------------------------
             # 4. Write file
             # ------------------------------------------------------------------
-            write_fits_image_file(file_path, resized_Z, header=header, overwrite=True)
+            write_fits_image_file(file_path, export_data, header=header, overwrite=True)
     
             QMessageBox.information(
                 self, "Success",
@@ -1649,6 +1664,30 @@ class ParameterPlotDialog(QDialog):
         # Use scipy's zoom function to resize the array
         resized_Z = zoom(Z, zoom_factors, order=1)  # order=1 for bilinear interpolation
         return resized_Z
+
+    @staticmethod
+    def prepare_parameter_map_for_export(Z):
+        """Return a float32 copy without changing the parameter-map grid."""
+        data = np.asarray(Z)
+        if data.ndim != 2:
+            raise ValueError("Parameter-map export requires a 2D array.")
+        return data.astype(np.float32, copy=True)
+
+    @staticmethod
+    def is_binary_mask(mask):
+        """Return True only when all finite mask values are exactly 0 or 1."""
+        values = np.asarray(mask)
+        if values.size == 0 or not np.all(np.isfinite(values)):
+            return False
+        return bool(np.all((values == 0) | (values == 1)))
+
+    @staticmethod
+    def is_d_spacing_parameter(parameter_name):
+        """Return whether a displayed metric represents a fitted d-spacing."""
+        name = str(parameter_name).strip()
+        while name.lower().startswith("filtered "):
+            name = name[len("filtered "):].strip()
+        return name.startswith("d_") and not name.startswith("d_unc_")
  
        
     def plot_parameter(self):
@@ -1900,6 +1939,15 @@ class ParameterPlotDialog(QDialog):
             self.update_coordinates(event)
 
     def calculate_strain(self):
+        if not self.is_d_spacing_parameter(self.parameter_name):
+            QMessageBox.warning(
+                self,
+                "Invalid Strain Source",
+                "Strain can only be calculated from a fitted d-spacing column "
+                "whose name starts with 'd_'.",
+            )
+            return
+
         # Get d0 value from input
         try:
             d0 = float(self.d0_input.text())

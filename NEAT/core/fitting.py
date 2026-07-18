@@ -217,7 +217,7 @@ PHASE_DATA = {
     },
     "Cu_fcc": {
         "structure": "fcc",
-        "lattice_params": {"a": 5.431},
+        "lattice_params": {"a": 3.615},
         "hkl_list": list(_FCC_HKL_DEFAULT),
     },
     "Fe_bcc": {
@@ -246,8 +246,8 @@ PHASE_DATA = {
         "hkl_list": list(_FCC_HKL_DEFAULT),
     },
     "Ti_Beta": {
-        "structure": "tetragonal",
-        "lattice_params": {"a": 3.266, "c": 4.80},
+        "structure": "bcc",
+        "lattice_params": {"a": 3.32},
         "hkl_list": [(1, 1, 0), (2, 0, 0), (2, 1, 1), (2, 2, 0), (3, 1, 0), (2, 2, 2)],
     },
     "Ti_alpha_hex": {
