@@ -21,9 +21,12 @@ The server accepts a structured NEAT question, safe scalar UI context, and
 limited conversation history. It performs approved-document retrieval itself,
 so it is not a general-purpose OpenAI proxy.
 
-The initial implementation uses a limited service access token. This is
-appropriate for a controlled pilot. A public deployment should replace the
-shared token with institutional sign-in or individual short-lived user tokens.
+Official downloads include a limited public-client service token so shared
+access works automatically. This token is extractable and is not a user
+identity or a durable security boundary. The atomic global quota and OpenAI
+project budget remain the cost controls. A future deployment requiring fair
+per-user allowances should use institutional sign-in or individual short-lived
+user tokens.
 
 Remote desktop clients require HTTPS. Plain HTTP is accepted only for
 `localhost` and `127.0.0.1` development.
@@ -66,7 +69,7 @@ GET /health
 Production hosting should terminate HTTPS in front of the service and keep the
 OpenAI key and service token in the hosting platform's secret manager.
 
-## Configure a desktop client
+## Configure a source desktop client
 
 For a local pilot:
 
@@ -77,6 +80,10 @@ python -m NEAT.app
 ```
 
 The AI Settings window will then enable **Use NEAT shared access**.
+
+Official standalone downloads already contain this limited public-client
+configuration and do not require these environment variables. The OpenAI API
+key is never included in either form.
 
 For a remote service, use its HTTPS URL. Never place `OPENAI_API_KEY` on client
 computers.

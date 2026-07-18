@@ -48,7 +48,7 @@ class AssistantSettingsDialogTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_shared_access_displays_global_daily_request_limit(self) -> None:
+    def test_shared_access_displays_limited_daily_allowance(self) -> None:
         dialog = AssistantSettingsDialog(
             settings_repository=_MemorySettingsRepository(),
             credential_store=_MemoryCredentialStore(),
@@ -57,7 +57,10 @@ class AssistantSettingsDialogTests(unittest.TestCase):
         )
         self.assertTrue(dialog.shared_radio.isVisible() or not dialog.isVisible())
         self.assertFalse(dialog.shared_radio.isEnabled())
-        self.assertIn("20 requests per day", dialog.shared_radio.text().lower())
+        self.assertIn(
+            "limited request allowance per day",
+            dialog.shared_radio.text().lower(),
+        )
         dialog.close()
 
     def test_dialog_reserves_space_for_dynamic_provider_fields(self) -> None:

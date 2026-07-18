@@ -153,7 +153,7 @@
       "parameter_reference.md#window-2-2-min-2-max",
       "parameter_reference.md#full-bragg-edge-fitting-interval"
     ],
-    "key_points": ["window 1 is the pre-edge baseline", "window 2 is the post-edge baseline", "full fitting interval runs from 1 Min to 2 Max", "3 Min and 3 Max are not visible in v4.8.0"],
+    "key_points": ["window 1 is the pre-edge baseline", "window 2 is the post-edge baseline", "full fitting interval runs from 1 Min to 2 Max", "3 Min and 3 Max are not visible in v4.8.1"],
     "expected_behavior": "answer"
   },
   {
@@ -233,7 +233,7 @@
     "category": "postprocessing",
     "question": "How does NEAT convert pixels to millimetres in post-processing?",
     "expected_sources": ["faq.md#can-neat-display-coordinates-in-millimetres"],
-    "key_points": ["Display in mm option", "fixed conversion 0.055 mm per pixel", "not editable in the v4.8.0 interface"],
+    "key_points": ["Display in mm option", "fixed conversion 0.055 mm per pixel", "not editable in the v4.8.1 interface"],
     "expected_behavior": "answer"
   },
   {

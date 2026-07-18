@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish, for example v4.8.0"
+        description: "Release tag to publish, for example v4.8.1"
         required: true
         type: string
 
@@ -55,6 +55,13 @@ jobs:
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+
+      - name: Prepare automatic public shared access
+        shell: pwsh
+        env:
+          NEAT_PUBLIC_SHARED_SERVICE_URL: https://ray.taild350ce.ts.net
+          NEAT_PUBLIC_SHARED_ACCESS_TOKEN: ${{ secrets.NEAT_SHARED_PUBLIC_ACCESS_TOKEN }}
+        run: python -m tools.prepare_public_shared_access
 
       - name: Build standalone app
         run: pyinstaller --noconfirm --clean NEAT.spec

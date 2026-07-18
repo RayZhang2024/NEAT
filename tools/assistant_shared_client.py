@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Mapping, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
@@ -20,6 +22,7 @@ from tools.assistant_answering import (
 
 SHARED_SERVICE_URL_ENV = "NEAT_SHARED_SERVICE_URL"
 SHARED_ACCESS_TOKEN_ENV = "NEAT_SHARED_ACCESS_TOKEN"
+PUBLIC_SHARED_CONFIG_FILENAME = "shared_access.json"
 
 
 class MissingSharedServiceConfiguration(RuntimeError):
@@ -45,13 +48,47 @@ def _persisted_windows_user_setting(name: str) -> str:
     return str(value or "").strip()
 
 
-def _shared_setting(name: str) -> str:
-    """Prefer the process environment, then the persisted Windows user value."""
+def _local_shared_setting(name: str) -> str:
+    """Read an explicit process or persisted per-computer override."""
 
     return (
         os.environ.get(name, "").strip()
         or _persisted_windows_user_setting(name)
     )
+
+
+def _bundled_shared_config_path() -> Path:
+    """Return the public-client configuration shipped in an official build."""
+
+    runtime_root = Path(
+        getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1])
+    )
+    return runtime_root / "NEAT" / "config" / PUBLIC_SHARED_CONFIG_FILENAME
+
+
+def _bundled_shared_settings() -> tuple[str, str]:
+    """Read the packaged public endpoint credential without logging it."""
+
+    path = _bundled_shared_config_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return "", ""
+    if not isinstance(payload, Mapping):
+        return "", ""
+    service_url = str(payload.get("service_url", "") or "").strip()
+    access_token = str(payload.get("access_token", "") or "").strip()
+    return service_url, access_token
+
+
+def _resolved_shared_settings() -> tuple[str, str]:
+    """Prefer a complete local override, otherwise use packaged public access."""
+
+    service_url = _local_shared_setting(SHARED_SERVICE_URL_ENV)
+    access_token = _local_shared_setting(SHARED_ACCESS_TOKEN_ENV)
+    if service_url and access_token:
+        return service_url, access_token
+    return _bundled_shared_settings()
 
 
 @dataclass(frozen=True)
@@ -79,15 +116,12 @@ class SharedServiceSettings:
 
 
 def is_shared_service_configured() -> bool:
-    return bool(
-        _shared_setting(SHARED_SERVICE_URL_ENV)
-        and _shared_setting(SHARED_ACCESS_TOKEN_ENV)
-    )
+    service_url, access_token = _resolved_shared_settings()
+    return bool(service_url and access_token)
 
 
 def load_shared_service_settings() -> SharedServiceSettings:
-    service_url = _shared_setting(SHARED_SERVICE_URL_ENV)
-    access_token = _shared_setting(SHARED_ACCESS_TOKEN_ENV)
+    service_url, access_token = _resolved_shared_settings()
     if not service_url or not access_token:
         raise MissingSharedServiceConfiguration(
             "NEAT shared access is not configured for this installation."
@@ -202,7 +236,7 @@ class SharedAssistantClient:
         if exc.code == 429 and code == "daily_limit_reached":
             reset = str(detail.get("reset_at_utc", "the next UTC day"))
             raise SharedServiceError(
-                "The 20 shared NEAT requests have been used for today. "
+                "The shared NEAT daily request allowance has been used. "
                 f"The allowance resets at {reset}. You can use your own API key "
                 "in AI settings."
             ) from None
@@ -220,6 +254,7 @@ class SharedAssistantClient:
 
 __all__ = [
     "MissingSharedServiceConfiguration",
+    "PUBLIC_SHARED_CONFIG_FILENAME",
     "SHARED_ACCESS_TOKEN_ENV",
     "SHARED_SERVICE_URL_ENV",
     "SharedAssistantClient",

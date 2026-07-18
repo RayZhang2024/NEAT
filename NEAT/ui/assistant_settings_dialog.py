@@ -171,7 +171,7 @@ class AssistantSettingsDialog(QDialog):
         self.personal_radio = QRadioButton("Use my own API key")
         access_layout.addWidget(self.personal_radio)
         self.shared_radio = QRadioButton(
-            "Use NEAT shared access (20 requests per day)"
+            "Use NEAT shared access (limited request allowance per day)"
         )
         self.shared_radio.setEnabled(self.shared_service_available)
         self.shared_radio.setToolTip(

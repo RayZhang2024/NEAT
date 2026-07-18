@@ -4,6 +4,7 @@
 PyInstaller build spec for NEAT standalone (Windows-friendly defaults).
 
 Build:
+    python -m tools.prepare_public_shared_access
     pyinstaller --noconfirm --clean NEAT.spec
 """
 
@@ -101,6 +102,19 @@ assistant_knowledge = project_root / "docs" / "assistant"
 if not assistant_knowledge.exists():
     raise FileNotFoundError(f"Missing assistant knowledge: {assistant_knowledge}")
 datas.append((str(assistant_knowledge), "docs/assistant"))
+
+# Official builds include a limited public-client credential for automatic
+# shared access. It is intentionally not the server's OpenAI API key and must
+# be treated as extractable by anyone who downloads NEAT.
+public_shared_config = (
+    project_root / "build" / "private" / "shared_access.json"
+)
+if not public_shared_config.exists():
+    raise FileNotFoundError(
+        "Missing packaged shared-access configuration. Run "
+        "python -m tools.prepare_public_shared_access before PyInstaller."
+    )
+datas.append((str(public_shared_config), "NEAT/config"))
 
 # Use project icon for the standalone executable.
 app_icon = project_root / "docs" / "icon" / "NEAT.ico"

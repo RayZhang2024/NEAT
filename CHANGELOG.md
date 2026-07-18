@@ -2,6 +2,28 @@
 
 All notable user-facing changes to NEAT are recorded here.
 
+## 4.8.1 - 2026-07-18
+
+### Changed
+
+- Official standalone downloads now enable NEAT shared AI access automatically;
+  users no longer need to configure a service URL or access token.
+- Shared-access labels describe a limited daily request allowance without
+  advertising a fixed number in the interface.
+- Complete per-computer shared-service settings continue to override the
+  bundled public configuration for development and testing.
+
+### Packaging and security
+
+- Release automation injects the limited public-client service credential from
+  a GitHub Actions secret and stops the build when it is missing.
+- The packaged smoke test verifies that automatic shared access is configured.
+- The server OpenAI API key remains exclusively on the hosted laptop and is
+  never written to the release package.
+- The bundled public-client token is intentionally extractable; the atomic
+  server-side daily allowance and OpenAI project budget remain the cost
+  controls.
+
 ## 4.8.0 - 2026-07-18
 
 ### Added

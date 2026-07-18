@@ -1,6 +1,6 @@
 # NEAT Assistant FAQ
 
-Knowledge-base version: NEAT 4.8.0  
+Knowledge-base version: NEAT 4.8.1
 Approved source: `User manual.md`
 
 This file contains concise answers for common NEAT usage questions. Answers describe documented NEAT behaviour only. Dataset-specific scientific interpretation should be reviewed by an experienced Bragg-edge imaging scientist.
@@ -122,7 +122,7 @@ For each selected Bragg edge:
 - **Window 2** (`2 Min`, `2 Max`) selects the higher-wavelength, post-edge baseline region.
 - The full Bragg-edge fitting interval runs from **`1 Min` to `2 Max`**, so it includes both baseline regions and the transition between them.
 
-In NEAT v4.8.0, the former independent `3 Min` and `3 Max` inputs are not shown. NEAT derives the full fitting interval automatically from `1 Min` and `2 Max`. If a fit is biased or unstable, inspect the two visible windows and the complete interval against the displayed spectrum before changing model parameters.
+In NEAT v4.8.1, the former independent `3 Min` and `3 Max` inputs are not shown. NEAT derives the full fitting interval automatically from `1 Min` and `2 Max`. If a fit is biased or unstable, inspect the two visible windows and the complete interval against the displayed spectrum before changing model parameters.
 
 Source: NEAT User Manual §4.3 and Appendix A.2.
 
@@ -140,7 +140,7 @@ After loading a wavelength-resolved dataset:
 5. Review the initial `s`, `t` and `eta` values and use their header checkboxes to choose whether each parameter is fixed or refined.
 6. Test the selected edge or pattern on a representative macro-pixel before batch fitting.
 
-In v4.8.0, `3 Min` and `3 Max` are not visible inputs; NEAT derives the full
+In v4.8.1, `3 Min` and `3 Max` are not visible inputs; NEAT derives the full
 fitting interval automatically. There are no universal Edge Table values that
 work for every dataset.
 
@@ -216,6 +216,6 @@ Source: NEAT User Manual §5.2, “Point selection & line profile”.
 
 ## Can NEAT display coordinates in millimetres?
 
-Yes. Enable **Display in mm** in Data Post-Processing. NEAT changes the axes and coordinate inputs from pixels to millimetres using `0.055 mm/pixel`. In v4.8.0 this value is fixed in the software and is not editable in the interface.
+Yes. Enable **Display in mm** in Data Post-Processing. NEAT changes the axes and coordinate inputs from pixels to millimetres using `0.055 mm/pixel`. In v4.8.1 this value is fixed in the software and is not editable in the interface.
 
 Source: NEAT User Manual §5.2, “Units”.

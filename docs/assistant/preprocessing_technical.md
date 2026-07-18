@@ -1,6 +1,6 @@
 # NEAT Assistant — Reviewed Preprocessing Details
 
-Knowledge-base version: NEAT 4.8.0  
+Knowledge-base version: NEAT 4.8.1
 Approval: reviewed technical guidance for user support
 
 These sections describe reviewed NEAT behaviour. They are intended to answer

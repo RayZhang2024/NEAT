@@ -1,6 +1,6 @@
 # NEAT Assistant Troubleshooting Guide
 
-Knowledge-base version: NEAT 4.8.0  
+Knowledge-base version: NEAT 4.8.1
 Approved source: `User manual.md`
 
 Use the checks below in order. Do not claim that a numerical result is scientifically valid solely because the software completed or the optimiser converged.
@@ -156,7 +156,7 @@ Check in this order:
 1. Confirm that the target edge is clearly visible and lies inside the global wavelength range.
 2. Confirm that Window 1 (`1 Min`, `1 Max`) covers a suitable lower-wavelength, pre-edge baseline region.
 3. Confirm that Window 2 (`2 Min`, `2 Max`) covers a suitable higher-wavelength, post-edge baseline region.
-4. Confirm that the complete interval from `1 Min` to `2 Max` contains the Bragg-edge transition. In v4.8.0, this full fitting interval is derived automatically; there are no separate visible `3 Min` and `3 Max` inputs.
+4. Confirm that the complete interval from `1 Min` to `2 Max` contains the Bragg-edge transition. In v4.8.1, this full fitting interval is derived automatically; there are no separate visible `3 Min` and `3 Max` inputs.
 5. Review the fitted curve, residuals, convergence messages, parameter values and uncertainties.
 6. Adjust the window bounds or the bounds/fixed state of `s`, `t` and `eta`, then repeat the macro-pixel test fit.
 7. If the spectrum remains inadequate, improve preprocessing or counting statistics before full-field fitting.

@@ -1,6 +1,6 @@
 """ GUI for Bragg edge imging data analysis. """
 __author__ = " Ruiyao Zhang "
-__version__ = "4.8.0"
+__version__ = "4.8.1"
 
 # ONNX Runtime must load before PyQt on Windows. PyQt can otherwise load a
 # conflicting DLL first, causing the assistant's local semantic search to fail

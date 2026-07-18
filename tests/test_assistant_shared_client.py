@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 
@@ -46,6 +48,57 @@ class SharedAssistantClientTests(unittest.TestCase):
 
         self.assertEqual(settings.service_url, "https://neat.example.org")
         self.assertEqual(settings.access_token, "persisted-limited-token")
+
+    def test_bundled_public_settings_enable_automatic_shared_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "shared_access.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "service_url": "https://public-neat.example.org",
+                        "access_token": "extractable-public-client-token",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {}, clear=True), patch(
+                "tools.assistant_shared_client._persisted_windows_user_setting",
+                return_value="",
+            ), patch(
+                "tools.assistant_shared_client._bundled_shared_config_path",
+                return_value=config_path,
+            ):
+                self.assertTrue(is_shared_service_configured())
+                settings = load_shared_service_settings()
+
+        self.assertEqual(
+            settings.service_url,
+            "https://public-neat.example.org",
+        )
+        self.assertEqual(
+            settings.access_token,
+            "extractable-public-client-token",
+        )
+
+    def test_complete_local_override_wins_over_bundled_settings(self) -> None:
+        local = {
+            "NEAT_SHARED_SERVICE_URL": "https://local-override.example.org",
+            "NEAT_SHARED_ACCESS_TOKEN": "local-override-token",
+        }
+        with patch.dict("os.environ", local, clear=True), patch(
+            "tools.assistant_shared_client._persisted_windows_user_setting",
+            return_value="",
+        ), patch(
+            "tools.assistant_shared_client._bundled_shared_settings",
+            return_value=("https://public.example.org", "public-token"),
+        ):
+            settings = load_shared_service_settings()
+
+        self.assertEqual(
+            settings.service_url,
+            "https://local-override.example.org",
+        )
+        self.assertEqual(settings.access_token, "local-override-token")
 
     def test_remote_service_requires_https(self) -> None:
         with self.assertRaisesRegex(ValueError, "must use HTTPS"):
@@ -118,7 +171,7 @@ class SharedAssistantClientTests(unittest.TestCase):
         )
         with self.assertRaises(SharedServiceError) as raised:
             client.ask("Question")
-        self.assertIn("20 shared NEAT requests", str(raised.exception))
+        self.assertIn("daily request allowance", str(raised.exception))
         self.assertIn("use your own API key", str(raised.exception))
 
 

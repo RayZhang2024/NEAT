@@ -1,6 +1,6 @@
 # Host the NEAT assistant on a Windows laptop
 
-This is the recommended no-hosting-cost arrangement for a controlled pilot.
+This is the no-hosting-cost arrangement used by NEAT public shared access.
 The laptop runs the existing single-instance FastAPI service and retains the
 atomic 20-request UTC daily allowance in its local SQLite database.
 
@@ -11,7 +11,11 @@ atomic 20-request UTC daily allowance in its local SQLite database.
 - Keep the server bound to `127.0.0.1`; do not forward port 8765 on the router.
 - Tailscale Funnel provides the public HTTPS endpoint.
 - The OpenAI key stays in Windows Credential Manager on the host laptop.
-- Only give the separate NEAT access token to approved pilot users.
+- The separate NEAT public-client token is included in official downloads and
+  must be treated as extractable. It protects the endpoint from incidental
+  traffic but does not identify or authenticate an individual user.
+- The server-side global daily quota and the OpenAI project budget are the cost
+  controls; one public user can consume the shared allowance before others.
 - Check institutional security policy before offering the service publicly.
 
 ## 1. Install and sign in to Tailscale
@@ -114,18 +118,26 @@ https://your-laptop.your-tailnet.ts.net
 
 Do not include `/health` in the client service URL.
 
-## 6. Configure each approved NEAT client
+## 6. Configure official public downloads
 
-On each client computer, set the Funnel address and the separate NEAT access
-token. Never copy the OpenAI API key to a client.
+Official release packages receive the Funnel address and separate public-client
+token during the GitHub Actions build. Add the server's service token as the
+GitHub repository Actions secret `NEAT_SHARED_PUBLIC_ACCESS_TOKEN`. The release
+workflow supplies the public URL and prepares the bundled configuration before
+PyInstaller runs. Never add the OpenAI API key to the workflow or a client.
+
+Before a local candidate build, prepare the same extractable configuration from
+the current computer's `NEAT_SHARED_SERVICE_URL` and
+`NEAT_SHARED_ACCESS_TOKEN`, then build:
 
 ```powershell
-setx NEAT_SHARED_SERVICE_URL "https://your-laptop.your-tailnet.ts.net"
-setx NEAT_SHARED_ACCESS_TOKEN "the generated NEAT access token"
+python -m tools.prepare_public_shared_access
+pyinstaller --noconfirm --clean NEAT.spec
 ```
 
-Restart NEAT after setting these values, then select **Use NEAT shared access**
-in AI Settings.
+Users of an official download can select **Use NEAT shared access** immediately;
+they do not configure an endpoint or token. Complete per-computer environment
+settings still override the bundled configuration for development and testing.
 
 ## Stop public access
 

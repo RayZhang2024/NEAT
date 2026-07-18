@@ -1,9 +1,9 @@
-# NEAT 4.8.0 release checklist
+# NEAT 4.8.1 release checklist
 
 ## Automated checks completed locally
 
-- [x] Version is `4.8.0` in the package and project metadata.
-- [x] Full unit suite passes (`167` tests).
+- [x] Version is `4.8.1` in the package and project metadata.
+- [x] Full unit suite passes (`171` tests).
 - [x] Ruff critical-error checks pass.
 - [x] Mypy checks for `NEAT/core` pass.
 - [x] `git diff --check` passes.
@@ -12,6 +12,7 @@
 - [x] Packaged smoke test loads provider adapters, keyring and all `149`
   approved knowledge sections.
 - [x] Packaged BM25 retrieval fallback returns results without an API call.
+- [x] Packaged smoke test confirms automatic shared access is configured.
 
 ## Manual acceptance checks required before tagging
 
@@ -30,8 +31,9 @@ Test the exact candidate at `dist/NEAT/NEAT.exe`, not the source checkout.
 - [ ] If personal cloud access is part of the release, test one provider with a
   low-cost request. This is a real, billable API call.
 - [ ] If shared access is part of the release, keep the laptop server and
-  Tailscale running and test from a second Tailscale-authorized device. Confirm
-  the global daily quota message is correct.
+  Tailscale running and test the freshly downloaded ZIP on a clean Windows user
+  without shared-access environment variables. Confirm shared access is enabled
+  automatically and the global daily quota message is correct.
 - [ ] If local-model support is part of the release, test one installed Ollama
   or LM Studio model. This is optional when no supported local server is
   available.
@@ -57,7 +59,7 @@ Only after the manual checks pass:
 
 1. commit the reviewed release files;
 2. push the release commit;
-3. create and push tag `v4.8.0`;
+3. create and push tag `v4.8.1`;
 4. wait for the GitHub release workflow to pass;
-5. download the produced `NEATv4.8.0.zip` and perform a final launch check;
+5. download the produced `NEATv4.8.1.zip` and perform a final launch check;
 6. publish/announce the release.

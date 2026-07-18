@@ -31,7 +31,7 @@ All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil,
 ## 🚀 Run the GUI
 
 ### Standalone executable
-You can download the Windows standalone executable from the [NEAT v4.8.0 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.8.0/NEATv4.8.0.zip).
+You can download the Windows standalone executable from the [NEAT v4.8.1 Release](https://github.com/RayZhang2024/NEAT/releases/download/v4.8.1/NEATv4.8.1.zip).
 No installation is needed; extract the ZIP and double-click `NEAT.exe`.
 
 ### 🚀 Example data
@@ -84,7 +84,7 @@ python -m NEAT.app
 ```
 
 ✅ The main window titled
-**“NEAT Neutron Bragg Edge Analysis Toolkit v4.8.0”**
+**“NEAT Neutron Bragg Edge Analysis Toolkit v4.8.1”**
 will appear, with tabs for:
 
 * **Data Preprocessing**
@@ -102,8 +102,8 @@ The assistant supports personal API keys for OpenAI, Anthropic, Google Gemini,
 DeepSeek and Kimi/Moonshot; manually configured OpenAI-compatible endpoints;
 and local models through Ollama or LM Studio. API keys are stored in the
 operating-system credential manager and are not saved in the repository or
-ordinary NEAT settings. Shared NEAT access is available only when explicitly
-configured for an installation.
+ordinary NEAT settings. Official standalone downloads include automatic shared
+NEAT access with a limited daily request allowance.
 
 Questions, approved NEAT documentation excerpts, recent chat turns and a small
 allow-listed set of screen settings may be sent to the selected model. Raw

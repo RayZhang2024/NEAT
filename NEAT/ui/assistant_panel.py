@@ -376,7 +376,7 @@ class AssistantDockWidget(QDockWidget):
                 )
                 self.status_label.setText(
                     "Configured — NEAT shared access (availability is checked "
-                    "when you ask; 20 requests per UTC day)"
+                    "when you ask; limited request allowance per day)"
                 )
                 self.status_label.setStyleSheet("color: #26734d;")
                 return

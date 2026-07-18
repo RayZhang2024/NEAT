@@ -19,10 +19,10 @@ class ReleasePackagingTests(unittest.TestCase):
         project = tomllib.loads(
             (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(NEAT.__version__, "4.8.0")
+        self.assertEqual(NEAT.__version__, "4.8.1")
         self.assertEqual(project["project"]["version"], NEAT.__version__)
         self.assertIn(
-            "## 4.8.0",
+            "## 4.8.1",
             (PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
         )
 
@@ -56,6 +56,8 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn(".[assistant,assistant-server]", workflow)
         self.assertIn("--release-smoke-test", workflow)
         self.assertIn("NEAT_RELEASE_SMOKE_RESULT", workflow)
+        self.assertIn("tools.prepare_public_shared_access", workflow)
+        self.assertIn("NEAT_SHARED_PUBLIC_ACCESS_TOKEN", workflow)
 
     def test_test_workflow_installs_dependencies_used_by_full_suite(self) -> None:
         workflow = (PROJECT_ROOT / ".github/workflows/tests.yml").read_text(
@@ -67,6 +69,8 @@ class ReleasePackagingTests(unittest.TestCase):
         specification = (PROJECT_ROOT / "NEAT.spec").read_text(encoding="utf-8")
         self.assertIn('"docs" / "assistant"', specification)
         self.assertIn('collect_submodules("tools")', specification)
+        self.assertIn('"shared_access.json"', specification)
+        self.assertIn('"NEAT/config"', specification)
         self.assertIn('"langchain-openai"', specification)
         self.assertIn('"langchain-anthropic"', specification)
         self.assertIn('"langchain-google-genai"', specification)

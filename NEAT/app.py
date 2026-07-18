@@ -193,6 +193,7 @@ def _run_release_smoke_test() -> int:
     from tools import assistant_openai  # noqa: F401
     from tools import assistant_openai_compatible  # noqa: F401
     from tools.assistant_retrieval import BM25Retriever, load_knowledge_base
+    from tools.assistant_shared_client import is_shared_service_configured
     _write_release_smoke_result("OK provider adapters")
 
     runtime_root = Path(
@@ -206,6 +207,12 @@ def _run_release_smoke_test() -> int:
     if not fallback_matches:
         raise RuntimeError("The packaged BM25 retrieval fallback returned no results.")
     _write_release_smoke_result("OK BM25 fallback")
+    if getattr(sys, "_MEIPASS", None):
+        if not is_shared_service_configured():
+            raise RuntimeError(
+                "The packaged automatic shared-access configuration is missing."
+            )
+        _write_release_smoke_result("OK automatic shared access configured")
     return len(sections)
 
 

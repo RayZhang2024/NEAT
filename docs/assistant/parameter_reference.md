@@ -1,6 +1,6 @@
 # NEAT Assistant Parameter Reference
 
-Knowledge-base version: NEAT 4.8.0  
+Knowledge-base version: NEAT 4.8.1
 Approved sources: `User manual.md` and documented NEAT GUI behaviour
 
 ## Preprocessing parameters
@@ -92,7 +92,7 @@ Higher-wavelength, post-edge baseline region used in the staged fit.
 
 ### Full Bragg-edge fitting interval
 
-The full interval fitted by the Bragg-edge model runs from visible `1 Min` to visible `2 Max`, including the transition between the two baseline windows. In NEAT v4.8.0, the former `3 Min` and `3 Max` inputs are hidden and are derived automatically from `1 Min` and `2 Max`; users do not configure a separate third window.
+The full interval fitted by the Bragg-edge model runs from visible `1 Min` to visible `2 Max`, including the transition between the two baseline windows. In NEAT v4.8.1, the former `3 Min` and `3 Max` inputs are hidden and are derived automatically from `1 Min` and `2 Max`; users do not configure a separate third window.
 
 Source: NEAT User Manual §4.3 and Appendix A.2.
 
@@ -173,7 +173,7 @@ Manual display limits for the map. Minimum must be smaller than maximum. When in
 
 ### Display in mm
 
-Changes axes and coordinate inputs from pixels to millimetres using `0.055 mm/pixel`. In NEAT v4.8.0 this conversion is fixed in the software and is not editable in the interface.
+Changes axes and coordinate inputs from pixels to millimetres using `0.055 mm/pixel`. In NEAT v4.8.1 this conversion is fixed in the software and is not editable in the interface.
 
 ### `d0`
 
