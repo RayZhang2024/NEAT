@@ -631,6 +631,9 @@ class BatchFitEdgesWorker(QThread):
                         selected_phase=self.fit_context.get("selected_phase"),
                         structure_type=self.fit_context.get("structure_type"),
                         lattice_params=self.fit_context.get("lattice_params"),
+                        fitting_parameter_bounds=self.fit_context.get(
+                            "fitting_parameter_bounds"
+                        ),
                     )
                     fit_params = fit_result.get("fit_params") if isinstance(fit_result, dict) else None
                     edge_height = fit_result.get("edge_height", np.nan) if isinstance(fit_result, dict) else np.nan

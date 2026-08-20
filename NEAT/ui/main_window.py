@@ -59,6 +59,7 @@ from ..core import (
     fitting_function_2,
     fitting_function_3,
 )
+from ..core.fitting import normalize_fitting_parameter_bounds
 from .mixins.fitting import FittingMixin
 from .mixins.postprocessing import PostProcessingMixin
 from .mixins.preprocessing import PreprocessingMixin
@@ -133,6 +134,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.nexus_axis_centers = None
         self.nexus_axis_uses_flight_path = False
         self.delay = 0.0
+        self.fitting_parameter_bounds = normalize_fitting_parameter_bounds()
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.app_version = str(__version__).strip()
         
@@ -409,6 +411,12 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         fitting_config_action = QAction("Instrument Setting...", self)
         fitting_config_action.triggered.connect(self.open_fitting_config_from_menu)
         setting_menu.addAction(fitting_config_action)
+
+        fitting_bounds_action = QAction("Fitting Parameter Bounds...", self)
+        fitting_bounds_action.triggered.connect(
+            self.open_fitting_parameter_bounds_dialog
+        )
+        setting_menu.addAction(fitting_bounds_action)
 
         manual_spectra_action = QAction("Manual Spectra Setting...", self)
         manual_spectra_action.triggered.connect(self.open_manual_spectra_setting_from_menu)
@@ -1430,6 +1438,12 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
 
         self.flight_path = data.get("flight_path", self.flight_path)
         self.delay = data.get("delay", self.delay)
+        try:
+            self.fitting_parameter_bounds = normalize_fitting_parameter_bounds(
+                data.get("fitting_parameter_bounds", self.fitting_parameter_bounds)
+            )
+        except ValueError:
+            self.fitting_parameter_bounds = normalize_fitting_parameter_bounds()
 
         phase = data.get("phase")
         if phase:
@@ -1517,6 +1531,10 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             "plot_font_size": getattr(self, "plot_font_size", 12),
             "flight_path": self.flight_path,
             "delay": getattr(self, "delay", 0.0),
+            "fitting_parameter_bounds": {
+                name: {"lower": bounds[0], "upper": bounds[1]}
+                for name, bounds in self.fitting_parameter_bounds.items()
+            },
             "phase": self.phase_dropdown.currentText(),
             "initial_roi": {
                 "xmin": self.xmin_input.text(),
