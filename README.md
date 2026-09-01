@@ -84,7 +84,7 @@ python -m NEAT.app
 ```
 
 ✅ The main window titled
-**“NEAT Neutron Bragg Edge Analysis Toolkit v4.8.2”**
+**“NEAT Neutron Bragg Edge Analysis Toolkit vX.Y.Z”**
 will appear, with tabs for:
 
 * **Data Preprocessing**

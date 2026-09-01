@@ -20,10 +20,11 @@ class ReleasePackagingTests(unittest.TestCase):
         project = tomllib.loads(
             (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
+        project_version = project["project"]["version"]
         self.assertEqual(NEAT.__version__, version("NEAT"))
-        self.assertEqual(project["project"]["version"], NEAT.__version__)
+        self.assertEqual(project_version, NEAT.__version__)
         self.assertIn(
-            "## 4.8.1",
+            f"## {project_version}",
             (PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
         )
 

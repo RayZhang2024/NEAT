@@ -14,6 +14,16 @@
 5. Download the published ZIP and perform a final launch check. Test the exact
    candidate at `dist/NEAT/NEAT.exe`, not the source checkout.
 
+## Manual packaged acceptance
+
+- Launch the packaged `NEAT.exe`, open representative FITS/TIFF data, and run
+  a short preprocessing → fitting → post-processing workflow.
+- Verify saved outputs and image orientation, then open and exercise the AI
+  Assistant. Confirm core NEAT remains usable without network access.
+- Preferably test the release ZIP on a clean Windows user or machine. After
+  publication, download the GitHub Release ZIP and repeat the final launch
+  check.
+
 ## Recovery before publication
 
 If the workflow fails before publishing, fix the issue on a new PR, merge it
