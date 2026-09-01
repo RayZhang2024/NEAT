@@ -1,6 +1,12 @@
-""" GUI for Bragg edge imging data analysis. """
+"""GUI for Bragg edge imaging data analysis."""
+
+from importlib.metadata import version
+
 __author__ = " Ruiyao Zhang "
-__version__ = "4.8.2"
+# Package metadata is the only maintained release-version value.  Setuptools
+# writes it from ``pyproject.toml`` for editable installs and wheels; NEAT.spec
+# bundles that metadata for the standalone application.
+__version__ = version("NEAT")
 
 # ONNX Runtime must load before PyQt on Windows. PyQt can otherwise load a
 # conflicting DLL first, causing the assistant's local semantic search to fail
@@ -12,4 +18,4 @@ except (ImportError, OSError):
 
 from .ui import FitsViewer
 
-__all__ = ["FitsViewer"]
+__all__ = ["FitsViewer", "__version__"]

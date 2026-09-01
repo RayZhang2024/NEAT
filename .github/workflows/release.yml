@@ -23,6 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Set release version
         shell: pwsh
@@ -40,10 +41,24 @@ jobs:
           "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RELEASE_ZIP=NEAT$tag.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Verify release commit is contained in main
+        shell: pwsh
+        run: |
+          git fetch origin main --tags
+          $releaseCommit = git rev-parse HEAD
+          $tagCommit = git rev-parse "$($env:RELEASE_TAG)^{commit}"
+          if ($releaseCommit -ne $tagCommit) {
+            throw "Checked-out commit $releaseCommit does not match release tag $env:RELEASE_TAG ($tagCommit)."
+          }
+          git merge-base --is-ancestor $tagCommit origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release commit $tagCommit is not contained in origin/main. Merge the release commit into main before tagging."
+          }
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: "pip"
 
       - name: Install dependencies
@@ -52,6 +67,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[assistant,assistant-server]"
           python -m pip install pyinstaller
+
+      - name: Verify release tag matches package version
+        shell: pwsh
+        run: python -m tools.check_release_version --tag $env:RELEASE_TAG
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v

@@ -1,6 +1,6 @@
 # NEAT Assistant — Reviewed Mapping and Result Details
 
-Knowledge-base version: NEAT 4.8.1
+Knowledge-base version: NEAT 4.8.2
 Approval: reviewed technical guidance for user support
 
 ## Mapping boxes and stored coordinates

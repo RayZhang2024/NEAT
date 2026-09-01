@@ -1,6 +1,6 @@
 # NEAT Assistant — Reviewed Post-Processing Details
 
-Knowledge-base version: NEAT 4.8.1
+Knowledge-base version: NEAT 4.8.2
 Approval: reviewed technical guidance for user support
 
 ## Result CSV loading
