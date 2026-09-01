@@ -1,6 +1,6 @@
 # NEAT Assistant Troubleshooting Guide
 
-Knowledge-base version: NEAT 4.8.1
+Knowledge-base version: NEAT 4.8.2
 Approved source: `User manual.md`
 
 Use the checks below in order. Do not claim that a numerical result is scientifically valid solely because the software completed or the optimiser converged.

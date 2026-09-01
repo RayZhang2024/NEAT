@@ -11,6 +11,47 @@ UNCERTAINTY_ESTIMATOR_TARGETS = (
 )
 
 
+DEFAULT_FITTING_PARAMETER_BOUNDS = {
+    "s": (0.0001, 0.01),
+    "t": (0.01, 0.1),
+    "eta": (0.0, 1.0),
+}
+
+
+def normalize_fitting_parameter_bounds(bounds=None):
+    """Return validated shared bounds for the three edge-shape parameters."""
+    supplied = bounds if isinstance(bounds, dict) else {}
+    normalized = {}
+    for name, default in DEFAULT_FITTING_PARAMETER_BOUNDS.items():
+        candidate = supplied.get(name, default)
+        if isinstance(candidate, dict):
+            candidate = (candidate.get("lower"), candidate.get("upper"))
+        try:
+            lower, upper = float(candidate[0]), float(candidate[1])
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid {name} fitting bounds") from exc
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+            raise ValueError(f"The lower {name} bound must be less than its upper bound")
+        if name in ("s", "t") and lower <= 0:
+            raise ValueError(f"The lower {name} bound must be greater than zero")
+        if name == "eta" and (lower < 0 or upper > 1):
+            raise ValueError("The eta bounds must stay inside [0, 1]")
+        normalized[name] = (lower, upper)
+    return normalized
+
+
+def initial_value_within_bounds(value, bounds):
+    """Return a finite optimizer starting value inside ``bounds``."""
+    lower, upper = bounds
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = (lower + upper) / 2.0
+    if not np.isfinite(value):
+        value = (lower + upper) / 2.0
+    return float(np.clip(value, lower, upper))
+
+
 def _validate_positive_parameter(name, value):
     try:
         numeric_value = float(value)

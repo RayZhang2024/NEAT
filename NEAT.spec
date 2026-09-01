@@ -34,6 +34,7 @@ hiddenimports += collect_submodules("keyring.backends")
 hiddenimports += collect_submodules("tools")
 
 for distribution_name in (
+    "NEAT",
     "anthropic",
     "chromadb",
     "keyring",

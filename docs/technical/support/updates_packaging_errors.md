@@ -50,7 +50,7 @@ it does not download, install or replace application files.
 
 ## Windows standalone release
 
-Tags matching `v*` run the GitHub release workflow on Python 3.11. It installs
+Tags matching `v*` run the GitHub release workflow on Python 3.13. It installs
 the project with the `assistant` and `assistant-server` extras plus PyInstaller,
 runs the unit suite, builds from `NEAT.spec`, runs a non-interactive packaged
 smoke test, compresses the one-folder `dist/NEAT` directory and publishes the
@@ -80,7 +80,7 @@ Runtime cannot load, its embedding model is unavailable, or the first-use
 model download fails, NEAT continues with approved-source BM25 retrieval. The
 assistant therefore remains usable, although semantic matching quality may be
 lower. The locally built Python 3.13 release candidate exercised this fallback;
-the official GitHub release workflow builds and retests on Python 3.11.
+the official GitHub release workflow builds and retests on Python 3.13.
 
 The local Chroma embedding model may require a first-use download. Offline
 operation does not require that download because BM25 works only from the

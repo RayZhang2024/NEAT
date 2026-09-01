@@ -62,6 +62,11 @@ from ...core import (
     fitting_function_2,
     fitting_function_3,
 )
+from ...core.fitting import (
+    DEFAULT_FITTING_PARAMETER_BOUNDS,
+    initial_value_within_bounds,
+    normalize_fitting_parameter_bounds,
+)
 from ...workers.batch import (
     BatchFitEdgesWorker,
     BatchFitWorker,
@@ -352,9 +357,22 @@ class FittingMixin:
             "input_file": getattr(self, "current_fitting_input", ""),
             "min_wavelength": _safe_float_text(self.min_wavelength_input.text() if hasattr(self, "min_wavelength_input") else ""),
             "max_wavelength": _safe_float_text(self.max_wavelength_input.text() if hasattr(self, "max_wavelength_input") else ""),
+            "fitting_parameter_bounds": self.get_fitting_parameter_bounds(),
             "bragg_rows": bragg_rows,
             "bragg_rows_text": bragg_rows_text,
         }
+
+    def get_fitting_parameter_bounds(self, fit_context=None):
+        """Return shared shape bounds, preferring a batch job snapshot."""
+        context = fit_context if isinstance(fit_context, dict) else {}
+        configured = context.get(
+            "fitting_parameter_bounds",
+            getattr(self, "fitting_parameter_bounds", DEFAULT_FITTING_PARAMETER_BOUNDS),
+        )
+        try:
+            return normalize_fitting_parameter_bounds(configured)
+        except ValueError:
+            return normalize_fitting_parameter_bounds()
 
     def setup_FittingTab(self):
         """
@@ -1622,6 +1640,7 @@ class FittingMixin:
         # 1) Validate structure & params
         # -------------------------------
         ctx = fit_context or {}
+        parameter_bounds = self.get_fitting_parameter_bounds(ctx)
         structure_type = ctx.get("structure_type", getattr(self, "structure_type", "cubic"))
         if structure_type not in STRUCTURE_CONFIG:
             return None, f"Unsupported structure type: {structure_type}"
@@ -1802,23 +1821,26 @@ class FittingMixin:
 
         if not fix_s:
             for s in s_initial:
-                initial_guess.append(0.01)
-                lower_bounds.append(5e-4)
-                upper_bounds.append(0.01)
+                lower, upper = parameter_bounds["s"]
+                initial_guess.append(initial_value_within_bounds(s, (lower, upper)))
+                lower_bounds.append(lower)
+                upper_bounds.append(upper)
 
-        # ---- t (0.0001 … 0.1) -------------------------------------------
+        # Append one shared-bound shape parameter per edge.
         if not fix_t:
             for t in t_initial:
-                initial_guess.append(0.02)
-                lower_bounds.append(1e-2)
-                upper_bounds.append(0.1)
+                lower, upper = parameter_bounds["t"]
+                initial_guess.append(initial_value_within_bounds(t, (lower, upper)))
+                lower_bounds.append(lower)
+                upper_bounds.append(upper)
 
         # ---- eta (0 … 1) ------------------------------------------------
         if not fix_eta:
             for eta in eta_initial:
-                initial_guess.append(0.5)
-                lower_bounds.append(0.0)
-                upper_bounds.append(1.0)
+                lower, upper = parameter_bounds["eta"]
+                initial_guess.append(initial_value_within_bounds(eta, (lower, upper)))
+                lower_bounds.append(lower)
+                upper_bounds.append(upper)
 
         # Concatenate region 3 data from all edges
         concatenated_x = np.concatenate([e['x_r3'] for e in bragg_edges])
@@ -3197,6 +3219,63 @@ class FittingMixin:
                 self.message_box.append("No flight-path-dependent loaded data to update.")
             self.save_user_settings()
         return
+
+    def open_fitting_parameter_bounds_dialog(self):
+        """Edit bounds shared by individual-edge and full-pattern fits."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Fitting Parameter Bounds")
+        layout = QVBoxLayout(dialog)
+        description = QLabel(
+            "These bounds apply to all individual-edge and full-pattern fits, "
+            "including batch fitting."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        form_layout = QGridLayout()
+        form_layout.addWidget(QLabel("Parameter"), 0, 0)
+        form_layout.addWidget(QLabel("Lower bound"), 0, 1)
+        form_layout.addWidget(QLabel("Upper bound"), 0, 2)
+        current = self.get_fitting_parameter_bounds()
+        inputs = {}
+        for row, name in enumerate(("s", "t", "eta"), start=1):
+            lower_spin = QDoubleSpinBox()
+            upper_spin = QDoubleSpinBox()
+            for spin in (lower_spin, upper_spin):
+                spin.setDecimals(8)
+                spin.setSingleStep(0.0001 if name == "s" else 0.01)
+                spin.setRange(0.0, 1.0 if name == "eta" else 1000.0)
+            if name in ("s", "t"):
+                lower_spin.setMinimum(0.00000001)
+                upper_spin.setMinimum(0.00000001)
+            lower_spin.setValue(current[name][0])
+            upper_spin.setValue(current[name][1])
+            form_layout.addWidget(QLabel(name), row, 0)
+            form_layout.addWidget(lower_spin, row, 1)
+            form_layout.addWidget(upper_spin, row, 2)
+            inputs[name] = (lower_spin, upper_spin)
+        layout.addLayout(form_layout)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(button_box)
+
+        def accept_bounds():
+            proposed = {
+                name: (lower.value(), upper.value())
+                for name, (lower, upper) in inputs.items()
+            }
+            try:
+                validated = normalize_fitting_parameter_bounds(proposed)
+            except ValueError as exc:
+                QMessageBox.warning(dialog, "Invalid Bounds", str(exc))
+                return
+            self.fitting_parameter_bounds = validated
+            self.save_user_settings()
+            dialog.accept()
+
+        button_box.accepted.connect(accept_bounds)
+        button_box.rejected.connect(dialog.reject)
+        dialog.exec_()
 
     def open_manual_spectra_settings_dialog(self):
         """Dialog for manual wavelength/ToF anchors and loading saved fitting metadata."""
@@ -5700,6 +5779,7 @@ class FittingMixin:
         selected_phase=None,
         structure_type=None,
         lattice_params=None,
+        fitting_parameter_bounds=None,
         emit_messages=True,
         update_table=True,
         only_update_unfixed=False,
@@ -5720,6 +5800,11 @@ class FittingMixin:
         intensities_data = self.intensities if intensities is None else np.asarray(intensities)
         lattice_params_data = dict(lattice_params if lattice_params is not None else getattr(self, "lattice_params", {}))
         structure_type_data = structure_type if structure_type is not None else getattr(self, "structure_type", "fcc" if is_known_phase else "unknown")
+        parameter_bounds = self.get_fitting_parameter_bounds(
+            {"fitting_parameter_bounds": fitting_parameter_bounds}
+            if fitting_parameter_bounds is not None
+            else None
+        )
         params_store = {}
         if draw_plots:
             if not hasattr(self, "params_unknown"):
@@ -5920,20 +6005,18 @@ class FittingMixin:
                 )
 
             # ---------- build p0 / bounds -------------------------
-            p0 = [a0_hat,  b0_hat,  a_hkl_hat,  b_hkl_hat,  a_guess]                    \
-                 + ([] if fix_s  else [0.01]) \
-                 + ([] if fix_t  else [0.1])  \
-                 + ([] if fix_eta else [0.5])
-
-            lb = list(lb4) + [a_guess*0.95]             \
-                 + ([] if fix_s  else [0.0001])\
-                 + ([] if fix_t  else [0.01])\
-                 + ([] if fix_eta else [0])
-
-            ub = list(ub4) + [a_guess*1.05]              \
-                 + ([] if fix_s  else [0.01])   \
-                 + ([] if fix_t  else [0.1])   \
-                 + ([] if fix_eta else [1])
+            p0 = [a0_hat, b0_hat, a_hkl_hat, b_hkl_hat, a_guess]
+            lb = list(lb4) + [a_guess * 0.95]
+            ub = list(ub4) + [a_guess * 1.05]
+            for name, fixed, value in (
+                ("s", fix_s, s_val),
+                ("t", fix_t, t_val),
+                ("eta", fix_eta, eta_val),
+            ):
+                if not fixed:
+                    p0.append(initial_value_within_bounds(value, parameter_bounds[name]))
+                    lb.append(parameter_bounds[name][0])
+                    ub.append(parameter_bounds[name][1])
 
             # ----------------- inside Region-3: helper -----------------
             def func_r3(x, *params):

@@ -2,6 +2,12 @@
 
 All notable user-facing changes to NEAT are recorded here.
 
+## 4.8.2 - 2026-08-20
+
+- Added shared user-configurable lower and upper bounds for fitting parameters
+  `s`, `t` and `eta`.
+- Applied the same bounds to individual-edge, full-pattern and batch fitting.
+
 ## 4.8.1 - 2026-07-18
 
 ### Changed

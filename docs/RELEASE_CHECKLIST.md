@@ -1,65 +1,38 @@
-# NEAT 4.8.1 release checklist
+# NEAT release checklist
 
-## Automated checks completed locally
+1. Create an issue and implement the scoped change on a branch. Open a PR and
+   let CI complete.
+2. Merge the reviewed PR into `main`. Confirm the changelog and the single
+   package version in `pyproject.toml` are ready for release.
+3. Tag the already-merged commit as `vX.Y.Z`, where `X.Y.Z` exactly matches the
+   installed NEAT package metadata, then push the tag.
+4. The release workflow verifies both invariants before building: the tagged
+   commit is contained in `main`, and the tag version matches package metadata.
+   It then installs dependencies, runs tests, prepares shared access, builds
+   with PyInstaller, smoke-tests the packaged executable, creates the ZIP,
+   uploads the artifact, and publishes the GitHub release.
+5. Download the published ZIP and perform a final launch check. Test the exact
+   candidate at `dist/NEAT/NEAT.exe`, not the source checkout.
 
-- [x] Version is `4.8.1` in the package and project metadata.
-- [x] Full unit suite passes (`171` tests).
-- [x] Ruff critical-error checks pass.
-- [x] Mypy checks for `NEAT/core` pass.
-- [x] `git diff --check` passes.
-- [x] No API-key-shaped secrets were found in release sources.
-- [x] Windows one-folder package builds successfully.
-- [x] Packaged smoke test loads provider adapters, keyring and all `149`
-  approved knowledge sections.
-- [x] Packaged BM25 retrieval fallback returns results without an API call.
-- [x] Packaged smoke test confirms automatic shared access is configured.
+## Manual packaged acceptance
 
-## Manual acceptance checks required before tagging
+- Launch the packaged `NEAT.exe`, open representative FITS/TIFF data, and run
+  a short preprocessing → fitting → post-processing workflow.
+- Verify saved outputs and image orientation, then open and exercise the AI
+  Assistant. Confirm core NEAT remains usable without network access.
+- Preferably test the release ZIP on a clean Windows user or machine. After
+  publication, download the GitHub Release ZIP and repeat the final launch
+  check.
 
-Test the exact candidate at `dist/NEAT/NEAT.exe`, not the source checkout.
+## Recovery before publication
 
-- [ ] Launch NEAT and confirm the splash screen, main window and **AI
-  Assistant** menu open normally.
-- [ ] Open representative FITS/TIFF data and perform one short preprocessing,
-  fitting and post-processing workflow. Confirm saved image orientation and
-  output folders are correct.
-- [ ] Open **AI Assistant > Settings**. Confirm no personal key is displayed in
-  plain text and a saved/environment key is reported only by availability.
-- [ ] Ask at least three known NEAT questions. Confirm the answers are grounded,
-  citations open the correct bundled sections, and unsupported details are not
-  invented. One good test is **Explain current screen** from a fitting screen.
-- [ ] If personal cloud access is part of the release, test one provider with a
-  low-cost request. This is a real, billable API call.
-- [ ] If shared access is part of the release, keep the laptop server and
-  Tailscale running and test the freshly downloaded ZIP on a clean Windows user
-  without shared-access environment variables. Confirm shared access is enabled
-  automatically and the global daily quota message is correct.
-- [ ] If local-model support is part of the release, test one installed Ollama
-  or LM Studio model. This is optional when no supported local server is
-  available.
-- [ ] Disconnect the network and verify core NEAT functions still work. The AI
-  assistant should show a useful provider error; bundled document retrieval
-  must not crash NEAT.
-- [ ] Preferably unzip and test the candidate under a different Windows user or
-  a clean Windows machine without the source virtual environment.
-- [ ] Review `CHANGELOG.md`, the README release link and the user-manual AI
-  section for public wording.
+If the workflow fails before publishing, fix the issue on a new PR, merge it
+to `main`, and create a new tag for the corrected commit. Do not retag or
+publish a commit that is not in `main`; a mismatched tag or package version
+must be corrected before retrying.
 
-## Known release-candidate observation
+## Packaging note
 
-The locally built Python 3.13 package cannot initialize packaged ONNX Runtime,
-so it uses the tested BM25 document-retrieval fallback. This does not disable
-the assistant. The official GitHub release workflow builds with Python 3.11
-and repeats the packaged smoke test; semantic retrieval remains optional in
-either case.
-
-## Publication gate
-
-Only after the manual checks pass:
-
-1. commit the reviewed release files;
-2. push the release commit;
-3. create and push tag `v4.8.1`;
-4. wait for the GitHub release workflow to pass;
-5. download the produced `NEATv4.8.1.zip` and perform a final launch check;
-6. publish/announce the release.
+The local Python 3.13 package may be unable to initialise packaged ONNX
+Runtime. The release smoke test verifies the supported BM25 retrieval fallback;
+this does not claim that semantic ONNX retrieval is available in the package.

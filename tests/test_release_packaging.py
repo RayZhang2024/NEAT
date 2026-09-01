@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import unittest
+from importlib.metadata import version
 from pathlib import Path
 import tomllib
 
@@ -19,10 +20,11 @@ class ReleasePackagingTests(unittest.TestCase):
         project = tomllib.loads(
             (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(NEAT.__version__, "4.8.1")
-        self.assertEqual(project["project"]["version"], NEAT.__version__)
+        project_version = project["project"]["version"]
+        self.assertEqual(NEAT.__version__, version("NEAT"))
+        self.assertEqual(project_version, NEAT.__version__)
         self.assertIn(
-            "## 4.8.1",
+            f"## {project_version}",
             (PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
         )
 
@@ -58,12 +60,18 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("NEAT_RELEASE_SMOKE_RESULT", workflow)
         self.assertIn("tools.prepare_public_shared_access", workflow)
         self.assertIn("NEAT_SHARED_PUBLIC_ACCESS_TOKEN", workflow)
+        self.assertIn('python-version: "3.13"', workflow)
+        self.assertIn("fetch-depth: 0", workflow)
+        self.assertIn("git merge-base --is-ancestor", workflow)
+        self.assertIn("does not match release tag", workflow)
+        self.assertIn("tools.check_release_version", workflow)
 
     def test_test_workflow_installs_dependencies_used_by_full_suite(self) -> None:
         workflow = (PROJECT_ROOT / ".github/workflows/tests.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn(".[assistant,assistant-server]", workflow)
+        self.assertEqual(workflow.count('python-version: "3.13"'), 3)
 
     def test_spec_bundles_approved_knowledge_and_dynamic_adapters(self) -> None:
         specification = (PROJECT_ROOT / "NEAT.spec").read_text(encoding="utf-8")
@@ -76,6 +84,7 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn('"langchain-google-genai"', specification)
         self.assertIn('"langchain-chroma"', specification)
         self.assertIn('"keyring"', specification)
+        self.assertIn('"NEAT"', specification)
         self.assertNotIn("collect_all(", specification)
 
 

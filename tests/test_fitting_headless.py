@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 import os
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -8,6 +9,11 @@ import h5py
 from PIL import Image
 
 from NEAT.core import fitting_function_3
+from NEAT.core.fitting import (
+    DEFAULT_FITTING_PARAMETER_BOUNDS,
+    initial_value_within_bounds,
+    normalize_fitting_parameter_bounds,
+)
 from NEAT.ui.mixins.fitting import FittingMixin
 from NEAT.workers.batch import (
     get_nexus_image_stack_info,
@@ -125,6 +131,103 @@ class _HeadlessFitting(FittingMixin):
 
 
 class TestFittingHeadless(unittest.TestCase):
+    def test_fitting_parameter_bounds_defaults_and_custom_values(self):
+        self.assertEqual(
+            normalize_fitting_parameter_bounds(),
+            DEFAULT_FITTING_PARAMETER_BOUNDS,
+        )
+        self.assertEqual(
+            normalize_fitting_parameter_bounds(
+                {
+                    "s": {"lower": 0.002, "upper": 0.004},
+                    "t": (0.03, 0.06),
+                    "eta": (0.2, 0.7),
+                }
+            ),
+            {"s": (0.002, 0.004), "t": (0.03, 0.06), "eta": (0.2, 0.7)},
+        )
+
+    def test_fitting_parameter_bounds_reject_invalid_values(self):
+        invalid_bounds = (
+            {"s": (0.01, 0.01)},
+            {"t": (0.0, 0.1)},
+            {"eta": (-0.1, 0.5)},
+            {"eta": (0.2, 1.1)},
+        )
+        for bounds in invalid_bounds:
+            with self.subTest(bounds=bounds):
+                with self.assertRaises(ValueError):
+                    normalize_fitting_parameter_bounds(bounds)
+
+    def test_initial_fitting_values_are_clipped_to_configured_bounds(self):
+        self.assertEqual(initial_value_within_bounds(-1.0, (0.002, 0.004)), 0.002)
+        self.assertEqual(initial_value_within_bounds(1.0, (0.002, 0.004)), 0.004)
+        self.assertEqual(initial_value_within_bounds(float("nan"), (0.2, 0.6)), 0.4)
+
+    def test_fit_region_applies_custom_fitting_parameter_bounds(self):
+        obj = _HeadlessFitting()
+        wavelengths = np.linspace(1.0, 2.2, 1600)
+        hkl = (1, 1, 0)
+        a_lattice = 1.2
+        regions = ((1.2, 1.35), (1.4, 1.55), (1.55, 1.95))
+        intensities = fitting_function_3(
+            wavelengths,
+            0.3,
+            0.2,
+            0.15,
+            0.07,
+            0.006,
+            0.05,
+            0.35,
+            [hkl],
+            *regions[2],
+            "bcc",
+            {"a": a_lattice},
+        )
+        row_data = {
+            "hkl": hkl,
+            "d": None,
+            "regions": [
+                {"min_wavelength": regions[1][0], "max_wavelength": regions[1][1]},
+                {"min_wavelength": regions[0][0], "max_wavelength": regions[0][1]},
+                {"min_wavelength": regions[2][0], "max_wavelength": regions[2][1]},
+            ],
+            "s": 0.006,
+            "t": 0.05,
+            "eta": 0.35,
+        }
+        configured_bounds = {
+            "s": (0.002, 0.004),
+            "t": (0.03, 0.04),
+            "eta": (0.2, 0.3),
+        }
+        calls = []
+
+        def capture_curve_fit(function, x_values, y_values, p0, bounds=None, **kwargs):
+            calls.append((list(p0), bounds))
+            p0_array = np.asarray(p0, dtype=float)
+            return p0_array, np.eye(len(p0_array))
+
+        with patch("NEAT.ui.mixins.fitting.curve_fit", side_effect=capture_curve_fit):
+            result = obj.fit_region(
+                0,
+                skip_ui_updates=True,
+                row_data=row_data,
+                wavelengths=wavelengths,
+                intensities=intensities,
+                fit_flags=(False, False, False),
+                selected_phase="Fe_bcc",
+                structure_type="bcc",
+                lattice_params={"a": a_lattice},
+                fitting_parameter_bounds=configured_bounds,
+            )
+
+        self.assertIsInstance(result, dict)
+        initial_values, (lower, upper) = calls[-1]
+        self.assertEqual(lower[-3:], [0.002, 0.03, 0.2])
+        self.assertEqual(upper[-3:], [0.004, 0.04, 0.3])
+        self.assertEqual(initial_values[-3:], [0.004, 0.04, 0.3])
+
     def test_manual_wavelength_anchors_interpolate_and_extend_to_stack_edges(self):
         obj = _HeadlessFitting()
         obj.images = [object()] * 5
