@@ -4,10 +4,15 @@ from pathlib import Path
 
 import numpy as np
 
-from NEAT.workers.batch import BatchFitEdgesWorker
+from NEAT.workers.batch import (
+    BatchFitWorker,
+    BatchFitEdgesWorker,
+    _representative_pixel_is_valid,
+    _sample_valid_pixel_mask,
+)
 
 
-def _make_edges_worker(folder):
+def _make_edges_worker(folder, images=None):
     fit_context = {
         "bragg_rows": [
             {
@@ -29,7 +34,7 @@ def _make_edges_worker(folder):
     }
     return BatchFitEdgesWorker(
         parent=object(),
-        images=[np.zeros((5, 5), dtype=np.float32)],
+        images=images or [np.ones((5, 5), dtype=np.float32)],
         wavelengths=np.array([1.0]),
         fit_context=fit_context,
         min_x=0,
@@ -65,6 +70,111 @@ class _CancellingIndividualFit(_SuccessfulIndividualFit):
 
 
 class TestBatchMappingOutputs(unittest.TestCase):
+    def test_representative_pixel_requires_finite_positive_signal(self):
+        valid = [np.array([[0.0, 1.0]], dtype=np.float32)]
+        self.assertTrue(_representative_pixel_is_valid(valid, 0, 1))
+        self.assertFalse(_representative_pixel_is_valid(valid, 0, 0))
+
+        invalid = [np.array([[np.nan]], dtype=np.float32)]
+        self.assertFalse(_representative_pixel_is_valid(invalid, 0, 0))
+
+    def test_sample_mask_blocks_interpolation_outside_sample(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = np.zeros((5, 5), dtype=np.float32)
+            for row, col in ((0, 0), (0, 4), (4, 0), (4, 4)):
+                image[row, col] = 1.0
+
+            expected_mask = np.zeros((5, 5), dtype=bool)
+            expected_mask[0, 0] = expected_mask[0, 4] = True
+            expected_mask[4, 0] = expected_mask[4, 4] = True
+            np.testing.assert_array_equal(
+                _sample_valid_pixel_mask([image]), expected_mask
+            )
+
+            worker = _make_edges_worker(Path(tmp), images=[image])
+            self.assertFalse(worker.sample_valid_pixel_mask[2, 2])
+            worker.a_array[0, 0, 0] = 0.0
+            worker.a_array[0, 4, 0] = 4.0
+            worker.a_array[4, 0, 0] = 4.0
+            worker.a_array[4, 4, 0] = 8.0
+
+            worker.interpolate_results()
+
+            self.assertTrue(np.isnan(worker.a_array[2, 2, 0]))
+
+    def test_invalid_representative_center_skips_individual_fit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _make_edges_worker(Path(tmp))
+            worker.images = [np.zeros((5, 5), dtype=np.float32)]
+            worker.max_x = 1
+            worker.max_y = 1
+            worker.total_boxes = 1
+
+            worker.run()
+
+            self.assertTrue(worker.invalid_center_mask[0, 0])
+            self.assertTrue(np.isnan(worker.a_array[0, 0, 0]))
+
+    def test_invalid_representative_center_skips_pattern_fit(self):
+        class UnexpectedPatternFit:
+            def fit_full_pattern_core(self, **_kwargs):
+                raise AssertionError("invalid representative center was fitted")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = BatchFitWorker(
+                parent=UnexpectedPatternFit(),
+                images=[np.zeros((5, 5), dtype=np.float32)],
+                wavelengths=np.array([1.0]),
+                fit_context={},
+                min_x=0,
+                max_x=1,
+                min_y=0,
+                max_y=1,
+                box_width=1,
+                box_height=1,
+                step_x=1,
+                step_y=1,
+                total_boxes=1,
+                interpolation_enabled=False,
+                work_directory=tmp,
+            )
+
+            worker.run()
+
+            self.assertTrue(worker.invalid_center_mask[0, 0])
+
+    def test_pattern_interpolation_leaves_outside_sample_nan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = np.zeros((5, 5), dtype=np.float32)
+            for row, col in ((0, 0), (0, 4), (4, 0), (4, 4)):
+                image[row, col] = 1.0
+            worker = BatchFitWorker(
+                parent=object(),
+                images=[image],
+                wavelengths=np.array([1.0]),
+                fit_context={},
+                min_x=0,
+                max_x=5,
+                min_y=0,
+                max_y=5,
+                box_width=1,
+                box_height=1,
+                step_x=2,
+                step_y=2,
+                total_boxes=9,
+                interpolation_enabled=True,
+                work_directory=tmp,
+            )
+            array = np.full((5, 5), np.nan)
+            array[0, 0], array[0, 4] = 0.0, 4.0
+            array[4, 0], array[4, 4] = 4.0, 8.0
+            worker.param_arrays = {"a": array.copy()}
+            worker.param_unc_arrays = {"a": array.copy()}
+
+            worker.interpolate_results()
+
+            self.assertTrue(np.isnan(worker.param_arrays["a"][2, 2]))
+
     def test_individual_edge_worker_accepts_more_than_five_valid_edges(self):
         with tempfile.TemporaryDirectory() as tmp:
             worker = _make_edges_worker(Path(tmp))

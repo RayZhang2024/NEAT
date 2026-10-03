@@ -74,6 +74,26 @@ from scipy.optimize import curve_fit, least_squares
 from ..core import calculate_x_hkl_general, fitting_function_3
 
 
+def _representative_pixel_is_valid(images, row, col):
+    """Return whether a mapping center has any usable positive intensity."""
+
+    values = np.asarray([image[row, col] for image in images], dtype=float)
+    return bool(np.any(np.isfinite(values) & (values > 0)))
+
+
+def _sample_valid_pixel_mask(images):
+    """Return the spatial mask of pixels with any finite positive signal."""
+
+    if len(images) == 0:
+        return np.zeros((0, 0), dtype=bool)
+
+    mask = np.zeros(np.asarray(images[0]).shape, dtype=bool)
+    for image in images:
+        image_array = np.asarray(image)
+        mask |= np.isfinite(image_array) & (image_array > 0)
+    return mask
+
+
 def _decode_hdf5_attr(value):
     if isinstance(value, bytes):
         return value.decode(errors="ignore")
@@ -551,6 +571,10 @@ class BatchFitEdgesWorker(QThread):
         # --- NEW: add a 3D array for edge heights ---
         self.height_array = None
         self.width_array = None
+        self.invalid_center_mask = np.zeros(
+            (self.image_height, self.image_width), dtype=bool
+        )
+        self.sample_valid_pixel_mask = _sample_valid_pixel_mask(self.images)
 
         self.initialize_arrays()
 
@@ -618,6 +642,14 @@ class BatchFitEdgesWorker(QThread):
                 # We'll store the final fit at the center pixel
                 center_row = row_min + self.box_height // 2
                 center_col = col_min + self.box_width // 2
+
+                if not _representative_pixel_is_valid(
+                    self.images, center_row, center_col
+                ):
+                    self.invalid_center_mask[center_row, center_col] = True
+                    for edge_idx in range(self.num_edges):
+                        self.assign_nan_to_pixel(center_row, center_col, edge_idx)
+                    continue
 
                 # For each valid row => do fit_region
                 for i, row_cfg in enumerate(self.valid_row_configs):
@@ -986,13 +1018,14 @@ class BatchFitEdgesWorker(QThread):
         )
         area_mask = np.zeros((self.image_height, self.image_width), dtype=bool)
         area_mask[self.min_y:self.max_y, self.min_x:self.max_x] = True
+        interpolation_target = area_mask & self.sample_valid_pixel_mask
     
         # ------------------------------------------------------------
         # Helper with robust fallback
         # ------------------------------------------------------------
         def interpolate_2d(arr, edge_id, label):
-            """Return a copy of arr where NaNs inside area_mask are filled."""
-            mask_valid = ~np.isnan(arr) & area_mask
+            """Fill NaNs only inside the valid sample part of the ROI."""
+            mask_valid = ~np.isnan(arr) & interpolation_target
             n_points   = np.count_nonzero(mask_valid)
     
             if n_points < 4:                     # too few for Qhull
@@ -1007,7 +1040,7 @@ class BatchFitEdgesWorker(QThread):
             try:
                 interp_vals = griddata(
                     pts, vals,
-                    (grid_x[area_mask], grid_y[area_mask]),
+                    (grid_x[interpolation_target], grid_y[interpolation_target]),
                     method='linear')
             except (QhullError, ValueError) as err:
                 # Fall back to safer 'nearest' method
@@ -1017,11 +1050,11 @@ class BatchFitEdgesWorker(QThread):
                     f"({err.__class__.__name__}) – using nearest neighbour.")
                 interp_vals = griddata(
                     pts, vals,
-                    (grid_x[area_mask], grid_y[area_mask]),
+                    (grid_x[interpolation_target], grid_y[interpolation_target]),
                     method='nearest')
     
             new_arr = arr.copy()
-            new_arr[area_mask] = interp_vals
+            new_arr[interpolation_target] = interp_vals
             return new_arr
     
         # ------------------------------------------------------------
@@ -1048,7 +1081,27 @@ class BatchFitEdgesWorker(QThread):
             self.height_array[:, :, i]  = interpolate_2d(self.height_array[:, :, i], i, "height")
             self.width_array[:, :, i]  = interpolate_2d(self.width_array[:, :, i], i, "width")
 
+        self._restore_invalid_centers()
+
         self.message.emit("Interpolation (edges) completed successfully.")
+
+    def _restore_invalid_centers(self):
+        """Keep centers with invalid representative pixels as NaN."""
+
+        for array in (
+            self.a_array,
+            self.s_array,
+            self.t_array,
+            self.eta_array,
+            self.width_array,
+            self.a_unc_array,
+            self.s_unc_array,
+            self.t_unc_array,
+            self.eta_unc_array,
+            self.height_array,
+        ):
+            if array is not None:
+                array[self.invalid_center_mask, ...] = np.nan
 
 class BatchFitWorker(QThread):
     progress_updated = pyqtSignal(int)
@@ -1127,6 +1180,10 @@ class BatchFitWorker(QThread):
         # New array for edge heights:
         self.height_array = None
         self.width_array = None
+        self.invalid_center_mask = np.zeros(
+            (self.image_height, self.image_width), dtype=bool
+        )
+        self.sample_valid_pixel_mask = _sample_valid_pixel_mask(self.images)
 
     @staticmethod
     def _safe_float(widget_or_value, default=""):
@@ -1173,6 +1230,13 @@ class BatchFitWorker(QThread):
 
                 center_row = row_min + self.box_height // 2
                 center_col = col_min + self.box_width // 2
+
+                if not _representative_pixel_is_valid(
+                    self.images, center_row, center_col
+                ):
+                    self.invalid_center_mask[center_row, center_col] = True
+                    self.assign_nan_to_pixel(center_row, center_col)
+                    continue
 
                 # Call fit_full_pattern_core
                 try:
@@ -1622,16 +1686,22 @@ class BatchFitWorker(QThread):
         grid_x, grid_y = np.meshgrid(np.arange(W), np.arange(H))
         area_mask = np.zeros((H, W), dtype=bool)
         area_mask[self.min_y:self.max_y, self.min_x:self.max_x] = True
+        interpolation_target = area_mask & self.sample_valid_pixel_mask
 
         def interpolate_2d(array_2d):
-            mask_valid = ~np.isnan(array_2d) & area_mask
+            mask_valid = ~np.isnan(array_2d) & interpolation_target
             if not np.any(mask_valid):
                 return array_2d
             pts = np.column_stack((grid_x[mask_valid], grid_y[mask_valid]))
             vals = array_2d[mask_valid]
-            interp_area = griddata(pts, vals, (grid_x[area_mask], grid_y[area_mask]), method='linear')
+            interp_area = griddata(
+                pts,
+                vals,
+                (grid_x[interpolation_target], grid_y[interpolation_target]),
+                method='linear',
+            )
             array_new = array_2d.copy()
-            array_new[area_mask] = interp_area
+            array_new[interpolation_target] = interp_area
             return array_new
 
         # lattice param arrays
@@ -1665,7 +1735,29 @@ class BatchFitWorker(QThread):
                     h_slice = self.height_array[:, :, i]
                     self.height_array[:, :, i] = interpolate_2d(h_slice)
 
+        self._restore_invalid_centers()
+
         self.message.emit("Interpolation completed successfully.")
+
+    def _restore_invalid_centers(self):
+        """Keep centers with invalid representative pixels as NaN."""
+
+        for array in self.param_arrays.values():
+            array[self.invalid_center_mask] = np.nan
+        for array in self.param_unc_arrays.values():
+            array[self.invalid_center_mask] = np.nan
+        for array in (
+            self.s_array,
+            self.s_unc_array,
+            self.t_array,
+            self.t_unc_array,
+            self.eta_array,
+            self.eta_unc_array,
+            self.width_array,
+            self.height_array,
+        ):
+            if array is not None:
+                array[self.invalid_center_mask, ...] = np.nan
 
 class ImageLoadWorker(QThread):
     progress_updated = pyqtSignal(int)  # Emits progress percentage

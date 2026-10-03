@@ -159,6 +159,37 @@ class TestOutlierFilteringWorker(unittest.TestCase):
             )
             self.assertIn("00002,2,2,10.0000,1.0000", report)
 
+    def test_positive_spike_detection_handles_image_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            image = np.ones((3, 3), dtype=np.float32)
+            image[0, 0] = 10.0
+            run = {"folder_path": tmp, "images": {"00003": image}}
+
+            OutlierFilteringWorker([run], str(output), "clean").run()
+
+            cleaned = load_image_file(output / "clean_00003.fits")
+            self.assertEqual(float(cleaned[0, 0]), 1.0)
+            report = (output / "clean_outlier_report.csv").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("00003,0,0,10.0000,1.0000", report)
+
+    def test_adjacent_spikes_keep_sequential_raster_replacement_behavior(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "output"
+            image = np.ones((7, 7), dtype=np.float32)
+            image[3, 3] = 100.0
+            image[3, 4] = 100.0
+            run = {"folder_path": tmp, "images": {"00004": image}}
+
+            OutlierFilteringWorker([run], str(output), "clean").run()
+
+            cleaned = load_image_file(output / "clean_00004.fits")
+            self.assertAlmostEqual(float(cleaned[3, 3]), 5.125)
+            self.assertAlmostEqual(float(cleaned[3, 4]), 1.171875)
+
 
 class TestNormalisationWorker(unittest.TestCase):
     def test_window_ranges_are_enforced(self):

@@ -1,6 +1,7 @@
 """Worker threads for preprocessing and filtering tasks."""
 
 import gc
+import heapq
 import os
 import re
 import shutil
@@ -9,6 +10,7 @@ import numpy as np
 import pandas as pd
 import psutil
 from PIL import Image, TiffImagePlugin
+from scipy import ndimage
 from PyQt5.QtCore import Qt, QEventLoop, QThread, pyqtSignal
 
 from .batch import get_raden_tiff_stack_info, load_image_file, write_fits_image_file
@@ -143,24 +145,84 @@ class OutlierFilteringWorker(QThread):
             )
             cleaned += 1
 
-        # Detect positive spikes after invalid-value repair. The scan is
-        # sequential, matching the existing replacement behavior.
+        # Cache clipped 5x5 sums and valid-pixel counts. The raster scan below
+        # updates these caches when it replaces a spike, preserving the old
+        # scan-order behavior without allocating a neighborhood/mask for every
+        # pixel.
+        valid = np.isfinite(img) & (img > 0)
+        positive_values = np.where(valid, img, 0.0).astype(np.float64)
+        neighbourhood_sum = ndimage.uniform_filter(
+            positive_values, size=5, mode="constant", cval=0.0
+        ) * 25.0
+        neighbourhood_count = ndimage.uniform_filter(
+            valid.astype(np.float64), size=5, mode="constant", cval=0.0
+        ) * 25.0
+
+        neighbor_count = neighbourhood_count - valid
+        with np.errstate(divide="ignore", invalid="ignore"):
+            neighbor_mean = (neighbourhood_sum - positive_values) / neighbor_count
+        tolerance = np.finfo(np.float64).eps * 32.0 * np.maximum(
+            1.0, np.abs(img)
+        )
+        candidate_mask = (
+            valid
+            & (neighbor_count > 0.0)
+            & (img >= 10.0 * neighbor_mean - tolerance)
+        )
+        candidates = [tuple(position) for position in np.argwhere(candidate_mask)]
+        heapq.heapify(candidates)
+        queued = candidate_mask.copy()
         height, width = img.shape
-        for y in range(height):
-            for x in range(width):
-                original = float(img[y, x])
-                if not np.isfinite(original) or original <= 0:
-                    continue
-                neighbor_mean = self._positive_neighbor_mean(
-                    img, y, x, radius=2
+
+        while candidates:
+            y, x = heapq.heappop(candidates)
+            queued[y, x] = False
+            original = float(img[y, x])
+            replacement = self._positive_neighbor_mean(img, y, x, radius=2)
+            if replacement is None or original < 10.0 * replacement:
+                continue
+
+            img[y, x] = replacement
+            records.append(
+                f"{suffix},{x},{y},{original:.4f},{replacement:.4f}"
+            )
+            cleaned += 1
+
+            # Every cached 5x5 window containing this pixel changes by the
+            # same delta. Later raster positions then see exactly the values
+            # the original sequential scan would have seen.
+            y0, y1 = max(0, y - 2), min(height, y + 3)
+            x0, x1 = max(0, x - 2), min(width, x + 3)
+            neighbourhood_sum[y0:y1, x0:x1] += replacement - original
+
+            # Replacements lower a spike to its neighbor mean. Only candidate
+            # positions in these nearby windows can newly cross the threshold.
+            local_y, local_x = np.mgrid[y0:y1, x0:x1]
+            later = (local_y > y) | ((local_y == y) & (local_x > x))
+            local_counts = neighbor_count[y0:y1, x0:x1]
+            local_values = img[y0:y1, x0:x1]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                local_means = (
+                    neighbourhood_sum[y0:y1, x0:x1] - local_values
+                ) / local_counts
+            local_tolerance = np.finfo(np.float64).eps * 32.0 * np.maximum(
+                1.0, np.abs(local_values)
+            )
+            newly_eligible = (
+                later
+                & valid[y0:y1, x0:x1]
+                & ~queued[y0:y1, x0:x1]
+                & (local_counts > 0.0)
+                & (
+                    local_values
+                    >= 10.0 * local_means - local_tolerance
                 )
-                if neighbor_mean is None or original < 10.0 * neighbor_mean:
-                    continue
-                img[y, x] = neighbor_mean
-                records.append(
-                    f"{suffix},{x},{y},{original:.4f},{neighbor_mean:.4f}"
-                )
-                cleaned += 1
+            )
+            for local_row, local_col in np.argwhere(newly_eligible):
+                candidate_y = y0 + int(local_row)
+                candidate_x = x0 + int(local_col)
+                queued[candidate_y, candidate_x] = True
+                heapq.heappush(candidates, (candidate_y, candidate_x))
 
         if cleaned == 0:
             self.message.emit(f"Frame {suffix}: no outliers detected")
