@@ -5892,7 +5892,7 @@ class FittingMixin:
 
         # Start the batch fitting worker
         self.batch_fit_worker = BatchFitWorker(
-            parent=self,
+            fitting_engine=FittingEngine(),
             images=self.images,
             wavelengths=self.wavelengths,
             fit_context=fit_context,

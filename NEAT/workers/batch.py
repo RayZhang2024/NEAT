@@ -1,5 +1,6 @@
 """Worker threads for batch fitting tasks."""
 
+import copy
 import datetime
 import gc
 import json
@@ -1114,7 +1115,7 @@ class BatchFitWorker(QThread):
 
     def __init__(
         self,
-        parent,
+        fitting_engine,
         images,
         wavelengths,
         fit_context,
@@ -1134,10 +1135,12 @@ class BatchFitWorker(QThread):
         fix_eta=False
     ):
         super().__init__()
-        self.parent = parent
+        self.fitting_engine = fitting_engine
         self.images = images
         self.wavelengths = wavelengths
-        self.fit_context = fit_context or {}
+        # The fitting configuration is small and nested; detach it from GUI
+        # state while leaving the potentially large image stack shared.
+        self.fit_context = copy.deepcopy(fit_context or {})
         self.min_x = min_x
         self.max_x = max_x
         self.min_y = min_y
@@ -1241,18 +1244,17 @@ class BatchFitWorker(QThread):
                     self.assign_nan_to_pixel(center_row, center_col)
                     continue
 
-                # Call fit_full_pattern_core
+                # Fit using the explicitly injected, GUI-independent engine.
                 try:
-                    result_dict, error_msg = self.parent.fit_full_pattern_core(
+                    result_dict, error_msg = self.fitting_engine.fit_full_pattern(
+                        wavelengths=self.wavelengths,
+                        intensities=intensities,
+                        fit_config=self.fit_context,
                         fix_s=self.fix_s,
                         fix_t=self.fix_t,
                         fix_eta=self.fix_eta,
                         max_nfev=300,
                         curve_fit_maxfev=300,
-                        fit_context=self.fit_context,
-                        wavelengths=self.wavelengths,
-                        intensities=intensities,
-                        apply_lattice_update=False,
                     )
                 except Exception as e:
                     error_msg = f"Unexpected error during fitting: {e}"
@@ -1260,7 +1262,9 @@ class BatchFitWorker(QThread):
 
                 # Surface the first few failures so users see why no fits succeed.
                 if (error_msg or not result_dict or not result_dict.get("success", False)) and failure_reported < 5:
-                    detail = error_msg or result_dict.get("message") if result_dict else ""
+                    detail = error_msg or (
+                        result_dict.get("message", "") if result_dict else ""
+                    )
                     self.message.emit(
                         f"Fit failed at box centered ({center_col},{center_row}): {detail or 'unknown reason'}"
                     )

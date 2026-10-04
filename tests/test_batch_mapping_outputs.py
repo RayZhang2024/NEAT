@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from NEAT.services.fitting_engine import FittingEngine
 from NEAT.workers.batch import (
     BatchFitWorker,
     BatchFitEdgesWorker,
@@ -117,12 +118,12 @@ class TestBatchMappingOutputs(unittest.TestCase):
 
     def test_invalid_representative_center_skips_pattern_fit(self):
         class UnexpectedPatternFit:
-            def fit_full_pattern_core(self, **_kwargs):
+            def fit_full_pattern(self, **_kwargs):
                 raise AssertionError("invalid representative center was fitted")
 
         with tempfile.TemporaryDirectory() as tmp:
             worker = BatchFitWorker(
-                parent=UnexpectedPatternFit(),
+                fitting_engine=UnexpectedPatternFit(),
                 images=[np.zeros((5, 5), dtype=np.float32)],
                 wavelengths=np.array([1.0]),
                 fit_context={},
@@ -149,7 +150,7 @@ class TestBatchMappingOutputs(unittest.TestCase):
             for row, col in ((0, 0), (0, 4), (4, 0), (4, 4)):
                 image[row, col] = 1.0
             worker = BatchFitWorker(
-                parent=object(),
+                fitting_engine=FittingEngine(),
                 images=[image],
                 wavelengths=np.array([1.0]),
                 fit_context={},
