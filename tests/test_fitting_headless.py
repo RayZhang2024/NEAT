@@ -715,6 +715,7 @@ class TestFittingHeadless(unittest.TestCase):
 
     def test_fit_full_pattern_core_with_context(self):
         obj = _HeadlessFitting()
+        obj.lattice_params = {"a": 1.19}
 
         wavelengths = np.linspace(1.0, 2.2, 1600)
         hkl = (1, 1, 0)
@@ -779,6 +780,7 @@ class TestFittingHeadless(unittest.TestCase):
         self.assertIn(hkl, result["edge_widths"])
         self.assertTrue(np.isfinite(result["edge_heights"][hkl]))
         self.assertTrue(np.isfinite(result["edge_widths"][hkl]))
+        self.assertEqual(obj.lattice_params["a"], 1.19)
 
         fixed_result, fixed_error = obj.fit_full_pattern_core(
             fix_s=True,
@@ -795,6 +797,19 @@ class TestFittingHeadless(unittest.TestCase):
         self.assertTrue(np.isnan(fixed_result["s_uncertainties"][hkl]))
         self.assertTrue(np.isnan(fixed_result["t_uncertainties"][hkl]))
         self.assertTrue(np.isnan(fixed_result["eta_uncertainties"][hkl]))
+
+        updated_result, update_error = obj.fit_full_pattern_core(
+            fix_s=True,
+            fix_t=True,
+            fix_eta=True,
+            max_nfev=200,
+            curve_fit_maxfev=5000,
+            fit_context=fit_context,
+            wavelengths=wavelengths,
+            intensities=intensities,
+        )
+        self.assertIsNone(update_error)
+        self.assertAlmostEqual(obj.lattice_params["a"], updated_result["lattice_params"]["a"])
 
     def test_canvas_corner_press_without_ctrl_moves_small_roi(self):
         obj = _HeadlessFitting()
