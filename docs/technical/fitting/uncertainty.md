@@ -9,9 +9,9 @@ verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
 status: code-verified
 instrument_applicability: [general]
 scientific_review: pending
-source_paths: [NEAT/core/fitting.py, NEAT/ui/mixins/fitting.py]
-source_symbols: [calculate_uncertainty_estimator_constant, estimate_uncertainty_parameter, FittingMixin.fit_region, FittingMixin.fit_full_pattern_core]
-test_paths: [tests/test_core_bragg_edges.py, tests/test_fitting_headless.py]
+source_paths: [NEAT/core/fitting.py, NEAT/services/fitting_engine.py, NEAT/ui/mixins/fitting.py]
+source_symbols: [calculate_uncertainty_estimator_constant, estimate_uncertainty_parameter, FittingMixin.fit_region, FittingEngine.fit_full_pattern, FittingMixin.fit_full_pattern_core]
+test_paths: [tests/test_core_bragg_edges.py, tests/test_fitting_engine.py, tests/test_fitting_headless.py]
 ---
 
 # Fitting uncertainty and planning estimator

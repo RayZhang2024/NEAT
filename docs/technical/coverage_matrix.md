@@ -26,7 +26,7 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
 | 3 | Fitting | [Edge Table and windows](fitting/edge_table_windows.md) | fitting table methods | Default-window and derived-window tests | Required | P0 | code-verified |
 | 3 | Fitting | [Pseudo-Voigt model](fitting/pseudo_voigt_model.md) | fitting functions and core helpers | Headless numerical fitting tests | Required | P0 | code-verified |
 | 3 | Fitting | [Individual-edge fitting](fitting/individual_edge_fitting.md) | `fit_region`, staged fitting | Known/unknown phase tests | Required | P0 | code-verified |
-| 3 | Fitting | [Pattern fitting](fitting/pattern_fitting.md) | `fit_full_pattern_core` | Headless pattern-fit test | Required | P0 | code-verified |
+| 3 | Fitting | [Pattern fitting](fitting/pattern_fitting.md) | `FittingEngine.fit_full_pattern`, `FittingMixin.fit_full_pattern_core` adapter | Headless engine and adapter regression tests | Required | P0 | code-verified |
 | 3 | Fitting | [Bounds, fixed parameters and diagnostics](fitting/bounds_diagnostics.md) | fitting UI/core | Fitting and residual helper tests | Required | P0 | code-verified |
 | 3 | Fitting | [Uncertainty estimation](fitting/uncertainty.md) | `core/fitting.py`, estimator dialog | Core estimator and fitting tests | Required | P0 | code-verified |
 | 4 | Mapping | [Mapping ROI, boxes and steps](mapping/mapping_geometry.md) | fitting batch controls | ROI geometry and fitting tests | Sampling guidance | P1 | code-verified |

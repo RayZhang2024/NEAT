@@ -17,8 +17,11 @@ test_paths: []
 # Pattern batch mapping worker
 
 The UI requires an initial full-pattern fit before mapping. For each box, the
-worker sums pixels at every wavelength and calls `fit_full_pattern_core` with
-`max_nfev=300`, baseline `curve_fit` limit 300, and no update to global lattice
+worker sums pixels at every wavelength and calls the MainWindow compatibility
+adapter `FittingMixin.fit_full_pattern_core`, which delegates numerical work to
+`FittingEngine.fit_full_pattern`. The worker still depends on its parent GUI
+object; direct worker-to-engine injection is deferred to Issue #5. Calls use
+`max_nfev=300`, baseline `curve_fit` limit 300, and do not update global lattice
 state.
 
 On the first successful box, it allocates full detector arrays for fitted

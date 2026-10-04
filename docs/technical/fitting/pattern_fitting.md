@@ -9,12 +9,18 @@ verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
 status: code-verified
 instrument_applicability: [known phases]
 scientific_review: pending
-source_paths: [NEAT/ui/mixins/fitting.py]
-source_symbols: [FittingMixin.fit_full_pattern_core, FittingMixin.fit_full_pattern]
-test_paths: [tests/test_fitting_headless.py]
+source_paths: [NEAT/services/fitting_engine.py, NEAT/ui/mixins/fitting.py]
+source_symbols: [FittingEngine.fit_full_pattern, FittingMixin.fit_full_pattern_core, FittingMixin.fit_full_pattern]
+test_paths: [tests/test_fitting_engine.py, tests/test_fitting_headless.py]
 ---
 
 # Multi-edge pattern fitting
+
+`FittingEngine.fit_full_pattern` performs the numerical pattern fit from
+explicit wavelength/intensity arrays and a plain-Python fit-context snapshot.
+The UI-facing `FittingMixin.fit_full_pattern_core` remains a compatibility
+adapter: it snapshots UI inputs, delegates to the engine, and applies the
+successful lattice update when requested.
 
 Pattern fitting requires a supported known structure and its required lattice
 parameters. Valid Edge Table rows with Region 3 data are collected. Each edge’s

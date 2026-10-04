@@ -8,14 +8,21 @@ __author__ = " Ruiyao Zhang "
 # bundles that metadata for the standalone application.
 __version__ = version("NEAT")
 
-# ONNX Runtime must load before PyQt on Windows. PyQt can otherwise load a
-# conflicting DLL first, causing the assistant's local semantic search to fail
-# even though onnxruntime is installed. Keep this optional for core-only installs.
-try:  # pragma: no cover - behavior depends on optional runtime and OS DLL loading
+# Keep the historical ONNX-before-Qt initialization order for assistant users,
+# without importing the GUI for callers that only use numerical services.
+try:  # pragma: no cover - depends on optional runtime and operating system
     import onnxruntime as _onnxruntime  # noqa: F401
 except (ImportError, OSError):
     _onnxruntime = None
 
-from .ui import FitsViewer
-
 __all__ = ["FitsViewer", "__version__"]
+
+
+def __getattr__(name):
+    """Load the GUI lazily so numerical services can be imported headlessly."""
+    if name != "FitsViewer":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from .ui import FitsViewer
+
+    return FitsViewer

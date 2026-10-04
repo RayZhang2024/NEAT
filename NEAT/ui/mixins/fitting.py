@@ -53,7 +53,7 @@ from PyQt5.QtWidgets import (
 )
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.patches import Rectangle
-from scipy.optimize import curve_fit, least_squares
+from scipy.optimize import curve_fit
 
 from ...core import (
     PHASE_DATA,
@@ -67,6 +67,7 @@ from ...core.fitting import (
     initial_value_within_bounds,
     normalize_fitting_parameter_bounds,
 )
+from ...services.fitting_engine import FittingEngine
 from ...workers.batch import (
     BatchFitEdgesWorker,
     BatchFitWorker,
@@ -1621,517 +1622,84 @@ class FittingMixin:
         intensities=None,
         apply_lattice_update=True,
     ):
-        """Core logic for full-pattern fitting supporting multiple crystal structures 
-           and returning parameter uncertainties.
-           
-           max_nfev: iterations for the global least-squares solver (batch uses this).
-           curve_fit_maxfev: optional cap for the region-1/2 curve_fit calls.
-        """
-        STRUCTURE_CONFIG = {
-            "cubic": ["a"],
-            "fcc": ["a"],
-            "bcc": ["a"],
-            "tetragonal": ["a", "c"],
-            "hexagonal": ["a", "c"],
-            "orthorhombic": ["a", "b", "c"]
-        }
-
-        # -------------------------------
-        # 1) Validate structure & params
-        # -------------------------------
-        ctx = fit_context or {}
-        parameter_bounds = self.get_fitting_parameter_bounds(ctx)
-        structure_type = ctx.get("structure_type", getattr(self, "structure_type", "cubic"))
-        if structure_type not in STRUCTURE_CONFIG:
-            return None, f"Unsupported structure type: {structure_type}"
-
-        required_params = STRUCTURE_CONFIG[structure_type]
-        lattice_params = dict(ctx.get("lattice_params", getattr(self, "lattice_params", {})))
-        if not lattice_params:
-            return None, "Lattice parameters not initialized"
-
-        missing_params = [p for p in required_params if p not in lattice_params]
-        if missing_params:
-            return None, f"Missing parameters for {structure_type}: {missing_params}"
-
-        wavelengths_data = self.wavelengths if wavelengths is None else np.asarray(wavelengths)
-        intensities_data = self.intensities if intensities is None else np.asarray(intensities)
-
-        # -------------------------------
-        # 2) Collect valid Bragg edges w/ Region 3 data
-        # -------------------------------
-        if fit_context is not None:
-            source_rows = list(ctx.get("bragg_rows", []))
-            total_edges = len(source_rows)
+        """Compatibility adapter for the GUI-independent full-pattern engine."""
+        if isinstance(fit_context, dict):
+            context = dict(fit_context)
         else:
-            source_rows = None
-            total_edges = self.bragg_table.rowCount()
-        if total_edges == 0:
-            return None, "No Bragg edges to fit"
-
-        bragg_edges = []
-        for row in range(total_edges):
-            if source_rows is None:
+            # Keep the former interactive-path validation messages while
+            # translating the table into the existing plain-data snapshot.
+            table = self.bragg_table
+            for row in range(table.rowCount()):
                 self._sync_derived_region3_bounds(row)
-            if source_rows is not None:
-                row_data = source_rows[row]
-                if not row_data.get("valid"):
-                    continue
-                hkl = row_data.get("hkl")
-                regions = row_data.get("regions")
-                s_val = row_data.get("s", 0.001)
-                t_val = row_data.get("t", 0.01)
-                eta_val = row_data.get("eta", 0.5)
-                if hkl is None or not regions:
-                    continue
-            else:
-                # Parse hkl
-                hkl_item = self.bragg_table.item(row, 0)
+                hkl_item = table.item(row, 0)
                 try:
-                    hkl_str = hkl_item.text().strip('()') if hkl_item else "0,0,0"
-                    h, k, l = map(int, hkl_str.split(','))
-                    hkl = (h, k, l)
+                    hkl_text = hkl_item.text().strip("()") if hkl_item else "0,0,0"
+                    hkl = tuple(map(int, hkl_text.split(",")))
+                    if len(hkl) != 3:
+                        raise ValueError
                 except ValueError:
-                    return None, f"Invalid hkl format in row {row+1}"
+                    return None, f"Invalid hkl format in row {row + 1}"
 
-                # Validate region bounds
-                regions = []
                 for region_num in range(1, 4):
-                    min_w_item = self.bragg_table.item(row, (region_num - 1)*2 + 2)
-                    max_w_item = self.bragg_table.item(row, (region_num - 1)*2 + 3)
+                    min_item = table.item(row, (region_num - 1) * 2 + 2)
+                    max_item = table.item(row, (region_num - 1) * 2 + 3)
                     try:
-                        min_w = float(min_w_item.text())
-                        max_w = float(max_w_item.text())
-                        if min_w >= max_w:
+                        min_wavelength = float(min_item.text())
+                        max_wavelength = float(max_item.text())
+                        if min_wavelength >= max_wavelength:
                             return None, f"Invalid region {region_num} bounds for hkl{hkl}"
-                        regions.append({'min_wavelength': min_w, 'max_wavelength': max_w})
                     except (ValueError, AttributeError):
                         return None, f"Invalid region {region_num} data for hkl{hkl}"
 
-            # Extract region 3 data
-            r3_min, r3_max = regions[2]['min_wavelength'], regions[2]['max_wavelength']
-            mask_r3 = (wavelengths_data >= r3_min) & (wavelengths_data <= r3_max)
-            x_r3 = wavelengths_data[mask_r3]
-            y_r3 = intensities_data[mask_r3]
-            if len(x_r3) == 0:
-                # Skip edges that have no Region 3 coverage
-                continue
-
-            # Fit Region 1 and 2
-            try:
-                # Region 1
-                mask_r1 = (wavelengths_data >= regions[1]['min_wavelength']) & (wavelengths_data <= regions[1]['max_wavelength'])
-                x_r1 = wavelengths_data[mask_r1]
-                y_r1 = intensities_data[mask_r1]
-                p0 = [0,0]
-                lower = [-10, -10]
-                upper = [10, 10]
-
-                cf_kwargs = {}
-                if curve_fit_maxfev is not None:
-                    cf_kwargs["maxfev"] = curve_fit_maxfev
-
-                popt_r1, _ = curve_fit(
-                    fitting_function_1,
-                    x_r1,
-                    y_r1,
-                    p0=p0,
-                    bounds=(lower, upper),
-                    **cf_kwargs,
-                )
-                a0, b0 = popt_r1
-
-                # Region 2
-                mask_r2 = (wavelengths_data >= regions[0]['min_wavelength']) & (wavelengths_data <= regions[0]['max_wavelength'])
-                x_r2 = wavelengths_data[mask_r2]
-                y_r2 = intensities_data[mask_r2]
-                popt_r2, _ = curve_fit(
-                    lambda xx, a, b: fitting_function_2(xx, a, b, a0, b0),
-                    x_r2,
-                    y_r2,
-                    p0=[0, 0],
-                    **cf_kwargs,
-                )
-                a_hkl, b_hkl = popt_r2
-
-            except (RuntimeError, ValueError, TypeError, FloatingPointError) as e:
-                return None, f"Fitting error for hkl{hkl}: {str(e)}"
-
-            if source_rows is None:
-                # Grab s/t from the table
-                s_item = self.bragg_table.item(row, 8)
-                t_item = self.bragg_table.item(row, 9)
-                eta_item = self.bragg_table.item(row, 10)
+                shape_items = [table.item(row, column) for column in (8, 9, 10)]
                 try:
-                    s_val = float(s_item.text()) if s_item else 0.001
-                    t_val = float(t_item.text()) if t_item else 0.01
-                    eta_val=float(eta_item.text()) if eta_item else 0.5
+                    for item in shape_items:
+                        if item is not None:
+                            float(item.text())
                 except ValueError:
                     return None, f"Invalid s/t values for hkl{hkl}"
 
-            # Store edge data
-            bragg_edges.append({
-                'hkl': hkl,
-                'a0': a0,
-                'b0': b0,
-                'a_hkl': a_hkl,
-                'b_hkl': b_hkl,
-                's': s_val,
-                't': t_val,
-                'eta': eta_val,
-                'x_r3': x_r3,
-                'y_r3': y_r3,
-                'regions': regions
-            })
-
-        if not bragg_edges:
-            return None, "No valid edges with Region 3 data"
-
-        # -------------------------------
-        # 3) Prepare global fit params
-        # -------------------------------
-        # Lattice parameters
-        lattice_initial = [lattice_params[p] for p in required_params]
-        lattice_lower = [v * 0.95 for v in lattice_initial]
-        lattice_upper = [v * 1.05 for v in lattice_initial]
-
-
-
-        # s/t
-        s_initial = [e['s'] for e in bragg_edges]
-        t_initial = [e['t'] for e in bragg_edges]
-        eta_initial = [e['eta'] for e in bragg_edges]
-
-        initial_guess = lattice_initial.copy()
-        lower_bounds = lattice_lower.copy()
-        upper_bounds = lattice_upper.copy()
-
-        # ---- (NEW) per-edge a0, b0, a_hkl, b_hkl  ----------------------------
-        for edge in bragg_edges:
-            for key in ("a0", "b0", "a_hkl", "b_hkl"):
-                val = edge[key]
-                half = 1 * max(abs(val), 1)     # symmetric ±50 %, works if val < 0
-                initial_guess.append(val)
-                lower_bounds.append(val - half)
-                upper_bounds.append(val + half)
-        # ----------------------------------------------------------------------
-
-
-
-
-        if not fix_s:
-            for s in s_initial:
-                lower, upper = parameter_bounds["s"]
-                initial_guess.append(initial_value_within_bounds(s, (lower, upper)))
-                lower_bounds.append(lower)
-                upper_bounds.append(upper)
-
-        # Append one shared-bound shape parameter per edge.
-        if not fix_t:
-            for t in t_initial:
-                lower, upper = parameter_bounds["t"]
-                initial_guess.append(initial_value_within_bounds(t, (lower, upper)))
-                lower_bounds.append(lower)
-                upper_bounds.append(upper)
-
-        # ---- eta (0 … 1) ------------------------------------------------
-        if not fix_eta:
-            for eta in eta_initial:
-                lower, upper = parameter_bounds["eta"]
-                initial_guess.append(initial_value_within_bounds(eta, (lower, upper)))
-                lower_bounds.append(lower)
-                upper_bounds.append(upper)
-
-        # Concatenate region 3 data from all edges
-        concatenated_x = np.concatenate([e['x_r3'] for e in bragg_edges])
-        concatenated_y = np.concatenate([e['y_r3'] for e in bragg_edges])
-        edge_indices = np.concatenate([
-            np.full_like(e['x_r3'], i, dtype=int) for i, e in enumerate(bragg_edges)
-        ])
-
-        # -------------------------------
-        # 4)  Residuals   (FIXED INDICES)
-        # -------------------------------
-
-        n_lat   = len(required_params)
-        n_edge  = len(bragg_edges)
-        n_ab    = 4 * n_edge 
-
-
-        def residuals(params):
-            idx = 0
-
-            # lattice ----------------------------------------------------------
-            lattice_dict = dict(zip(required_params, params[:n_lat]))
-            idx += n_lat
-
-            # per-edge (a0, b0, a_hkl, b_hkl) ----------------------------------
-            ab_block = params[idx : idx + n_ab].reshape(n_edge, 4)
-            idx += n_ab
-
-            # s parameters -----------------------------------------------------
-            if not fix_s:
-                s_params = params[idx : idx + n_edge];  idx += n_edge
-            else:
-                s_params = s_initial
-
-            # t parameters -----------------------------------------------------
-            if not fix_t:
-                t_params = params[idx : idx + n_edge];  idx += n_edge
-            else:
-                t_params = t_initial
-
-            # eta parameters ---------------------------------------------------
-            if not fix_eta:
-                eta_params = params[idx : idx + n_edge]
-            else:
-                eta_params = eta_initial
-
-            # build model ------------------------------------------------------
-            model = np.zeros_like(concatenated_y)
-            for edge_idx, edge in enumerate(bragg_edges):
-                mask   = edge_indices == edge_idx
-                x_loc  = concatenated_x[mask]
-
-                a0_fit, b0_fit, a_hkl_fit, b_hkl_fit = ab_block[edge_idx]
-                s_val  = s_params[edge_idx]
-                t_val  = t_params[edge_idx]
-                eta_val= eta_params[edge_idx]
-                r3_min = edge['regions'][2]['min_wavelength']
-                r3_max = edge['regions'][2]['max_wavelength']
-
-                model[mask] = fitting_function_3(
-                    x_loc,
-                    a0_fit, b0_fit, a_hkl_fit, b_hkl_fit,
-                    s_val, t_val, eta_val,
-                    [edge['hkl']], r3_min, r3_max,
-                    structure_type, lattice_dict
+            context = self._build_batch_fit_context()
+            # The former table path used these defaults when a shape-parameter
+            # cell itself was absent (distinct from a present but blank cell).
+            for row_idx, row_data in enumerate(context["bragg_rows"]):
+                for name, column, default in (
+                    ("s", 8, 0.001),
+                    ("t", 9, 0.01),
+                    ("eta", 10, 0.5),
+                ):
+                    if table.item(row_idx, column) is None:
+                        row_data[name] = default
+                row_data["valid"] = bool(
+                    row_data.get("regions")
+                    and (row_data.get("hkl") is not None or context["selected_phase"] == "Unknown_Phase")
+                    and all(row_data.get(name) is not None for name in ("s", "t", "eta"))
                 )
+        context.setdefault("structure_type", getattr(self, "structure_type", "cubic"))
+        context.setdefault("lattice_params", dict(getattr(self, "lattice_params", {})))
+        context["fitting_parameter_bounds"] = self.get_fitting_parameter_bounds(context)
 
-            return concatenated_y - model
+        wavelengths_data = self.wavelengths if wavelengths is None else np.asarray(wavelengths)
+        intensities_data = self.intensities if intensities is None else np.asarray(intensities)
+        result_dict, error_msg = FittingEngine().fit_full_pattern(
+            wavelengths_data,
+            intensities_data,
+            context,
+            fix_s=fix_s,
+            fix_t=fix_t,
+            fix_eta=fix_eta,
+            max_nfev=max_nfev,
+            curve_fit_maxfev=curve_fit_maxfev,
+        )
 
-
-
-        # -------------------------------
-        # 5) Perform optimization
-        # -------------------------------
-        try:
-            result = least_squares(
-                residuals,
-                initial_guess,
-                bounds=(lower_bounds, upper_bounds),
-                max_nfev=max_nfev,
-                verbose=0
-            )
-        except Exception as e:
-            return None, f"Optimization failed: {str(e)}"
-
-        if not result.success:
-            return None, f"Fit did not converge: {result.message}"
-
-
-
-        # -------------------------------
-        # 6)  Solve + compute covariance
-        # -------------------------------
-        final_params = result.x          # already available
-        lattice_fit  = dict(zip(required_params,
-                                final_params[:len(required_params)]))
-
-        # ▶ 1 — grab the refined (a0,b0,a_hkl,b_hkl) for every edge
-        ab_fit_block = final_params[len(required_params) :
-                                    len(required_params) + n_ab].reshape(n_edge, 4)
-
-        # ---- variance & covariance ----
-        final_res = residuals(final_params)
-        N, M      = len(concatenated_y), len(final_params)
-        RSS       = np.sum(final_res ** 2)
-        variance  = RSS / max(1, N - M)      # avoid zero‑div
-
-        try:
-            J   = result.jac
-            cov = np.linalg.inv(J.T @ J) * variance
-            param_stderr = np.sqrt(np.diag(cov))
-        except np.linalg.LinAlgError:
-            param_stderr = np.full_like(final_params, np.inf)
-
-        # -------------------------------
-        # 7)  Slice parameters correctly
-        # -------------------------------
-        idx = len(required_params)
-        ab_slice        = param_stderr[idx : idx + n_ab].reshape(n_edge, 4)
-        idx            += n_ab
-        # --- s ---
-        if not fix_s:
-            fitted_s_vals       = final_params[idx : idx + len(bragg_edges)]
-            s_uncertainties_list = param_stderr[idx : idx + len(bragg_edges)]
-            idx += len(bragg_edges)
-        else:
-            fitted_s_vals        = s_initial
-            s_uncertainties_list = [np.nan] * len(bragg_edges)
-
-        # --- t ---
-        if not fix_t:
-            fitted_t_vals       = final_params[idx : idx + len(bragg_edges)]
-            t_uncertainties_list = param_stderr[idx : idx + len(bragg_edges)]
-            idx += len(bragg_edges)
-        else:
-            fitted_t_vals        = t_initial
-            t_uncertainties_list = [np.nan] * len(bragg_edges)
-
-        # --- eta ---
-        if not fix_eta:
-            fitted_eta_vals       = final_params[idx : idx + len(bragg_edges)]
-            eta_uncertainties_list = param_stderr[idx : idx + len(bragg_edges)]
-        else:
-            fitted_eta_vals        = eta_initial
-            eta_uncertainties_list = [np.nan] * len(bragg_edges)
-
-
-
-        # Update our class lattice_params with the newly fitted ones
-        if apply_lattice_update and hasattr(self, "lattice_params"):
-            self.lattice_params.update(lattice_fit)
-
-        # Lattice param uncertainties
-        lattice_uncertainties = {}
-        for i, p in enumerate(required_params):
-            lattice_uncertainties[p] = param_stderr[i]
-
-        # Build dictionaries from hkl -> s/t uncertainty
-        s_unc_dict = {}
-        t_unc_dict = {}
-        eta_unc_dict = {}
-        for edge, s_val, s_unc_val, t_val, t_unc_val, eta_val, eta_unc_val in zip(bragg_edges, fitted_s_vals, s_uncertainties_list, fitted_t_vals, t_uncertainties_list, fitted_eta_vals, eta_uncertainties_list):
-            s_unc_dict[edge['hkl']] = s_unc_val
-            t_unc_dict[edge['hkl']] = t_unc_val
-            eta_unc_dict[edge['hkl']] = eta_unc_val
-        ab_fits = {
-            edge['hkl']: tuple(ab_fit_block[i])      # ab_fit_block comes from step 1
-            for i, edge in enumerate(bragg_edges)
-        }
-
-        # -------------------------------
-        # 8) Build sorted model data
-        # -------------------------------
-        # Model = data - residual, so:
-        model_vals = concatenated_y - final_res
-        order = np.argsort(concatenated_x)
-        sorted_x = concatenated_x[order]
-        sorted_y = model_vals[order]
-        sorted_x_exp = concatenated_x[order]
-        sorted_y_exp = concatenated_y[order]
-
-        # We'll also return the entire (x_data, y_data) for plotting
-        # x_data => sorted_x, y_data => sorted_y
-        # residuals => final_res
-
-        # -------------------------------
-        # 9) Construct result dictionary
-        # -------------------------------
-        result_dict = {
-            'ab_fits': ab_fits,
-            'bragg_edges': bragg_edges,
-            'structure_type': structure_type,
-            'lattice_params': lattice_fit,
-            'lattice_uncertainties': lattice_uncertainties,  # <--- newly added
-            'fitted_s': { e['hkl']: s for e, s in zip(bragg_edges, fitted_s_vals) },
-            'fitted_t': { e['hkl']: t for e, t in zip(bragg_edges, fitted_t_vals) },
-            'fitted_eta': { e['hkl']: eta for e, eta in zip(bragg_edges, fitted_eta_vals) },
-            's_uncertainties': s_unc_dict,                  # <--- newly added
-            't_uncertainties': t_unc_dict,                  # <--- newly added
-            'eta_uncertainties': eta_unc_dict,                  # <--- newly added
-            'x_data': sorted_x,                             # <--- for plotting
-            'y_data': sorted_y,
-            'x_exp_sorted': sorted_x_exp,
-            'y_exp_sorted': sorted_y_exp,
-            'residuals': final_res,
-            'success': result.success,
-            'message': result.message
-        }
-
-        edge_heights = {}
-        edge_widths = {}
-
-        # For each edge in bragg_edges, we now have final s/t + final lattice params.
-        # Compute x_edge from lattice params; height from Region3 plateau (max-min); width from Region3 derivative.
-        def d_spacing(h, k, l, structure, lat):
-            x_vals = calculate_x_hkl_general(structure, lat, [(h, k, l)])
-            if not x_vals or np.isnan(x_vals[0]):
-                return np.nan
-            return x_vals[0] / 2.0  # lambda = 2d => d = lambda/2
-
-        for i, edge in enumerate(bragg_edges):
-            (h, k, l) = edge['hkl']
-            s_val = fitted_s_vals[i]
-            t_val = fitted_t_vals[i]
-            eta_val = fitted_eta_vals[i]
-            a0_fit, b0_fit, a_hkl_fit, b_hkl_fit = ab_fit_block[i]
-
-            d_hkl = d_spacing(h, k, l, structure_type, lattice_fit)
-            if np.isnan(d_hkl) or d_hkl <= 0:
-                edge_heights[edge['hkl']] = np.nan
-                edge_widths[edge['hkl']] = np.nan
-                continue
-
-            x_edge = 2.0 * d_hkl
-
-            # Height: max-min of fitted Region3 curve over its span
-            try:
-                r3_min = edge["regions"][2]["min_wavelength"]
-                r3_max = edge["regions"][2]["max_wavelength"]
-                xx_h = np.linspace(r3_min, r3_max, 4000)
-                yy_h = fitting_function_3(
-                    xx_h, a0_fit, b0_fit, a_hkl_fit, b_hkl_fit,
-                    s_val, t_val, eta_val, [edge['hkl']],
-                    r3_min, r3_max,
-                    structure_type, lattice_fit
-                )
-                edge_height = yy_h.max() - yy_h.min() if yy_h.size else np.nan
-            except (ValueError, FloatingPointError, TypeError):
-                edge_height = np.nan
-
-            # Width: FWHM of derivative around x_edge using Region3 model
-            try:
-                r3_min = edge["regions"][2]["min_wavelength"]
-                r3_max = edge["regions"][2]["max_wavelength"]
-                span = max(0.2, 0.1 * (r3_max - r3_min))
-                start = max(r3_min, x_edge - span)
-                end = min(r3_max, x_edge + span)
-                if end <= start:
-                    raise ValueError("Invalid span for width computation")
-                xx = np.linspace(start, end, 4000)
-                yy = fitting_function_3(
-                    xx, a0_fit, b0_fit, a_hkl_fit, b_hkl_fit,
-                    s_val, t_val, eta_val, [edge['hkl']],
-                    start, end,
-                    structure_type, lattice_fit
-                )
-                if yy.size < 5:
-                    raise ValueError("Insufficient points for width computation")
-                dy = np.gradient(yy, xx)
-                dy_max = dy.max()
-                if dy_max <= 0:
-                    raise ValueError("Non-positive derivative peak")
-                half = dy_max / 2.0
-                indices = np.where(dy >= half)[0]
-                if indices.size == 0:
-                    raise ValueError("No points above half maximum")
-                edge_width = xx[indices[-1]] - xx[indices[0]]
-            except (ValueError, FloatingPointError, TypeError):
-                edge_width = np.nan
-
-            edge_widths[edge['hkl']] = edge_width
-            edge_heights[edge['hkl']] = edge_height
-
-
-
-        # Store in the result dictionary
-        result_dict["edge_heights"] = edge_heights  
-        result_dict["edge_widths"] = edge_widths
-
-
-        return result_dict, None
+        if (
+            result_dict is not None
+            and error_msg is None
+            and apply_lattice_update
+            and hasattr(self, "lattice_params")
+        ):
+            self.lattice_params.update(result_dict["lattice_params"])
+        return result_dict, error_msg
 
     def fit_full_pattern(self, skip_plot=False):
         """High-level method that calls fit_full_pattern_core and updates GUI elements."""
