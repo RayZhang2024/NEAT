@@ -1191,19 +1191,6 @@ class BatchFitWorker(QThread):
         )
         self.sample_valid_pixel_mask = _sample_valid_pixel_mask(self.images)
 
-    @staticmethod
-    def _safe_float(widget_or_value, default=""):
-        """
-        Safely convert a widget or raw value to float, returning default on failure.
-        """
-        try:
-            if widget_or_value is None:
-                return default
-            value = widget_or_value.text() if hasattr(widget_or_value, "text") else widget_or_value
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-
     def run(self):
         box_counter = 0
         params_initialized = False

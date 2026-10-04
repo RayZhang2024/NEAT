@@ -11,7 +11,7 @@ instrument_applicability: [known-phase image stacks]
 scientific_review: pending
 source_paths: [NEAT/ui/mixins/fitting.py, NEAT/workers/batch.py]
 source_symbols: [FittingMixin.batch_fit, BatchFitWorker]
-test_paths: []
+test_paths: [tests/test_pattern_batch_worker.py, tests/test_batch_mapping_outputs.py]
 ---
 
 # Pattern batch mapping worker

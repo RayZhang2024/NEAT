@@ -11,7 +11,7 @@ instrument_applicability: [general]
 scientific_review: not-required
 source_paths: [NEAT/ui/main_window.py, NEAT/ui/mixins/preprocessing.py, NEAT/ui/mixins/fitting.py, NEAT/ui/assistant_panel.py, NEAT/workers/preprocessing.py, NEAT/workers/batch.py]
 source_symbols: [FitsViewer.cleanup_resources, AssistantDockWidget.shutdown, SummationWorker.stop, FullProcessWorker.stop, BatchFitEdgesWorker.stop, BatchFitWorker.stop]
-test_paths: [tests/test_preprocessing_workers.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_semantic_retrieval.py]
+test_paths: [tests/test_preprocessing_workers.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_semantic_retrieval.py, tests/test_pattern_batch_worker.py]
 ---
 
 # Worker ownership, progress, cancellation and shutdown
