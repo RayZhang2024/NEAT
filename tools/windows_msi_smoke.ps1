@@ -45,7 +45,7 @@ function Get-NeatUninstallEntries {
             Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
                 $entry = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
                 if ($entry.DisplayName -eq "NEAT") {
-                    [pscustomobject]@{ Root = $root; Key = $_.PSPath; Entry = $entry }
+                    [pscustomobject]@{ Hive = $_.PSDrive.Name; Key = $_.PSPath; Entry = $entry }
                 }
             }
         }
@@ -88,8 +88,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Installed payload does not match its manifest." }
 
     $registryEntries = @(Get-NeatUninstallEntries)
-    if ($registryEntries.Count -ne 1 -or $registryEntries[0].Root -ne "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall") {
-        throw "Expected exactly one per-user NEAT uninstall registration; found $($registryEntries.Count)."
+    if ($registryEntries.Count -ne 1 -or $registryEntries[0].Hive -ne "HKCU") {
+        $registrations = ($registryEntries | ForEach-Object { "$($_.Hive):$($_.Key)" }) -join "; "
+        throw "Expected exactly one per-user NEAT uninstall registration; found $($registryEntries.Count): $registrations"
     }
     if (-not ((Get-NeatShortcutTargets) -contains $installedExe)) {
         throw "The NEAT Start Menu launcher does not target $installedExe"

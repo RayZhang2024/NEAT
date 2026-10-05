@@ -275,6 +275,7 @@ class WindowsDistributionTests(unittest.TestCase):
             '"/l*v"',
             '"ALLUSERS=2"',
             '"MSIINSTALLPERUSER=1"',
+            'Hive = $_.PSDrive.Name',
             "ExitCode -ne 0",
         ):
             self.assertIn(marker, msi_smoke)
