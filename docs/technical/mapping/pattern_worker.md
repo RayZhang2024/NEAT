@@ -9,19 +9,21 @@ verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
 status: code-verified
 instrument_applicability: [known-phase image stacks]
 scientific_review: pending
-source_paths: [NEAT/ui/mixins/fitting.py, NEAT/workers/batch.py]
-source_symbols: [FittingMixin.batch_fit, BatchFitWorker]
-test_paths: [tests/test_pattern_batch_worker.py, tests/test_batch_mapping_outputs.py]
+source_paths: [NEAT/domain/fitting.py, NEAT/ui/mixins/fitting.py, NEAT/workers/batch.py]
+source_symbols: [FullPatternFitConfig, FullPatternFitResult, FittingMixin.batch_fit, BatchFitWorker]
+test_paths: [tests/test_fitting_domain.py, tests/test_pattern_batch_worker.py, tests/test_batch_mapping_outputs.py]
 ---
 
 # Pattern batch mapping worker
 
 The UI requires an initial full-pattern fit before mapping. For each box, the
 worker sums pixels at every wavelength and calls its explicitly injected
-`FittingEngine.fit_full_pattern` instance. The worker has no MainWindow parent
-or GUI callback dependency. Its nested plain-Python fitting configuration is
-deep-copied at construction, while wavelength and image arrays remain shared
-inputs (the worker does not copy the full image stack). Calls use
+`FittingEngine.fit_full_pattern` instance using a `FullPatternFitConfig`. It
+consumes `FullPatternFitResult` attributes directly. The worker has no
+MainWindow parent or GUI callback dependency. The typed scientific config
+owns its nested inputs; the worker separately snapshots plain CSV/provenance
+metadata. Wavelength and image arrays remain shared inputs (the worker does
+not copy the full image stack). Calls use
 `max_nfev=300`, `curve_fit_maxfev=300`, and do not update global lattice state.
 
 On the first successful box, it allocates full detector arrays for fitted

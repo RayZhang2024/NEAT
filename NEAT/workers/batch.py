@@ -7,6 +7,7 @@ import json
 import os
 import re
 import warnings
+from typing import Any, Mapping
 
 import h5py
 import numpy as np
@@ -73,6 +74,8 @@ from scipy.interpolate import griddata
 from scipy.optimize import curve_fit, least_squares
 
 from ..core import calculate_x_hkl_general, fitting_function_3
+from ..domain import FullPatternFitConfig
+from ..services.fitting_engine import FittingEngine
 
 
 def _representative_pixel_is_valid(images, row, col):
@@ -1115,10 +1118,11 @@ class BatchFitWorker(QThread):
 
     def __init__(
         self,
-        fitting_engine,
+        fitting_engine: FittingEngine,
         images,
         wavelengths,
-        fit_context,
+        fit_config: FullPatternFitConfig,
+        output_metadata: Mapping[str, Any],
         min_x,
         max_x,
         min_y,
@@ -1138,9 +1142,7 @@ class BatchFitWorker(QThread):
         self.fitting_engine = fitting_engine
         self.images = images
         self.wavelengths = wavelengths
-        # The fitting configuration is small and nested; detach it from GUI
-        # state while leaving the potentially large image stack shared.
-        self.fit_context = copy.deepcopy(fit_context or {})
+        self.fit_config = fit_config
         self.min_x = min_x
         self.max_x = max_x
         self.min_y = min_y
@@ -1156,25 +1158,26 @@ class BatchFitWorker(QThread):
         self.fix_s = fix_s
         self.fix_t = fix_t
         self.fix_eta = fix_eta
-        self.structure_type = self.fit_context.get("structure_type", "cubic")
-        self.hkl_list = []
+        self.structure_type = self.fit_config.structure_type
+        self.hkl_list: list[tuple[int, int, int]] = []
+        metadata = copy.deepcopy(output_metadata or {})
         self.metadata_snapshot = {
-            "flight_path": self.fit_context.get("flight_path"),
-            "flight_path_source": self.fit_context.get("flight_path_source"),
-            "data_source": self.fit_context.get("data_source"),
-            "input_file": self.fit_context.get("input_file"),
-            "min_wavelength": self.fit_context.get("min_wavelength"),
-            "max_wavelength": self.fit_context.get("max_wavelength"),
-            "selected_phase": self.fit_context.get("selected_phase"),
-            "bragg_rows_text": list(self.fit_context.get("bragg_rows_text", [])),
+            "flight_path": metadata.get("flight_path"),
+            "flight_path_source": metadata.get("flight_path_source"),
+            "data_source": metadata.get("data_source"),
+            "input_file": metadata.get("input_file"),
+            "min_wavelength": metadata.get("min_wavelength"),
+            "max_wavelength": metadata.get("max_wavelength"),
+            "selected_phase": metadata.get("selected_phase"),
+            "bragg_rows_text": list(metadata.get("bragg_rows_text", [])),
         }
 
         # All images same shape
         self.image_height, self.image_width = self.images[0].shape
 
         # We'll discover lattice parameters after first success
-        self.param_arrays = {}      # e.g. { "a": 2D array, "b":..., etc. }
-        self.param_unc_arrays = {}
+        self.param_arrays: dict[str, np.ndarray] = {}      # e.g. { "a": 2D array, "b":..., etc. }
+        self.param_unc_arrays: dict[str, np.ndarray] = {}
         self.num_edges = None
         self.s_array = None
         self.s_unc_array = None
@@ -1233,10 +1236,10 @@ class BatchFitWorker(QThread):
 
                 # Fit using the explicitly injected, GUI-independent engine.
                 try:
-                    result_dict, error_msg = self.fitting_engine.fit_full_pattern(
+                    result, error_msg = self.fitting_engine.fit_full_pattern(
                         wavelengths=self.wavelengths,
                         intensities=intensities,
-                        fit_config=self.fit_context,
+                        fit_config=self.fit_config,
                         fix_s=self.fix_s,
                         fix_t=self.fix_t,
                         fix_eta=self.fix_eta,
@@ -1245,39 +1248,37 @@ class BatchFitWorker(QThread):
                     )
                 except Exception as e:
                     error_msg = f"Unexpected error during fitting: {e}"
-                    result_dict = None
+                    result = None
 
                 # Surface the first few failures so users see why no fits succeed.
-                if (error_msg or not result_dict or not result_dict.get("success", False)) and failure_reported < 5:
-                    detail = error_msg or (
-                        result_dict.get("message", "") if result_dict else ""
-                    )
+                if (error_msg or not result or not result.success) and failure_reported < 5:
+                    detail = error_msg or (result.message if result else "")
                     self.message.emit(
                         f"Fit failed at box centered ({center_col},{center_row}): {detail or 'unknown reason'}"
                     )
                     failure_reported += 1
 
-                if error_msg or not result_dict or not result_dict.get("success", False):
+                if error_msg or not result or not result.success:
                     # Fill NaNs
                     self.assign_nan_to_pixel(center_row, center_col)
                     continue
 
                 # -------------- Fit Succeeded --------------
-                lattice_params = result_dict["lattice_params"]
-                lattice_uncs   = result_dict["lattice_uncertainties"]
+                lattice_params = result.lattice_params
+                lattice_uncs   = result.lattice_uncertainties
 
-                fitted_s_dict = result_dict["fitted_s"]
-                fitted_t_dict = result_dict["fitted_t"]
-                fitted_eta_dict = result_dict["fitted_eta"]
-                s_unc_dict     = result_dict["s_uncertainties"]
-                t_unc_dict     = result_dict["t_uncertainties"]
-                eta_unc_dict     = result_dict["eta_uncertainties"]
-                bragg_edges    = result_dict.get("bragg_edges", [])
-                ab_fits = result_dict['ab_fits']
+                fitted_s_dict = result.fitted_s
+                fitted_t_dict = result.fitted_t
+                fitted_eta_dict = result.fitted_eta
+                s_unc_dict     = result.s_uncertainties
+                t_unc_dict     = result.t_uncertainties
+                eta_unc_dict     = result.eta_uncertainties
+                bragg_edges    = result.bragg_edges
+                ab_fits = result.ab_fits
 
                 # Update local hkl list
                 if bragg_edges:
-                    hkl_list = [edge["hkl"] for edge in bragg_edges]
+                    hkl_list = [edge.hkl for edge in bragg_edges]
                 else:
                     hkl_list = sorted(fitted_s_dict.keys())
                 self.hkl_list = hkl_list
@@ -1409,7 +1410,7 @@ class BatchFitWorker(QThread):
         structure_type = self.structure_type
 
         for i, edge in enumerate(bragg_edges):
-            (h, k, l) = edge["hkl"]
+            (h, k, l) = edge.hkl
             # a0   = edge["a0"]
             # b0   = edge["b0"]
             # a_hk = edge["a_hkl"]
@@ -1421,7 +1422,7 @@ class BatchFitWorker(QThread):
             #     self.height_array[row_c, col_c, i] = np.nan
             #     continue
             try:
-                a0_fit, b0_fit, a_hkl_fit, b_hkl_fit = ab_fits[edge["hkl"]]
+                a0_fit, b0_fit, a_hkl_fit, b_hkl_fit = ab_fits[edge.hkl]
             except KeyError:
                 # safety fallback – skip if not present
                 self.height_array[row_c, col_c, i] = np.nan
@@ -1432,9 +1433,9 @@ class BatchFitWorker(QThread):
            
             
            # ---------------- width  (FWHM of derivative) --------------
-            s = fitted_s_dict.get(edge["hkl"],  np.nan)
-            t = fitted_t_dict.get(edge["hkl"],  np.nan)
-            η = fitted_eta_dict.get(edge["hkl"], np.nan)
+            s = fitted_s_dict.get(edge.hkl,  np.nan)
+            t = fitted_t_dict.get(edge.hkl,  np.nan)
+            η = fitted_eta_dict.get(edge.hkl, np.nan)
     
             span  = 0.2                 # Å on each side of x_edge
             xx    = np.linspace(x_edge-span, x_edge+span, 14000)

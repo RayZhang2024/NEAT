@@ -1,10 +1,13 @@
 """Headless regression coverage for the full-pattern fitting service."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
 from NEAT.core import fitting_function_3
+from NEAT.domain import FullPatternEdgeFit, FullPatternFitConfig, FullPatternFitResult
 from NEAT.services.fitting_engine import FittingEngine
 
 
@@ -82,7 +85,7 @@ class TestFittingEngine(unittest.TestCase):
         return self.engine.fit_full_pattern(
             self.wavelengths,
             self.intensities,
-            config or self.fit_config,
+            FullPatternFitConfig.from_legacy_dict(config or self.fit_config),
             fix_s=fix_s,
             fix_t=fix_t,
             fix_eta=fix_eta,
@@ -95,39 +98,40 @@ class TestFittingEngine(unittest.TestCase):
         free_result, error = self.fit()
         self.assertIsNone(error)
         self.assertEqual(self.fit_config["lattice_params"], original_lattice)
-        self.assertTrue(free_result["success"])
-        self.assertAlmostEqual(free_result["lattice_params"]["a"], 1.2, places=2)
-        self.assertIn(self.hkl, free_result["ab_fits"])
-        self.assertTrue(np.isfinite(free_result["edge_heights"][self.hkl]))
-        self.assertTrue(np.isfinite(free_result["edge_widths"][self.hkl]))
-        self.assertIn("residuals", free_result)
-        self.assertEqual(free_result["x_data"].shape, free_result["y_data"].shape)
+        self.assertIsInstance(free_result, FullPatternFitResult)
+        self.assertIsInstance(free_result.bragg_edges[0], FullPatternEdgeFit)
+        self.assertTrue(free_result.success)
+        self.assertAlmostEqual(free_result.lattice_params["a"], 1.2, places=2)
+        self.assertIn(self.hkl, free_result.ab_fits)
+        self.assertTrue(np.isfinite(free_result.edge_heights[self.hkl]))
+        self.assertTrue(np.isfinite(free_result.edge_widths[self.hkl]))
+        self.assertEqual(free_result.x_data.shape, free_result.y_data.shape)
 
         fixed_result, error = self.fit(fix_s=True, fix_t=True, fix_eta=True)
         self.assertIsNone(error)
-        self.assertTrue(np.isnan(fixed_result["s_uncertainties"][self.hkl]))
-        self.assertTrue(np.isnan(fixed_result["t_uncertainties"][self.hkl]))
-        self.assertTrue(np.isnan(fixed_result["eta_uncertainties"][self.hkl]))
-        self.assertEqual(fixed_result["fitted_s"][self.hkl], self.shape["s"])
+        self.assertTrue(np.isnan(fixed_result.s_uncertainties[self.hkl]))
+        self.assertTrue(np.isnan(fixed_result.t_uncertainties[self.hkl]))
+        self.assertTrue(np.isnan(fixed_result.eta_uncertainties[self.hkl]))
+        self.assertEqual(fixed_result.fitted_s[self.hkl], self.shape["s"])
 
         mixed_result, error = self.fit(fix_s=True, fix_t=False, fix_eta=True)
         self.assertIsNone(error)
-        self.assertTrue(np.isnan(mixed_result["s_uncertainties"][self.hkl]))
-        self.assertTrue(np.isfinite(mixed_result["t_uncertainties"][self.hkl]))
-        self.assertTrue(np.isnan(mixed_result["eta_uncertainties"][self.hkl]))
+        self.assertTrue(np.isnan(mixed_result.s_uncertainties[self.hkl]))
+        self.assertTrue(np.isfinite(mixed_result.t_uncertainties[self.hkl]))
+        self.assertTrue(np.isnan(mixed_result.eta_uncertainties[self.hkl]))
 
     def test_matches_pre_refactor_commit_numerical_golden(self):
         result, error = self.fit()
         self.assertIsNone(error)
-        self.assertTrue(result["success"])
-        residual_l2 = float(np.linalg.norm(result["residuals"]))
+        self.assertTrue(result.success)
+        residual_l2 = float(np.linalg.norm(result.residuals))
         actual = {
-            "lattice_a": float(result["lattice_params"]["a"]),
-            "fitted_s": float(result["fitted_s"][self.hkl]),
-            "fitted_t": float(result["fitted_t"][self.hkl]),
-            "fitted_eta": float(result["fitted_eta"][self.hkl]),
-            "edge_height": float(result["edge_heights"][self.hkl]),
-            "edge_width": float(result["edge_widths"][self.hkl]),
+            "lattice_a": float(result.lattice_params["a"]),
+            "fitted_s": float(result.fitted_s[self.hkl]),
+            "fitted_t": float(result.fitted_t[self.hkl]),
+            "fitted_eta": float(result.fitted_eta[self.hkl]),
+            "edge_height": float(result.edge_heights[self.hkl]),
+            "edge_width": float(result.edge_widths[self.hkl]),
             "residual_l2": residual_l2,
             "rss": residual_l2**2,
         }
@@ -145,9 +149,9 @@ class TestFittingEngine(unittest.TestCase):
         }
         result, error = self.fit(config=config)
         self.assertIsNone(error)
-        self.assertTrue(0.004 <= result["fitted_s"][self.hkl] <= 0.0045)
-        self.assertTrue(0.035 <= result["fitted_t"][self.hkl] <= 0.045)
-        self.assertTrue(0.25 <= result["fitted_eta"][self.hkl] <= 0.32)
+        self.assertTrue(0.004 <= result.fitted_s[self.hkl] <= 0.0045)
+        self.assertTrue(0.035 <= result.fitted_t[self.hkl] <= 0.045)
+        self.assertTrue(0.25 <= result.fitted_eta[self.hkl] <= 0.32)
 
     def test_invalid_structure_and_missing_context_return_errors(self):
         config = dict(self.fit_config, structure_type="unsupported")
@@ -159,6 +163,49 @@ class TestFittingEngine(unittest.TestCase):
         result, error = self.fit(config=config)
         self.assertIsNone(result)
         self.assertEqual(error, "Lattice parameters not initialized")
+
+    def test_primary_engine_rejects_unconverted_legacy_dict(self):
+        with self.assertRaises(TypeError):
+            self.engine.fit_full_pattern(self.wavelengths, self.intensities, self.fit_config)
+
+    def test_no_rows_and_unusable_rows_keep_distinct_errors(self):
+        config = dict(self.fit_config, bragg_rows=[])
+        self.assertEqual(self.fit(config=config), (None, "No Bragg edges to fit"))
+        config["bragg_rows"] = [{"valid": False, "hkl": None, "regions": None}]
+        self.assertEqual(self.fit(config=config), (None, "No valid edges with Region 3 data"))
+
+    def test_legacy_invalid_bounds_fall_back_to_defaults(self):
+        config = dict(self.fit_config, fitting_parameter_bounds={"s": (0.02, 0.01)})
+        result, error = self.fit(config=config)
+        self.assertIsNone(error)
+        self.assertAlmostEqual(result.fitted_s[self.hkl], self.shape["s"], places=4)
+
+    def test_established_service_failure_messages(self):
+        config = dict(self.fit_config, structure_type="orthorhombic")
+        self.assertEqual(
+            self.fit(config=config),
+            (None, "Missing parameters for orthorhombic: ['b', 'c']"),
+        )
+        typed = FullPatternFitConfig.from_legacy_dict(self.fit_config)
+        result, error = self.engine.fit_full_pattern(
+            self.wavelengths[:-1], self.intensities, typed
+        )
+        self.assertIsNone(result)
+        self.assertEqual(error, "Wavelength and intensity arrays must have the same shape")
+
+        bad_regions = list(self.regions)
+        bad_regions[1] = {"min_wavelength": 9.0, "max_wavelength": 10.0}
+        config = dict(self.fit_config, bragg_rows=[{
+            **self.fit_config["bragg_rows"][0], "regions": bad_regions,
+        }])
+        result, error = self.fit(config=config)
+        self.assertIsNone(result)
+        self.assertTrue(error.startswith("Fitting error for hkl(1, 1, 0):"))
+
+        with patch("NEAT.services.fitting_engine.least_squares", side_effect=RuntimeError("synthetic")):
+            self.assertEqual(self.fit(), (None, "Optimization failed: synthetic"))
+        with patch("NEAT.services.fitting_engine.least_squares", return_value=SimpleNamespace(success=False, message="stopped")):
+            self.assertEqual(self.fit(), (None, "Fit did not converge: stopped"))
 
 
 if __name__ == "__main__":
