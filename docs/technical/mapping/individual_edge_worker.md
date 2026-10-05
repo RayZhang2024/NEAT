@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: mapping
 audience: [user, scientist, developer]
 neat_version: 4.8.0
-verified_commit: 9081f2693adda68eb04a8397adb253ff2cf53142
+verified_commit: 74ac16ecc3be77373f5078f4ec983d6caba7c927
 status: code-verified
 instrument_applicability: [image stacks]
 scientific_review: pending
