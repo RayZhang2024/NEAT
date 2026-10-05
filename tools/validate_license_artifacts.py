@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import argparse
 import tarfile
-import tomllib
 import zipfile
 from email.parser import Parser
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
 
 
 def _metadata_headers(metadata_bytes: bytes) -> dict[str, list[str]]:

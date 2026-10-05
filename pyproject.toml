@@ -38,6 +38,9 @@ assistant-server = [
     "fastapi>=0.115,<1",
     "uvicorn>=0.34,<1"
 ]
+test = [
+    "tomli>=2; python_version < '3.11'"
+]
 
 [tool.briefcase]
 project_name = "NEAT"
@@ -52,9 +55,6 @@ external_package_executable_path = "NEAT.exe"
 system_installer = false
 use_full_install_path = false
 install_launcher = true
-test = [
-    "tomli>=2; python_version < '3.11'"
-]
 
 [project.scripts]
 neat = "NEAT.app:main"

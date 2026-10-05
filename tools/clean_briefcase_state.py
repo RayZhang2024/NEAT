@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import argparse
 import shutil
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
 
 
 def clean_briefcase_state(project_root: Path) -> list[Path]:

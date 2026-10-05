@@ -6,11 +6,15 @@ import hashlib
 import contextlib
 import io
 import tempfile
-import tomllib
 import unittest
 import uuid
 import zipfile
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
 
 from tools.clean_briefcase_state import clean_briefcase_state
 from tools.windows_distribution import (

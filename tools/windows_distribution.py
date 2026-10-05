@@ -10,8 +10,12 @@ import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
-import tomllib
 import xml.etree.ElementTree as ET
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
 
 
 MANIFEST_SCHEMA_VERSION = 1
