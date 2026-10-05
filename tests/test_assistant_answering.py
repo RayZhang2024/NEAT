@@ -7,6 +7,7 @@ from pathlib import Path
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_answering import (
     ConversationTurn,
     GroundedAnswerGenerator,
@@ -18,7 +19,7 @@ from tools.assistant_service import NEATAssistantService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-KNOWLEDGE_DIRECTORY = PROJECT_ROOT / "docs" / "assistant"
+KNOWLEDGE_DIRECTORY = assistant_knowledge_root()
 
 
 class _RecordingModel:

@@ -5,16 +5,32 @@ doc_type: technical_reference
 functional_area: support
 audience: [user, developer, support]
 neat_version: 4.8.0
-verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
+verified_commit: ab7763679e795260a9378a8759c863a74b84ef5b
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [pyproject.toml, NEAT.spec, .github/workflows/release.yml, NEAT/app.py, NEAT/ui/main_window.py, tools/assistant_openai.py]
+source_paths: [pyproject.toml, NEAT.spec, NEAT/package_resources.py, .github/workflows/tests.yml, .github/workflows/release.yml, NEAT/app.py, NEAT/ui/main_window.py, tools/assistant_openai.py]
 source_symbols: [UpdateCheckWorker, FitsViewer.start_update_check, FitsViewer._on_update_check_finished, describe_openai_error]
-test_paths: [tests/test_assistant_openai.py]
+test_paths: [tests/test_assistant_openai.py, tests/test_package_resources.py, tests/test_release_packaging.py]
 ---
 
 # Updates, packaging and operational errors
+
+## Supported Python and installation surfaces
+
+The package metadata declares Python `>=3.10,<3.14`; the documented GUI
+platform remains Windows. This range applies to Python package/source installs
+and developer checkouts. The Windows standalone release is a separate
+self-contained PyInstaller artifact and continues to build with Python 3.13.
+Ubuntu CI provides development-quality unit, lint and type feedback, not a
+claim of supported Linux GUI operation.
+
+Normal CI runs the full unit suite on Windows with Python 3.10, 3.11, 3.12 and
+3.13. Its Windows 3.13 artifact job builds both a wheel and an sdist, inspects
+their contents, then installs each into a separate clean environment outside
+the checkout. The smoke probes verify installed imports, metadata, runtime
+resources, headless scientific imports and dependency health. Source-checkout
+tests are not treated as proof that either artifact is complete.
 
 ## Source installation and entry points
 
@@ -59,10 +75,16 @@ zip.
 The spec relies on PyInstaller's standard scientific/GUI hooks rather than
 recursively collecting dependency test suites. It includes selected runtime
 DLLs, provider metadata, dynamic assistant modules, keyring backends and the
-approved `docs/assistant` knowledge directory. It bundles the launch splash
-and uses `docs/icon/NEAT.ico` when present. The executable is windowed
+approved `NEAT/knowledge` package resources. Normal wheels and sdists declare
+the same knowledge Markdown and launch splash through explicit setuptools
+package-data rules. The executable is windowed
 (`console=False`) and is collected as a directory, not a single-file
 executable.
+
+Installed runtime knowledge is resolved through
+`NEAT.package_resources.assistant_knowledge_root()`; repository evaluation
+questions and developer guidance remain under `docs/assistant` and are not
+runtime dependencies.
 
 ## Assistant package verification and retrieval fallback
 

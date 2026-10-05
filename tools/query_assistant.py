@@ -5,13 +5,13 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_query_pipeline import RoutedRetriever
 from tools.assistant_retrieval import load_knowledge_base
 from tools.assistant_semantic_retrieval import ChromaSemanticRetriever
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-KNOWLEDGE_DIRECTORY = PROJECT_ROOT / "docs" / "assistant"
 INDEX_DIRECTORY = PROJECT_ROOT / ".assistant_cache" / "chroma"
 
 
@@ -23,7 +23,7 @@ def main() -> int:
     parser.add_argument("--top-k", type=int, default=3)
     args = parser.parse_args()
 
-    sections = load_knowledge_base(KNOWLEDGE_DIRECTORY)
+    sections = load_knowledge_base(assistant_knowledge_root())
     semantic = ChromaSemanticRetriever(
         sections,
         persist_directory=INDEX_DIRECTORY,

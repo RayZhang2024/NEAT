@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: assistant
 audience: [user, developer, support, scientist]
 neat_version: 4.8.0
-verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
+verified_commit: ab7763679e795260a9378a8759c863a74b84ef5b
 status: code-verified
 instrument_applicability: [general]
 scientific_review: pending
-source_paths: [NEAT/ui/assistant_panel.py, tools/assistant_retrieval.py, tools/assistant_semantic_retrieval.py, tools/assistant_router.py, tools/assistant_query_pipeline.py, tools/assistant_answering.py, tools/assistant_service.py, tools/assistant_openai.py, tools/assistant_feedback.py, tools/assistant_feedback_summary.py, tools/assistant_answer_evaluation.py]
+source_paths: [NEAT/package_resources.py, NEAT/knowledge, NEAT/ui/assistant_panel.py, tools/assistant_retrieval.py, tools/assistant_semantic_retrieval.py, tools/assistant_router.py, tools/assistant_query_pipeline.py, tools/assistant_answering.py, tools/assistant_service.py, tools/assistant_openai.py, tools/assistant_feedback.py, tools/assistant_feedback_summary.py, tools/assistant_answer_evaluation.py]
 source_symbols: [AssistantDockWidget, collect_neat_context, ChromaSemanticRetriever, QuestionRouter, RoutedRetriever, GroundedPromptBuilder, NEATAssistantService, record_assistant_feedback]
-test_paths: [tests/test_assistant_retrieval.py, tests/test_assistant_semantic_retrieval.py, tests/test_assistant_router.py, tests/test_assistant_answering.py, tests/test_assistant_openai.py, tests/test_assistant_panel.py, tests/test_assistant_feedback.py, tests/test_assistant_feedback_summary.py, tests/test_assistant_answer_evaluation.py]
+test_paths: [tests/test_package_resources.py, tests/test_assistant_retrieval.py, tests/test_assistant_semantic_retrieval.py, tests/test_assistant_router.py, tests/test_assistant_answering.py, tests/test_assistant_openai.py, tests/test_assistant_panel.py, tests/test_assistant_feedback.py, tests/test_assistant_feedback_summary.py, tests/test_assistant_answer_evaluation.py]
 ---
 
 # AI assistant retrieval, privacy, feedback and evaluation
@@ -38,16 +38,17 @@ active per panel.
 
 ## Approved knowledge boundary
 
-`load_knowledge_base` loads exactly:
+`load_knowledge_base` loads exactly the approved files listed by
+`tools.assistant_retrieval.KNOWLEDGE_FILENAMES`. Production Markdown lives in
+the installable `NEAT.knowledge` package and is resolved through
+`NEAT.package_resources.assistant_knowledge_root()` using the
+`importlib.resources` Traversable API. The loader also accepts explicit
+filesystem `Path` overrides for tests and operators.
 
-- `docs/assistant/faq.md`;
-- `docs/assistant/troubleshooting.md`;
-- `docs/assistant/parameter_reference.md`;
-- `docs/assistant/preprocessing_technical.md`;
-- `docs/assistant/fitting_technical.md`;
-- `docs/assistant/mapping_technical.md`;
-- `docs/assistant/postprocessing_technical.md`; and
-- `docs/assistant/known_limitations.md`.
+`docs/assistant` contains evaluation datasets, pilot checklists and developer
+guidance; it is not required by installed runtime retrieval. Evaluation tools
+load production knowledge from the package resource while keeping question
+datasets in the repository.
 
 Markdown is divided into level-two and level-three heading sections. Each
 section has a deterministic filename-and-anchor source ID. The larger

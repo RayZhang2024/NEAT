@@ -6,6 +6,7 @@ import argparse
 import time
 from pathlib import Path
 
+from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_retrieval import (
     BM25Retriever,
     evaluate_retriever,
@@ -17,8 +18,7 @@ from tools.assistant_semantic_retrieval import ChromaSemanticRetriever
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_KNOWLEDGE_DIRECTORY = PROJECT_ROOT / "docs" / "assistant"
-DEFAULT_QUESTIONS_PATH = DEFAULT_KNOWLEDGE_DIRECTORY / "evaluation_questions.json"
+DEFAULT_QUESTIONS_PATH = PROJECT_ROOT / "docs" / "assistant" / "evaluation_questions.json"
 DEFAULT_INDEX_DIRECTORY = PROJECT_ROOT / ".assistant_cache" / "chroma"
 
 
@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--knowledge-directory",
         type=Path,
-        default=DEFAULT_KNOWLEDGE_DIRECTORY,
+        help="Optional filesystem override for the package-owned knowledge corpus.",
     )
     parser.add_argument("--questions", type=Path, default=DEFAULT_QUESTIONS_PATH)
     parser.add_argument("--index-directory", type=Path, default=DEFAULT_INDEX_DIRECTORY)
@@ -94,7 +94,12 @@ def main() -> int:
     if args.top_k <= 0:
         raise SystemExit("--top-k must be positive")
 
-    sections = load_knowledge_base(args.knowledge_directory.resolve())
+    knowledge_root = (
+        args.knowledge_directory.resolve()
+        if args.knowledge_directory is not None
+        else assistant_knowledge_root()
+    )
+    sections = load_knowledge_base(knowledge_root)
     questions = load_evaluation_questions(args.questions.resolve())
     missing_sources = validate_expected_sources(sections, questions)
     if missing_sources:

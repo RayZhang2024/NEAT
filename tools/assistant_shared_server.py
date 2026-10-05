@@ -7,11 +7,16 @@ import secrets
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Mapping, Optional, Protocol
+from typing import TYPE_CHECKING, Literal, Mapping, Optional, Protocol
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from importlib.resources.abc import Traversable
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
+
+from NEAT.package_resources import assistant_knowledge_root
 
 from tools.assistant_answering import ConversationTurn, GroundedAnswer
 from tools.assistant_openai import (
@@ -62,7 +67,9 @@ class SharedServerConfig:
     daily_limit: int = DEFAULT_DAILY_LIMIT
     database_path: Path = DEFAULT_SERVER_STATE_DIRECTORY / "quota.sqlite3"
     index_directory: Path = DEFAULT_SERVER_STATE_DIRECTORY / "chroma"
-    knowledge_directory: Path = PROJECT_ROOT / "docs" / "assistant"
+    knowledge_directory: Path | Traversable = field(
+        default_factory=assistant_knowledge_root
+    )
 
     @classmethod
     def from_environment(cls) -> "SharedServerConfig":

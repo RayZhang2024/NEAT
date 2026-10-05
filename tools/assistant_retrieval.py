@@ -9,7 +9,10 @@ import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Iterable, Optional, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from importlib.resources.abc import Traversable
 
 
 KNOWLEDGE_FILENAMES = (
@@ -165,7 +168,7 @@ def tokenize(text: str) -> list[str]:
 
 
 def load_markdown_sections(
-    path: Path,
+    path: Path | Traversable,
     *,
     minimum_level: int = 2,
     maximum_level: int = 3,
@@ -237,14 +240,14 @@ def load_markdown_sections(
     return sections
 
 
-def load_knowledge_base(directory: Path) -> list[KnowledgeSection]:
+def load_knowledge_base(directory: Path | Traversable) -> list[KnowledgeSection]:
     """Load the approved NEAT assistant Markdown files."""
 
     sections: list[KnowledgeSection] = []
     missing = []
     for filename in KNOWLEDGE_FILENAMES:
-        path = directory / filename
-        if not path.exists():
+        path = directory.joinpath(filename)
+        if not path.is_file():
             missing.append(filename)
             continue
         sections.extend(load_markdown_sections(path))

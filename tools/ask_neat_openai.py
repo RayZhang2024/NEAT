@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_openai import (
     DEFAULT_OPENAI_MODEL,
     MissingOpenAIAPIKey,
@@ -19,7 +20,6 @@ from tools.assistant_service import NEATAssistantService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-KNOWLEDGE_DIRECTORY = PROJECT_ROOT / "docs" / "assistant"
 INDEX_DIRECTORY = PROJECT_ROOT / ".assistant_cache" / "chroma"
 
 
@@ -68,7 +68,7 @@ def main() -> int:
         return 2
 
     try:
-        sections = load_knowledge_base(KNOWLEDGE_DIRECTORY)
+        sections = load_knowledge_base(assistant_knowledge_root())
         retriever = ChromaSemanticRetriever(
             sections,
             persist_directory=INDEX_DIRECTORY,

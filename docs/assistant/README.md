@@ -2,9 +2,20 @@
 
 The assistant knowledge base is evaluated before it is connected to a language model. This separates retrieval failures from answer-generation failures.
 
-## Approved knowledge files
+## Approved runtime knowledge files
 
-The explicit loader accepts only:
+The authoritative production Markdown corpus is installed from
+`NEAT/knowledge/` and resolved through
+`NEAT.package_resources.assistant_knowledge_root()`. The explicit loader uses
+`tools.assistant_retrieval.KNOWLEDGE_FILENAMES` as its allow-list. Do not keep
+manually synchronized runtime copies under `docs/assistant`.
+
+This repository directory holds evaluation questions, routing datasets, pilot
+checklists, hosting/developer guidance and other authoring material. Tools that
+need both use the package resource for the production corpus and the repository
+path for evaluation datasets.
+
+The explicit loader accepts only the approved package files:
 
 - `faq.md`, `troubleshooting.md` and `parameter_reference.md`;
 - the user-facing software/UI guide and menu reference;

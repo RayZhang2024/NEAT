@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_answering import GroundedAnswer, SourceCitation
+from tools.assistant_retrieval import KNOWLEDGE_FILENAMES, load_knowledge_base
 from tools.assistant_shared_quota import SQLiteDailyQuota
 from tools.assistant_shared_server import SharedServerConfig, create_app
 
@@ -69,6 +71,23 @@ class SharedAssistantServerTests(unittest.TestCase):
         self.headers = {
             "Authorization": "Bearer desktop-access-token",
         }
+
+    def test_default_server_knowledge_uses_package_resource(self) -> None:
+        config = SharedServerConfig(
+            openai_api_key="server-only-openai-key",
+            service_token="desktop-access-token",
+        )
+        self.assertEqual(str(config.knowledge_directory), str(assistant_knowledge_root()))
+        sections = load_knowledge_base(config.knowledge_directory)
+        self.assertEqual(
+            {section.filename for section in sections}, set(KNOWLEDGE_FILENAMES)
+        )
+
+    def test_custom_server_knowledge_path_override_is_preserved(self) -> None:
+        self.assertEqual(
+            self.config.knowledge_directory,
+            Path(self.temporary_directory.name) / "knowledge",
+        )
 
     def tearDown(self) -> None:
         self.client.close()

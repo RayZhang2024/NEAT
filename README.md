@@ -21,8 +21,13 @@ Developed at ISIS Neutron and Muon Source, NEAT is designed for use with IMAT an
 
 ## ⚙️ Requirements
 
-- **Python** ≥ 3.9  
+- **Python package/source use:** `>=3.10,<3.14`
 - Supported platforms: **Windows**
+
+The Windows standalone release is a self-contained executable. Python package
+installs include the GUI and runtime resources; a developer checkout additionally
+contains tests, build configuration and evaluation material. Ubuntu CI is a
+development-quality check and does not indicate Linux or macOS GUI support.
 
 All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil, etc.) will be installed automatically.
 
