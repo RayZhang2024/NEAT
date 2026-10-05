@@ -186,6 +186,14 @@ class TestIndividualEdgeService(unittest.TestCase):
         with self.assertRaises(ValueError):
             FittingParameterBounds(s=(0.02, 0.01))
 
+    def test_strict_typed_regions_reject_nonfinite_bounds(self):
+        with self.assertRaises(ValueError):
+            WavelengthRegion(np.nan, 1.5)
+        _, _, _, config = self.fixture(True)
+        config = replace(config, legacy_window_order=False)
+        with self.assertRaises(ValueError):
+            replace(config, regions=((np.nan, 1.5), *config.regions[1:]))
+
     def test_missing_lattice_and_unknown_d_are_service_failures(self):
         for known in (True, False):
             wavelengths, intensities, _, config = self.fixture(known)
@@ -205,6 +213,30 @@ class TestIndividualEdgeService(unittest.TestCase):
         self.assertEqual((attempt.error_stage, attempt.error_message), ("Region 1", "has no data in range"))
         with self.assertRaises(ValueError):
             replace(config, legacy_window_order=False)
+
+    def test_legacy_nan_region1_and_region2_preserve_failure_stage(self):
+        wavelengths, intensities, row, _ = self.fixture(True)
+        row["regions"][1] = {"min_wavelength": np.nan, "max_wavelength": 1.35}
+        region1_config = IndividualEdgeFitConfig.from_legacy_row(
+            row, source_row=4, is_known_phase=True, structure_type="bcc",
+            lattice_params={"a": 1.2}, fitting_parameter_bounds=FittingParameterBounds(),
+        )
+        self.assertTrue(np.isnan(region1_config.window(1)[0]))
+        attempt = FittingEngine().fit_individual_edge(wavelengths, intensities, region1_config)
+        self.assertEqual((attempt.error_stage, attempt.error_message),
+                         ("Region 1", "has no data in range"))
+
+        row["regions"][1] = {"min_wavelength": 1.2, "max_wavelength": 1.35}
+        row["regions"][0] = {"min_wavelength": np.nan, "max_wavelength": 1.55}
+        region2_config = IndividualEdgeFitConfig.from_legacy_row(
+            row, source_row=4, is_known_phase=True, structure_type="bcc",
+            lattice_params={"a": 1.2}, fitting_parameter_bounds=FittingParameterBounds(),
+        )
+        attempt = FittingEngine().fit_individual_edge(wavelengths, intensities, region2_config)
+        self.assertEqual((attempt.error_stage, attempt.error_message),
+                         ("Region 2", "has no data in range"))
+        self.assertIsNotNone(attempt.region1)
+        self.assertIsNotNone(attempt.region1.fit)
 
     def test_region3_failure_retains_prior_stages(self):
         wavelengths, intensities, _, config = self.fixture(True)

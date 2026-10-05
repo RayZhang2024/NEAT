@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from NEAT.core import fitting_function_3
 from NEAT.domain import FullPatternFitConfig, FittingParameterBounds, IndividualEdgeFitConfig
 from NEAT.services.fitting_engine import FittingEngine
 from NEAT.workers.batch import (
@@ -383,6 +384,60 @@ class TestBatchMappingOutputs(unittest.TestCase):
             self.assertTrue(np.isnan(worker.a_array[0, 0, 0]))
             self.assertTrue(np.isnan(worker.a_array[0, 0, 1]))
             self.assertEqual(worker.a_array[0, 0, 2], 1.0)
+
+    def test_batch_valid_nan_window_keeps_slot_and_later_edge_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wavelengths = np.linspace(1.0, 2.2, 1600)
+            hkl = (1, 1, 0)
+            intensities = fitting_function_3(
+                wavelengths, 0.3, 0.2, 0.15, 0.07, 0.006, 0.05, 0.35,
+                [hkl], 1.55, 1.95, "bcc", {"a": 1.2},
+            )
+            regions = [
+                {"min_wavelength": 1.4, "max_wavelength": 1.55},
+                {"min_wavelength": 1.2, "max_wavelength": 1.35},
+                {"min_wavelength": 1.55, "max_wavelength": 1.95},
+            ]
+            valid_row = {
+                "row": 0, "valid": True, "hkl": hkl, "d": None,
+                "regions": regions, "s": 0.006, "t": 0.05, "eta": 0.35,
+            }
+            nan_row = {
+                **valid_row, "row": 4,
+                "regions": [regions[0],
+                            {"min_wavelength": np.nan, "max_wavelength": 1.35},
+                            regions[2]],
+            }
+            bounds = FittingParameterBounds()
+            configs = tuple(
+                IndividualEdgeFitConfig.from_legacy_row(
+                    row, source_row=row["row"], is_known_phase=True,
+                    structure_type="bcc", lattice_params={"a": 1.2},
+                    fitting_parameter_bounds=bounds,
+                )
+                for row in (nan_row, valid_row)
+            )
+            self.assertEqual([config.source_row for config in configs], [4, 0])
+            self.assertTrue(np.isnan(configs[0].window(1)[0]))
+            images = [np.array([[value]], dtype=float) for value in intensities]
+            worker = _make_edges_worker(Path(tmp), images=images, edge_configs=configs)
+            worker.wavelengths = wavelengths
+            worker.max_x = worker.max_y = worker.total_boxes = 1
+            worker.interpolation_enabled = False
+            calls = []
+
+            class TrackingEngine:
+                def fit_individual_edge(self, wave, signal, config, **kwargs):
+                    calls.append(config.source_row)
+                    return FittingEngine().fit_individual_edge(wave, signal, config, **kwargs)
+
+            worker.fitting_engine = TrackingEngine()
+            worker.run()
+            self.assertEqual(calls, [4, 0])
+            self.assertEqual(worker.num_edges, 2)
+            self.assertEqual(worker.a_array.shape[-1], 2)
+            self.assertTrue(np.isnan(worker.a_array[0, 0, 0]))
+            self.assertTrue(np.isfinite(worker.a_array[0, 0, 1]))
 
     def test_zero_valid_edges_preserves_worker_finish_payload(self):
         with tempfile.TemporaryDirectory() as tmp:

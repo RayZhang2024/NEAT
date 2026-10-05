@@ -40,9 +40,9 @@ class IndividualEdgeFitConfig:
                 regions.append(region)
             else:
                 lower, upper = (float(value) for value in region)
-                if not isfinite(lower) or not isfinite(upper):
-                    raise ValueError("Region bounds must be finite")
-                if self.legacy_window_order and lower >= upper:
+                if self.legacy_window_order and (
+                    not isfinite(lower) or not isfinite(upper) or lower >= upper
+                ):
                     regions.append((lower, upper))
                 else:
                     regions.append(WavelengthRegion(lower, upper))

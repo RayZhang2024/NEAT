@@ -145,6 +145,14 @@ class TestIndividualEdgeAdapter(unittest.TestCase):
         self.assertIn("Region 1 has no data in range", obj.messages[-1])
         self.assertNotIn("setup failed", obj.messages[-1])
 
+    def test_legacy_nan_region1_reports_stage_not_setup(self):
+        _, _, row, _ = self.fixture(True)
+        row["regions"][1] = {"min_wavelength": np.nan, "max_wavelength": 1.35}
+        obj, result = self.run_fit(row=row)
+        self.assertIsNone(result)
+        self.assertIn("Region 1 has no data in range", obj.messages[-1])
+        self.assertNotIn("setup failed", obj.messages[-1])
+
     def test_region3_failure_retains_region1_region2_plots(self):
         from NEAT.services import individual_edge as service
         real_fit = service.curve_fit
