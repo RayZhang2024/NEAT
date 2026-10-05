@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 def assistant_knowledge_root() -> Traversable:
     """Return the package resource directory containing approved assistant knowledge."""
 
-    return files("NEAT.knowledge")
+    return files("NEAT").joinpath("knowledge")
 
 
 def launch_splash_resource() -> Traversable:

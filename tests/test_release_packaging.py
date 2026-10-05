@@ -109,6 +109,10 @@ class ReleasePackagingTests(unittest.TestCase):
 
     def test_spec_bundles_approved_knowledge_and_dynamic_adapters(self) -> None:
         specification = (PROJECT_ROOT / "NEAT.spec").read_text(encoding="utf-8")
+        self.assertLess(
+            specification.index("sys.path.insert(0, str(project_root))"),
+            specification.index("from tools.assistant_retrieval import KNOWLEDGE_FILENAMES"),
+        )
         self.assertIn('"NEAT" / "knowledge"', specification)
         self.assertNotIn('"docs" / "assistant"', specification)
         self.assertIn('collect_submodules("tools")', specification)

@@ -12,6 +12,10 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 from pathlib import Path
 import sys
 
+project_root = Path.cwd()
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from tools.assistant_retrieval import KNOWLEDGE_FILENAMES
 
 block_cipher = None
@@ -19,7 +23,6 @@ block_cipher = None
 datas = []
 binaries = []
 hiddenimports = []
-project_root = Path.cwd()
 
 # PyInstaller's standard hooks discover the imported scientific and assistant
 # packages, including their native libraries. Avoid recursive bulk collection,

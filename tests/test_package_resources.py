@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from NEAT.package_resources import assistant_knowledge_root, launch_splash_resource
 from tools.assistant_retrieval import KNOWLEDGE_FILENAMES, load_knowledge_base
@@ -38,6 +39,18 @@ class _MemoryDirectory:
 
 
 class PackageResourceTests(unittest.TestCase):
+    def test_knowledge_root_resolves_from_top_level_package_resource(self) -> None:
+        package_root = Mock()
+        knowledge_root = object()
+        package_root.joinpath.return_value = knowledge_root
+
+        with patch("NEAT.package_resources.files", return_value=package_root) as files:
+            result = assistant_knowledge_root()
+
+        files.assert_called_once_with("NEAT")
+        package_root.joinpath.assert_called_once_with("knowledge")
+        self.assertIs(result, knowledge_root)
+
     def test_source_package_resource_contains_exact_approved_corpus(self) -> None:
         root = assistant_knowledge_root()
         markdown_files = {item.name for item in root.iterdir() if item.name.endswith(".md")}
