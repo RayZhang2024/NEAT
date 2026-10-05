@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: support
 audience: [user, developer, support]
 neat_version: 4.8.2
-verified_commit: cb55653c13567988351537f30a627043b54bb434
+verified_commit: 78ac485cf28044051639306d2f59bcff2728adf6
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
@@ -67,9 +67,11 @@ it does not download, install or replace application files.
 ## Windows end-user releases
 
 Tags matching `v*` run the GitHub release workflow on Python 3.13. It installs
-the project with the `assistant` and `assistant-server` extras, PyInstaller,
-and pinned build-only `briefcase==0.4.5`; it runs the unit suite and keeps the
-wheel/sdist packaging checks. After shared-access preparation it builds the
+the project with the `assistant` and `assistant-server` extras, plus pinned
+build-only `pyinstaller==6.22.2`, `onnxruntime==1.29.0`, and
+`briefcase==0.4.5`; it runs the unit suite and keeps the wheel/sdist packaging
+checks. These build pins do not narrow NEAT's general source-install
+compatibility. After shared-access preparation it builds the
 one-folder application from `NEAT.spec` exactly once and runs
 `dist/NEAT/NEAT.exe --release-smoke-test` before wrapping it.
 
