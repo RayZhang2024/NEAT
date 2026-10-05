@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import contextlib
 import io
+import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -42,6 +44,121 @@ class WindowsDistributionTests(unittest.TestCase):
         (payload / "nested").mkdir()
         (payload / "nested" / "a-data.bin").write_bytes(b"nested")
         return payload
+
+    def run_user_data_safety_script(self, script: str, local_app_data: Path) -> None:
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if not powershell:
+            self.skipTest("PowerShell is required for the user-data safety behavior test")
+        environment = os.environ.copy()
+        environment["ISSUE18_SAFETY_MODULE"] = str(
+            PROJECT_ROOT / "tools/windows_user_data_safety.psm1"
+        )
+        environment["ISSUE18_TEST_LOCALAPPDATA"] = str(local_app_data)
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"PowerShell failed. stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+
+    def test_user_data_test_scope_restores_preexisting_tree_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            local_app_data = Path(directory)
+            neat_data = local_app_data / "NEAT"
+            (neat_data / "assistant_cache" / "chroma").mkdir(parents=True)
+            (neat_data / "empty-directory").mkdir()
+            (neat_data / "assistant_settings.json").write_text(
+                '{"keep":"existing settings"}', encoding="utf-8"
+            )
+            (neat_data / "assistant_cache" / "chroma" / "index.bin").write_bytes(
+                b"existing cache data"
+            )
+            expected_files = {
+                path.relative_to(neat_data).as_posix(): path.read_bytes()
+                for path in neat_data.rglob("*")
+                if path.is_file()
+            }
+            expected_directories = {
+                path.relative_to(neat_data).as_posix()
+                for path in neat_data.rglob("*")
+                if path.is_dir()
+            }
+            script = r'''
+$ErrorActionPreference = "Stop"
+Import-Module $env:ISSUE18_SAFETY_MODULE -Force
+$scope = New-NeatUserDataTestScope -LocalAppDataRoot $env:ISSUE18_TEST_LOCALAPPDATA
+try {
+    if (Test-Path (Join-Path $scope.DataRoot "assistant_settings.json")) {
+        throw "Pre-existing settings were not isolated from the test tree."
+    }
+    if (-not (Test-Path -LiteralPath $scope.BackupPath -PathType Container)) {
+        throw "Pre-existing NEAT data was not backed up."
+    }
+    [System.IO.File]::WriteAllText((Join-Path $scope.DataRoot "test-sentinel.txt"), "test-owned")
+} finally {
+    Restore-NeatUserDataTestScope -Scope $scope
+}
+'''
+            self.run_user_data_safety_script(script, local_app_data)
+
+            restored_files = {
+                path.relative_to(neat_data).as_posix(): path.read_bytes()
+                for path in neat_data.rglob("*")
+                if path.is_file()
+            }
+            restored_directories = {
+                path.relative_to(neat_data).as_posix()
+                for path in neat_data.rglob("*")
+                if path.is_dir()
+            }
+            self.assertEqual(restored_files, expected_files)
+            self.assertEqual(restored_directories, expected_directories)
+            self.assertEqual(list(local_app_data.glob("NEAT.issue18-backup-*")), [])
+
+    def test_user_data_test_scope_removes_only_its_tree_when_no_prior_data_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            local_app_data = Path(directory)
+            script = r'''
+$ErrorActionPreference = "Stop"
+Import-Module $env:ISSUE18_SAFETY_MODULE -Force
+$scope = New-NeatUserDataTestScope -LocalAppDataRoot $env:ISSUE18_TEST_LOCALAPPDATA
+try {
+    [System.IO.File]::WriteAllText((Join-Path $scope.DataRoot "test-sentinel.txt"), "test-owned")
+} finally {
+    Restore-NeatUserDataTestScope -Scope $scope
+}
+'''
+            self.run_user_data_safety_script(script, local_app_data)
+            self.assertFalse((local_app_data / "NEAT").exists())
+            self.assertEqual(list(local_app_data.glob("NEAT.issue18-backup-*")), [])
+
+    def test_msi_smoke_keeps_real_user_data_sentinels_through_uninstall(self) -> None:
+        smoke = (PROJECT_ROOT / "tools/windows_msi_smoke.ps1").read_text(encoding="utf-8")
+        self.assertIn(
+            "New-NeatUserDataTestScope -LocalAppDataRoot $env:LOCALAPPDATA", smoke
+        )
+        self.assertNotIn("$env:LOCALAPPDATA =", smoke)
+        self.assertIn('Join-Path $neatUserData "assistant_settings.json"', smoke)
+        self.assertIn(
+            'Join-Path $neatUserData "assistant_cache\\chroma\\preserve-sentinel.txt"',
+            smoke,
+        )
+        uninstall = smoke.index('"MSI uninstall"')
+        self.assertGreater(smoke.index("$settingsHash ="), smoke.index("try {"))
+        self.assertGreater(smoke.index("$cacheHash ="), smoke.index("try {"))
+        self.assertGreater(smoke.index("per-user assistant settings sentinel"), uninstall)
+        self.assertGreater(smoke.index("per-user assistant cache sentinel"), uninstall)
+        self.assertIn("Restore-NeatUserDataTestScope -Scope $userDataScope", smoke)
+        self.assertIn('"ALLUSERS=2"', smoke)
+        self.assertIn('"MSIINSTALLPERUSER=1"', smoke)
+        self.assertIn("Hive -ne \"HKCU\"", smoke)
 
     def test_manifest_is_sorted_normalized_hashed_and_repeatable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -261,6 +378,7 @@ class WindowsDistributionTests(unittest.TestCase):
         self.assertIn("--no-input", workflow)
         self.assertIn("--release-smoke-test", workflow)
         self.assertIn("windows_msi_smoke.ps1", workflow)
+        self.assertIn("tools/windows_user_data_safety.psm1", workflow)
         self.assertIn('-MsiPath "dist\\$env:DISTRIBUTION_MSI"', workflow)
         self.assertIn("issue18-dummy-only", workflow)
         self.assertIn("NEAT-v${{ env.RELEASE_VERSION }}-portable.zip", workflow)

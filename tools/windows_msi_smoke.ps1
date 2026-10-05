@@ -6,6 +6,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$safetyModule = Join-Path $PSScriptRoot "windows_user_data_safety.psm1"
+Import-Module -Name $safetyModule -Force -ErrorAction Stop
 $msi = (Resolve-Path -LiteralPath $MsiPath).Path
 $manifest = (Resolve-Path -LiteralPath $ManifestPath).Path
 $logs = [System.IO.Path]::GetFullPath($LogDirectory)
@@ -67,17 +69,22 @@ if (Test-Path $installRoot) {
     throw "The deterministic test install location already exists: $installRoot"
 }
 
-$userDataRoot = Join-Path $tempRoot "issue18-user-data"
-$neatUserData = Join-Path $userDataRoot "NEAT"
-$settingsPath = Join-Path $neatUserData "assistant_settings.json"
-$cachePath = Join-Path $neatUserData "assistant_cache\chroma\preserve-sentinel.txt"
-New-Item -ItemType Directory -Path (Split-Path $settingsPath), (Split-Path $cachePath) -Force | Out-Null
-[System.IO.File]::WriteAllText($settingsPath, '{"issue18":"preserve"}', [System.Text.Encoding]::UTF8)
-[System.IO.File]::WriteAllText($cachePath, "preserve user cache", [System.Text.Encoding]::UTF8)
-$settingsHash = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
-$cacheHash = (Get-FileHash -LiteralPath $cachePath -Algorithm SHA256).Hash
+$userDataScope = New-NeatUserDataTestScope -LocalAppDataRoot $env:LOCALAPPDATA
+$neatUserData = $userDataScope.DataRoot
 
 try {
+    $expectedUserDataRoot = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA "NEAT"))
+    if ($neatUserData -ine $expectedUserDataRoot) {
+        throw "MSI preservation test must use the current user's real NEAT data root: $expectedUserDataRoot"
+    }
+    $settingsPath = Join-Path $neatUserData "assistant_settings.json"
+    $cachePath = Join-Path $neatUserData "assistant_cache\chroma\preserve-sentinel.txt"
+    New-Item -ItemType Directory -Path (Split-Path $settingsPath), (Split-Path $cachePath) -Force | Out-Null
+    [System.IO.File]::WriteAllText($settingsPath, '{"issue18":"preserve"}', [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($cachePath, "preserve user cache", [System.Text.Encoding]::UTF8)
+    $settingsHash = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
+    $cacheHash = (Get-FileHash -LiteralPath $cachePath -Algorithm SHA256).Hash
+
     Invoke-Msi @("/i", $msi, "/qn", "/norestart", "/l*v", $installLog, "ALLUSERS=2", "MSIINSTALLPERUSER=1", "INSTALLFOLDER=$installRoot") "MSI install"
     $installed = $true
     if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
@@ -96,15 +103,12 @@ try {
         throw "The NEAT Start Menu launcher does not target $installedExe"
     }
 
-    $previousLocalAppData = $env:LOCALAPPDATA
     $previousSmokeResult = $env:NEAT_RELEASE_SMOKE_RESULT
-    $env:LOCALAPPDATA = $userDataRoot
     $env:NEAT_RELEASE_SMOKE_RESULT = $smokeResult
     try {
         $app = Start-Process -FilePath $installedExe -ArgumentList @("--release-smoke-test") `
             -Wait -PassThru -WindowStyle Hidden
     } finally {
-        $env:LOCALAPPDATA = $previousLocalAppData
         $env:NEAT_RELEASE_SMOKE_RESULT = $previousSmokeResult
     }
     if ($app.ExitCode -ne 0) { throw "Installed NEAT smoke test returned $($app.ExitCode), expected 0." }
@@ -121,25 +125,34 @@ try {
         throw "Uninstall left the NEAT Start Menu launcher behind."
     }
     if (Get-NeatUninstallEntries) { throw "Uninstall left the NEAT installed-app registration behind." }
-    if ((Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash -ne $settingsHash) {
+    if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash -ne $settingsHash) {
         throw "Uninstall removed or changed the per-user assistant settings sentinel."
     }
-    if ((Get-FileHash -LiteralPath $cachePath -Algorithm SHA256).Hash -ne $cacheHash) {
+    if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $cachePath -Algorithm SHA256).Hash -ne $cacheHash) {
         throw "Uninstall removed or changed the per-user assistant cache sentinel."
     }
     if (Test-Path -LiteralPath $installRoot) {
         $leftover = Get-ChildItem -LiteralPath $installRoot -Force -Recurse -ErrorAction SilentlyContinue
         if ($leftover) { throw "Uninstall left application payload files under $installRoot" }
     }
+    Write-Output "Verified real user-data root remained in place through uninstall: $neatUserData"
+    Write-Output "Preserved assistant settings SHA-256: $settingsHash"
+    Write-Output "Preserved assistant cache sentinel SHA-256: $cacheHash"
     Write-Output "MSI install, manifest comparison, installed smoke, Start Menu, uninstall, and user-data preservation passed."
 } finally {
-    if ($installed -and -not $uninstalled) {
-        $cleanupLog = Join-Path $logs "cleanup-uninstall.log"
-        $cleanup = Start-Process -FilePath "msiexec.exe" `
-            -ArgumentList @("/x", $msi, "/qn", "/norestart", "/l*v", $cleanupLog, "ALLUSERS=2", "MSIINSTALLPERUSER=1") `
-            -Wait -PassThru -WindowStyle Hidden
-        if ($cleanup.ExitCode -ne 0) {
-            Write-Warning "Best-effort cleanup uninstall returned $($cleanup.ExitCode); see $cleanupLog"
+    try {
+        if ($installed -and -not $uninstalled) {
+            $cleanupLog = Join-Path $logs "cleanup-uninstall.log"
+            $cleanup = Start-Process -FilePath "msiexec.exe" `
+                -ArgumentList @("/x", $msi, "/qn", "/norestart", "/l*v", $cleanupLog, "ALLUSERS=2", "MSIINSTALLPERUSER=1") `
+                -Wait -PassThru -WindowStyle Hidden
+            if ($cleanup.ExitCode -ne 0) {
+                Write-Warning "Best-effort cleanup uninstall returned $($cleanup.ExitCode); see $cleanupLog"
+            }
         }
+    } finally {
+        Restore-NeatUserDataTestScope -Scope $userDataScope
     }
 }
