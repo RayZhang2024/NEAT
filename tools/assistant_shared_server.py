@@ -6,10 +6,12 @@ import os
 import secrets
 import threading
 from dataclasses import dataclass, field
-from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Literal, Mapping, Optional, Protocol
+from typing import TYPE_CHECKING, Literal, Mapping, Optional, Protocol
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from importlib.resources.abc import Traversable
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
