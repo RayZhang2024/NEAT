@@ -219,6 +219,7 @@ class WindowsDistributionTests(unittest.TestCase):
         self.assertLess(workflow.index("Smoke test packaged"), workflow.index("Create canonical payload manifest"))
         self.assertLess(workflow.index("Create canonical payload manifest"), workflow.index("Package portable ZIP"))
         self.assertLess(workflow.index("Package portable ZIP"), workflow.index("Build per-user MSI"))
+        self.assertIn("New-Item -ItemType Directory -Path $env:BRIEFCASE_HOME -Force", workflow)
         self.assertIn('"RELEASE_PORTABLE=NEAT-$tag-portable.zip"', workflow)
         self.assertIn('"RELEASE_MSI=NEAT-$tag.msi"', workflow)
         self.assertIn("tools.check_release_version", workflow)
@@ -233,6 +234,7 @@ class WindowsDistributionTests(unittest.TestCase):
     def test_dedicated_distribution_workflow_is_python313_and_non_publishing(self) -> None:
         workflow = (PROJECT_ROOT / ".github/workflows/distribution.yml").read_text(encoding="utf-8")
         self.assertIn('python-version: "3.13"', workflow)
+        self.assertIn("New-Item -ItemType Directory -Path $env:BRIEFCASE_HOME -Force", workflow)
         self.assertIn("briefcase==0.4.5", workflow)
         self.assertIn("onnxruntime==1.29.0", workflow)
         self.assertIn("pyinstaller==6.22.2", workflow)

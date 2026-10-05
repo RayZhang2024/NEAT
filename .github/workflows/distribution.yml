@@ -125,6 +125,7 @@ jobs:
         env:
           BRIEFCASE_HOME: ${{ runner.temp }}\neat-briefcase
         run: |
+          New-Item -ItemType Directory -Path $env:BRIEFCASE_HOME -Force | Out-Null
           python -m briefcase package windows -p msi --no-input --adhoc-sign
           if ($LASTEXITCODE -ne 0) { throw "Briefcase MSI packaging failed." }
           python -m tools.windows_distribution verify-briefcase --project-root .
