@@ -1,0 +1,163 @@
+name: Windows Distribution
+
+on:
+  pull_request:
+    paths:
+      - "NEAT.spec"
+      - "pyproject.toml"
+      - "LICENSE"
+      - "README.md"
+      - "tools/windows_distribution.py"
+      - "tools/clean_briefcase_state.py"
+      - "tools/windows_msi_smoke.ps1"
+      - "tools/validate_license_artifacts.py"
+      - "tests/test_windows_distribution.py"
+      - "docs/RELEASE_CHECKLIST.md"
+      - "docs/technical/support/updates_packaging_errors.md"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/distribution.yml"
+  push:
+    branches: [main]
+    paths:
+      - "NEAT.spec"
+      - "pyproject.toml"
+      - "LICENSE"
+      - "README.md"
+      - "tools/windows_distribution.py"
+      - "tools/clean_briefcase_state.py"
+      - "tools/windows_msi_smoke.ps1"
+      - "tools/validate_license_artifacts.py"
+      - "tests/test_windows_distribution.py"
+      - "docs/RELEASE_CHECKLIST.md"
+      - "docs/technical/support/updates_packaging_errors.md"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/distribution.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-distribution:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Read the single package version
+        shell: pwsh
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+          if ($LASTEXITCODE -ne 0) { throw "Could not read the NEAT package version." }
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install NEAT, test, and distribution tools
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[assistant,assistant-server,test]"
+          python -m pip install pyinstaller build ruff mypy "briefcase==0.4.5"
+
+      - name: Verify dependency consistency
+        run: python -m pip check
+
+      - name: Run full unit suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Run Ruff fatal-error gate
+        run: python -m ruff check NEAT tests tools --select E9,F63,F7,F82
+
+      - name: Run targeted type checks
+        run: python -m mypy NEAT/core NEAT/domain NEAT/services --ignore-missing-imports --follow-imports=silent
+
+      - name: Build and verify wheel/sdist license metadata
+        shell: pwsh
+        run: |
+          python -m build --wheel --sdist --outdir dist\python
+          python -m tools.validate_license_artifacts --artifacts-dir dist\python
+
+      - name: Prepare dummy shared-access configuration
+        shell: pwsh
+        env:
+          NEAT_PUBLIC_SHARED_SERVICE_URL: https://ci.invalid
+          NEAT_PUBLIC_SHARED_ACCESS_TOKEN: issue18-dummy-only
+        run: python -m tools.prepare_public_shared_access
+
+      - name: Build the PyInstaller one-folder payload once
+        run: pyinstaller --noconfirm --clean NEAT.spec
+
+      - name: Run direct frozen-payload smoke test
+        shell: pwsh
+        run: |
+          $result = Join-Path $env:RUNNER_TEMP "neat-direct-smoke.txt"
+          $env:NEAT_RELEASE_SMOKE_RESULT = $result
+          $process = Start-Process -FilePath "dist\NEAT\NEAT.exe" `
+            -ArgumentList "--release-smoke-test" -Wait -PassThru -WindowStyle Hidden
+          Get-Content -LiteralPath $result
+          if ($process.ExitCode -ne 0 -or -not (Select-String -Path $result -Pattern "^PASS$" -Quiet)) {
+            throw "Direct PyInstaller smoke failed with exit code $($process.ExitCode)."
+          }
+
+      - name: Create canonical payload manifest
+        run: python -m tools.windows_distribution manifest --payload dist/NEAT --output dist/NEAT-payload-manifest.json
+
+      - name: Create and verify portable ZIP
+        run: python -m tools.windows_distribution portable --payload dist/NEAT --manifest dist/NEAT-payload-manifest.json --output dist/NEAT-v${{ env.RELEASE_VERSION }}-portable.zip
+
+      - name: Clean Briefcase packaging state
+        shell: pwsh
+        run: python -m tools.clean_briefcase_state
+
+      - name: Build MSI non-interactively from the same external payload
+        shell: pwsh
+        env:
+          BRIEFCASE_HOME: ${{ runner.temp }}\neat-briefcase
+        run: |
+          python -m briefcase package windows -p msi --no-input --adhoc-sign
+          if ($LASTEXITCODE -ne 0) { throw "Briefcase MSI packaging failed." }
+          python -m tools.windows_distribution verify-briefcase --project-root .
+          if ($LASTEXITCODE -ne 0) { throw "Briefcase external-payload verification failed." }
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+          if ($LASTEXITCODE -ne 0) { throw "Could not read the NEAT package version." }
+          $source = "dist\NEAT-$version.msi"
+          $filename = "NEAT-v$version.msi"
+          $target = "dist\$filename"
+          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Briefcase MSI not found: $source" }
+          Move-Item -LiteralPath $source -Destination $target
+          "DISTRIBUTION_MSI=$filename" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Validate silent MSI install, launch, and uninstall
+        shell: pwsh
+        run: |
+          ./tools/windows_msi_smoke.ps1 -MsiPath $env:DISTRIBUTION_MSI `
+            -ManifestPath "dist\NEAT-payload-manifest.json" `
+            -LogDirectory (Join-Path $env:RUNNER_TEMP "neat-msi-smoke-logs")
+
+      - name: Upload validated distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: neat-windows-distribution
+          path: |
+            dist/NEAT-v${{ env.RELEASE_VERSION }}-portable.zip
+            dist/${{ env.DISTRIBUTION_MSI }}
+            dist/NEAT-payload-manifest.json
+          if-no-files-found: error
+
+      - name: Upload MSI logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neat-msi-failure-logs
+          path: ${{ runner.temp }}/neat-msi-smoke-logs/*.log
+          if-no-files-found: ignore
