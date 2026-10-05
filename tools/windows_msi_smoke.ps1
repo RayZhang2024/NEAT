@@ -78,7 +78,7 @@ $settingsHash = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
 $cacheHash = (Get-FileHash -LiteralPath $cachePath -Algorithm SHA256).Hash
 
 try {
-    Invoke-Msi @("/i", $msi, "/qn", "/norestart", "/l*v", $installLog, "ALLUSERS=", "MSIINSTALLPERUSER=1", "INSTALLFOLDER=$installRoot") "MSI install"
+    Invoke-Msi @("/i", $msi, "/qn", "/norestart", "/l*v", $installLog, "ALLUSERS=2", "MSIINSTALLPERUSER=1", "INSTALLFOLDER=$installRoot") "MSI install"
     $installed = $true
     if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
         throw "MSI completed but the expected installed executable was not found: $installedExe"
@@ -113,7 +113,7 @@ try {
         if (-not $smokeText.Contains($marker)) { throw "Installed smoke result is missing required marker: $marker" }
     }
 
-    Invoke-Msi @("/x", $msi, "/qn", "/norestart", "/l*v", $uninstallLog, "ALLUSERS=", "MSIINSTALLPERUSER=1") "MSI uninstall"
+    Invoke-Msi @("/x", $msi, "/qn", "/norestart", "/l*v", $uninstallLog, "ALLUSERS=2", "MSIINSTALLPERUSER=1") "MSI uninstall"
     $uninstalled = $true
     if (Test-Path -LiteralPath $installedExe) { throw "Uninstall left the application executable behind: $installedExe" }
     if (Get-NeatShortcutTargets | Where-Object { $_ -eq $installedExe }) {
@@ -135,7 +135,7 @@ try {
     if ($installed -and -not $uninstalled) {
         $cleanupLog = Join-Path $logs "cleanup-uninstall.log"
         $cleanup = Start-Process -FilePath "msiexec.exe" `
-            -ArgumentList @("/x", $msi, "/qn", "/norestart", "/l*v", $cleanupLog, "ALLUSERS=", "MSIINSTALLPERUSER=1") `
+            -ArgumentList @("/x", $msi, "/qn", "/norestart", "/l*v", $cleanupLog, "ALLUSERS=2", "MSIINSTALLPERUSER=1") `
             -Wait -PassThru -WindowStyle Hidden
         if ($cleanup.ExitCode -ne 0) {
             Write-Warning "Best-effort cleanup uninstall returned $($cleanup.ExitCode); see $cleanupLog"

@@ -267,7 +267,16 @@ class WindowsDistributionTests(unittest.TestCase):
         self.assertNotIn("action-gh-release", workflow)
         self.assertNotIn("contents: write", workflow)
         msi_smoke = (PROJECT_ROOT / "tools/windows_msi_smoke.ps1").read_text(encoding="utf-8")
-        for marker in ('"/i"', '"/x"', '"/qn"', '"/norestart"', '"/l*v"', "ExitCode -ne 0"):
+        for marker in (
+            '"/i"',
+            '"/x"',
+            '"/qn"',
+            '"/norestart"',
+            '"/l*v"',
+            '"ALLUSERS=2"',
+            '"MSIINSTALLPERUSER=1"',
+            "ExitCode -ne 0",
+        ):
             self.assertIn(marker, msi_smoke)
         self.assertIn("assistant_settings.json", msi_smoke)
         self.assertIn("assistant_cache", msi_smoke)
