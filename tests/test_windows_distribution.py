@@ -226,12 +226,16 @@ class WindowsDistributionTests(unittest.TestCase):
         self.assertIn("tools.prepare_public_shared_access", workflow)
         self.assertIn("NEAT_SHARED_PUBLIC_ACCESS_TOKEN", workflow)
         self.assertIn("briefcase==0.4.5", workflow)
+        self.assertIn("onnxruntime==1.29.0", workflow)
+        self.assertIn("pyinstaller==6.22.2", workflow)
         self.assertIn("Validate silent MSI lifecycle", workflow)
 
     def test_dedicated_distribution_workflow_is_python313_and_non_publishing(self) -> None:
         workflow = (PROJECT_ROOT / ".github/workflows/distribution.yml").read_text(encoding="utf-8")
         self.assertIn('python-version: "3.13"', workflow)
         self.assertIn("briefcase==0.4.5", workflow)
+        self.assertIn("onnxruntime==1.29.0", workflow)
+        self.assertIn("pyinstaller==6.22.2", workflow)
         self.assertIn("--no-input", workflow)
         self.assertIn("--release-smoke-test", workflow)
         self.assertIn("windows_msi_smoke.ps1", workflow)

@@ -52,7 +52,9 @@ identity is `io.github.rayzhang2024.neat` (Briefcase config stores the prefix
 `io.github.rayzhang2024` and app name `neat`). MSI and asset versions derive
 from `[project].version`; Briefcase maps a PEP 440 version to its MSI numeric
 triple, while the release asset uses the `vX.Y.Z` tag. Do not change the
-identity between releases.
+identity between releases. The Windows build lanes pin PyInstaller `6.22.2`
+and ONNX Runtime `1.29.0` to the locally smoke-tested Python 3.13 build set;
+these are build-environment pins, not NEAT's source-install version bounds.
 
 The MSI can be built from an already validated payload with:
 
