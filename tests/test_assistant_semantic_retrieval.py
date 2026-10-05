@@ -8,6 +8,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_retrieval import load_knowledge_base
 from tools.assistant_semantic_retrieval import (
     knowledge_fingerprint,
@@ -15,7 +16,7 @@ from tools.assistant_semantic_retrieval import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-KNOWLEDGE_DIRECTORY = PROJECT_ROOT / "docs" / "assistant"
+KNOWLEDGE_DIRECTORY = assistant_knowledge_root()
 class AssistantSemanticConfigurationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -36,6 +37,7 @@ class AssistantSemanticConfigurationTests(unittest.TestCase):
             from pathlib import Path
             import NEAT
             from PyQt5.QtCore import QThread
+            from NEAT.package_resources import assistant_knowledge_root
             from tools.assistant_retrieval import load_knowledge_base
             from tools.assistant_semantic_retrieval import ChromaSemanticRetriever
 
@@ -49,7 +51,7 @@ class AssistantSemanticConfigurationTests(unittest.TestCase):
 
                 def run(self):
                     try:
-                        sections = load_knowledge_base(root / "docs" / "assistant")
+                        sections = load_knowledge_base(assistant_knowledge_root())
                         retriever = ChromaSemanticRetriever(
                             sections,
                             persist_directory=root / ".assistant_cache" / "chroma",

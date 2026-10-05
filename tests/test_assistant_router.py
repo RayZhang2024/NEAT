@@ -8,12 +8,13 @@ from pathlib import Path
 from tools.assistant_query_pipeline import ESCALATION_SOURCE_ID, RoutedRetriever
 from tools.assistant_retrieval import SearchResult, load_knowledge_base
 from tools.assistant_router import QuestionRoute, QuestionRouter
+from NEAT.package_resources import assistant_knowledge_root
 from tools.evaluate_assistant_router import evaluate_router, load_routing_questions
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-KNOWLEDGE_DIRECTORY = PROJECT_ROOT / "docs" / "assistant"
-ROUTING_QUESTIONS = KNOWLEDGE_DIRECTORY / "routing_questions.json"
+KNOWLEDGE_DIRECTORY = assistant_knowledge_root()
+ROUTING_QUESTIONS = PROJECT_ROOT / "docs" / "assistant" / "routing_questions.json"
 
 
 class _FakeRetriever:

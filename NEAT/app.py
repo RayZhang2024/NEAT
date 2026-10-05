@@ -17,6 +17,8 @@ from PyQt5.QtCore import QCoreApplication, Qt
 from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap
 from PyQt5.QtWidgets import QApplication, QSplashScreen
 
+from NEAT.package_resources import assistant_knowledge_root, launch_splash_resource
+
 
 def create_app():
     """Configure and create the QApplication instance."""
@@ -40,15 +42,21 @@ def _load_launch_splash_pixmap():
     if meipass:
         candidates.append(Path(meipass) / "NEAT" / "assets" / "launch_splash.png")
 
-    # Source/package layout.
-    candidates.append(Path(__file__).resolve().parent / "assets" / "launch_splash.png")
-
+    # Source/package resource fallback.
     for candidate in candidates:
-        if not candidate.exists():
+        if not candidate.is_file():
             continue
         pixmap = QPixmap(str(candidate))
         if not pixmap.isNull():
             return pixmap
+    try:
+        resource = launch_splash_resource()
+        if resource.is_file():
+            pixmap = QPixmap()
+            if pixmap.loadFromData(resource.read_bytes()):
+                return pixmap
+    except (FileNotFoundError, OSError):
+        pass
     return None
 
 
@@ -196,10 +204,7 @@ def _run_release_smoke_test() -> int:
     from tools.assistant_shared_client import is_shared_service_configured
     _write_release_smoke_result("OK provider adapters")
 
-    runtime_root = Path(
-        getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1])
-    )
-    sections = load_knowledge_base(runtime_root / "docs" / "assistant")
+    sections = load_knowledge_base(assistant_knowledge_root())
     if not sections:
         raise RuntimeError("The packaged assistant knowledge base is empty.")
     _write_release_smoke_result(f"OK knowledge sections={len(sections)}")

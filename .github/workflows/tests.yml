@@ -5,8 +5,16 @@ on:
   pull_request:
 
 jobs:
-  unit-tests:
-    runs-on: ubuntu-latest
+  windows-unit-tests:
+    name: Windows / Python ${{ matrix.python-version }} / unit tests
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    env:
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -14,18 +22,22 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
-      - name: Install package
+      - name: Install package and test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[assistant,assistant-server]"
+          python -m pip install ".[assistant,assistant-server,test]"
 
-      - name: Run unit tests
+      - name: Run full unit suite
         run: python -m unittest discover -s tests -v
 
-  lint:
+  ubuntu-quality:
+    name: Ubuntu / Python 3.13 / developer quality
     runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,16 +47,26 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install lint tool
+      - name: Install package and quality tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ruff
+          python -m pip install ".[assistant,assistant-server,test]" ruff mypy
 
-      - name: Run lint checks
+      - name: Run full unit suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Run Ruff fatal-error gate
         run: python -m ruff check NEAT tests --select E9,F63,F7,F82
 
-  type-check:
-    runs-on: ubuntu-latest
+      - name: Run targeted type checks
+        run: python -m mypy NEAT/core NEAT/domain NEAT/services --ignore-missing-imports --follow-imports=silent
+
+  clean-artifact-installs:
+    name: Windows / Python 3.13 / wheel and sdist installs
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,11 +76,64 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install package and type checker
+      - name: Install build frontend
         run: |
           python -m pip install --upgrade pip
-          python -m pip install .
-          python -m pip install mypy
+          python -m pip install build
 
-      - name: Run type checks
-        run: python -m mypy NEAT/core --ignore-missing-imports --follow-imports=silent
+      - name: Build wheel and source distribution
+        run: python -m build --outdir dist
+
+      - name: Inspect built artifacts
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem dist -Filter "*.whl" | Select-Object -First 1
+          $sdist = Get-ChildItem dist -Filter "*.tar.gz" | Select-Object -First 1
+          if (-not $wheel -or -not $sdist) {
+            throw "Expected both a wheel and an sdist in dist/."
+          }
+          python -m tools.validate_package_artifacts $wheel.FullName $sdist.FullName
+
+      - name: Smoke-test clean wheel install
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist -Filter "*.whl" | Select-Object -First 1).FullName
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "neat-wheel-smoke"
+          New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
+          python -m venv (Join-Path $smokeRoot ".venv")
+          $python = Join-Path $smokeRoot ".venv\Scripts\python.exe"
+          & $python -m pip install $wheel
+          Copy-Item tools\installed_package_smoke.py (Join-Path $smokeRoot "installed_package_smoke.py")
+          $env:NEAT_CHECKOUT_ROOT = $env:GITHUB_WORKSPACE
+          $env:PYTHONPATH = ""
+          Push-Location $smokeRoot
+          try {
+            & $python .\installed_package_smoke.py
+            if ($LASTEXITCODE -ne 0) { throw "Wheel smoke failed." }
+            & $python -m pip check
+            if ($LASTEXITCODE -ne 0) { throw "Wheel pip check failed." }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Smoke-test clean sdist install
+        shell: pwsh
+        run: |
+          $sdist = (Get-ChildItem dist -Filter "*.tar.gz" | Select-Object -First 1).FullName
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "neat-sdist-smoke"
+          New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
+          python -m venv (Join-Path $smokeRoot ".venv")
+          $python = Join-Path $smokeRoot ".venv\Scripts\python.exe"
+          & $python -m pip install $sdist
+          Copy-Item tools\installed_package_smoke.py (Join-Path $smokeRoot "installed_package_smoke.py")
+          $env:NEAT_CHECKOUT_ROOT = $env:GITHUB_WORKSPACE
+          $env:PYTHONPATH = ""
+          Push-Location $smokeRoot
+          try {
+            & $python .\installed_package_smoke.py
+            if ($LASTEXITCODE -ne 0) { throw "Sdist smoke failed." }
+            & $python -m pip check
+            if ($LASTEXITCODE -ne 0) { throw "Sdist pip check failed." }
+          } finally {
+            Pop-Location
+          }

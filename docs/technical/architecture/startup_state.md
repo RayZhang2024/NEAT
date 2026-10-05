@@ -9,9 +9,9 @@ verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [NEAT/app.py, NEAT/ui/main_window.py]
+source_paths: [NEAT/app.py, NEAT/package_resources.py, NEAT/ui/main_window.py]
 source_symbols: [create_app, create_launch_splash, main, FitsViewer.__init__, FitsViewer.load_user_settings, FitsViewer.save_user_settings, FitsViewer.closeEvent]
-test_paths: [tests/test_assistant_panel.py]
+test_paths: [tests/test_assistant_panel.py, tests/test_package_resources.py]
 ---
 
 # Application startup, window composition and persistent state
@@ -23,13 +23,16 @@ Both `python -m NEAT.app` and the installed `neat` command call
 
 1. enables Qt high-DPI scaling and high-DPI pixmaps;
 2. creates one `QApplication` and applies a maximum line-edit height;
-3. displays `NEAT/assets/launch_splash.png`, or a generated fallback;
+3. resolves the packaged `NEAT/assets/launch_splash.png` resource, or displays
+   a generated fallback when it is missing or unreadable;
 4. imports `FitsViewer` after the splash is visible;
 5. builds and shows the main window; and
 6. enters the Qt event loop.
 
 The splash is capped at approximately 1100 by 720 logical pixels and uses the
 screen device-pixel ratio when the source image has enough resolution.
+Source/package installs resolve it through `importlib.resources`; the
+PyInstaller build bundles the same package-owned asset.
 `KeyboardInterrupt` at the event loop produces process exit code 130.
 
 ## Main-window composition

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import html
-from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
+from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_feedback import record_assistant_feedback
 from tools.assistant_runtime import (
     default_assistant_index_directory,
@@ -27,8 +27,6 @@ from PyQt5.QtWidgets import (
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-KNOWLEDGE_DIRECTORY = PROJECT_ROOT / "docs" / "assistant"
 INDEX_DIRECTORY = default_assistant_index_directory()
 
 
@@ -190,7 +188,7 @@ class AssistantRequestWorker(QThread):
                     EnvironmentCredentialStore(),
                 ]
             )
-            sections = load_knowledge_base(KNOWLEDGE_DIRECTORY)
+            sections = load_knowledge_base(assistant_knowledge_root())
             retriever = create_release_safe_retriever(
                 sections,
                 persist_directory=INDEX_DIRECTORY,

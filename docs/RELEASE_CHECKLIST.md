@@ -1,7 +1,9 @@
 # NEAT release checklist
 
 1. Create an issue and implement the scoped change on a branch. Open a PR and
-   let CI complete.
+   let CI complete. Normal CI tests Windows Python 3.10–3.13 and separately
+   builds and clean-installs both wheel and sdist artifacts on Windows Python
+   3.13; the Ubuntu lane is developer-quality feedback only.
 2. Merge the reviewed PR into `main`. Confirm the changelog and the single
    package version in `pyproject.toml` are ready for release.
 3. Tag the already-merged commit as `vX.Y.Z`, where `X.Y.Z` exactly matches the
@@ -32,6 +34,10 @@ publish a commit that is not in `main`; a mismatched tag or package version
 must be corrected before retrying.
 
 ## Packaging note
+
+The wheel and sdist smoke tests run in independent environments outside the
+checkout. They validate the installed package-owned assistant knowledge and
+launch splash; they do not replace the separate PyInstaller release smoke.
 
 The local Python 3.13 package may be unable to initialise packaged ONNX
 Runtime. The release smoke test verifies the supported BM25 retrieval fallback;

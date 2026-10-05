@@ -12,6 +12,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 from pathlib import Path
 import sys
 
+from tools.assistant_retrieval import KNOWLEDGE_FILENAMES
 
 block_cipher = None
 
@@ -95,14 +96,26 @@ for _, candidates in required_runtime_dlls.items():
 
 # Bundle custom splash asset used by NEAT/app.py.
 launch_splash = project_root / "NEAT" / "assets" / "launch_splash.png"
-if launch_splash.exists():
-    datas.append((str(launch_splash), "NEAT/assets"))
+if not launch_splash.is_file():
+    raise FileNotFoundError(f"Missing NEAT launch splash: {launch_splash}")
+datas.append((str(launch_splash), "NEAT/assets"))
 
 # Approved retrieval sources are runtime data, not developer-only documentation.
-assistant_knowledge = project_root / "docs" / "assistant"
-if not assistant_knowledge.exists():
-    raise FileNotFoundError(f"Missing assistant knowledge: {assistant_knowledge}")
-datas.append((str(assistant_knowledge), "docs/assistant"))
+assistant_knowledge = project_root / "NEAT" / "knowledge"
+missing_knowledge = [
+    filename
+    for filename in KNOWLEDGE_FILENAMES
+    if not (assistant_knowledge / filename).is_file()
+]
+if missing_knowledge:
+    raise FileNotFoundError(
+        f"Missing approved assistant knowledge in {assistant_knowledge}: "
+        + ", ".join(missing_knowledge)
+    )
+datas.extend(
+    (str(assistant_knowledge / filename), "NEAT/knowledge")
+    for filename in KNOWLEDGE_FILENAMES
+)
 
 # Official builds include a limited public-client credential for automatic
 # shared access. It is intentionally not the server's OpenAI API key and must

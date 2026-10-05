@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
+from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_answer_evaluation import (
     build_answer_evaluation_record,
     build_error_record,
@@ -34,8 +35,7 @@ from tools.assistant_service import NEATAssistantService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-KNOWLEDGE_DIRECTORY = PROJECT_ROOT / "docs" / "assistant"
-QUESTIONS_PATH = KNOWLEDGE_DIRECTORY / "evaluation_questions.json"
+QUESTIONS_PATH = PROJECT_ROOT / "docs" / "assistant" / "evaluation_questions.json"
 INDEX_DIRECTORY = PROJECT_ROOT / ".assistant_cache" / "chroma"
 OUTPUT_DIRECTORY = PROJECT_ROOT / ".assistant_cache" / "evaluations"
 
@@ -105,7 +105,7 @@ def main() -> int:
     if args.top_k <= 0:
         raise SystemExit("--top-k must be positive")
 
-    sections = load_knowledge_base(KNOWLEDGE_DIRECTORY)
+    sections = load_knowledge_base(assistant_knowledge_root())
     questions = load_evaluation_questions(QUESTIONS_PATH)
     missing_sources = validate_expected_sources(sections, questions)
     if missing_sources:

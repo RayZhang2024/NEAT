@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_retrieval import (
     BM25Retriever,
     evaluate_retriever,
@@ -16,8 +17,8 @@ from tools.assistant_retrieval import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-KNOWLEDGE_DIRECTORY = PROJECT_ROOT / "docs" / "assistant"
-QUESTIONS_PATH = KNOWLEDGE_DIRECTORY / "evaluation_questions.json"
+KNOWLEDGE_DIRECTORY = assistant_knowledge_root()
+QUESTIONS_PATH = PROJECT_ROOT / "docs" / "assistant" / "evaluation_questions.json"
 
 
 class AssistantRetrievalTests(unittest.TestCase):

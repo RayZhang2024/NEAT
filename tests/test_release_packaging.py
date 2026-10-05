@@ -5,9 +5,14 @@ from __future__ import annotations
 import subprocess
 import sys
 import unittest
+import re
 from importlib.metadata import version
 from pathlib import Path
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 import NEAT
 
@@ -27,6 +32,14 @@ class ReleasePackagingTests(unittest.TestCase):
             f"## {project_version}",
             (PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
         )
+
+    def test_python_support_matches_project_metadata_and_readme(self) -> None:
+        project = tomllib.loads(
+            (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        supported = project["project"]["requires-python"]
+        self.assertEqual(supported, ">=3.10,<3.14")
+        self.assertIn(f"`{supported}`", (PROJECT_ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_source_release_smoke_test_loads_all_approved_knowledge(self) -> None:
         completed = subprocess.run(
@@ -55,12 +68,16 @@ class ReleasePackagingTests(unittest.TestCase):
         workflow = (PROJECT_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
         )
+        normalized = workflow.lower()
         self.assertIn(".[assistant,assistant-server]", workflow)
         self.assertIn("--release-smoke-test", workflow)
         self.assertIn("NEAT_RELEASE_SMOKE_RESULT", workflow)
         self.assertIn("tools.prepare_public_shared_access", workflow)
         self.assertIn("NEAT_SHARED_PUBLIC_ACCESS_TOKEN", workflow)
-        self.assertIn('python-version: "3.13"', workflow)
+        self.assertRegex(normalized, r"runs-on:\s*windows-latest")
+        self.assertRegex(normalized, r"python-version:\s*['\"]?3\.13")
+        self.assertIn("python -m unittest discover -s tests -v", workflow)
+        self.assertIn("pyinstaller --noconfirm --clean neat.spec", normalized)
         self.assertIn("fetch-depth: 0", workflow)
         self.assertIn("git merge-base --is-ancestor", workflow)
         self.assertIn("does not match release tag", workflow)
@@ -70,12 +87,30 @@ class ReleasePackagingTests(unittest.TestCase):
         workflow = (PROJECT_ROOT / ".github/workflows/tests.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn(".[assistant,assistant-server]", workflow)
-        self.assertEqual(workflow.count('python-version: "3.13"'), 3)
+        normalized = workflow.lower()
+        self.assertIn(".[assistant,assistant-server,test]", workflow)
+        windows_matrix = re.search(
+            r"windows-unit-tests:(.*?)(?=\n  ubuntu-quality:)", normalized, re.DOTALL
+        )
+        self.assertIsNotNone(windows_matrix)
+        self.assertRegex(windows_matrix.group(1), r"runs-on:\s*windows-latest")
+        version_matrix = re.search(
+            r"python-version:\s*\[([^\]]+)\]", windows_matrix.group(1)
+        )
+        self.assertIsNotNone(version_matrix)
+        matrix_versions = set(re.findall(r"3\.1[0-3]", version_matrix.group(1)))
+        self.assertEqual(matrix_versions, {"3.10", "3.11", "3.12", "3.13"})
+        self.assertIn("python -m unittest discover -s tests -v", windows_matrix.group(1))
+        self.assertIn("clean-artifact-installs:", normalized)
+        self.assertIn("validate_package_artifacts", workflow)
+        self.assertIn("installed_package_smoke.py", workflow)
+        self.assertIn("NEAT/core NEAT/domain NEAT/services", workflow)
+        self.assertIn("python -m build", workflow)
 
     def test_spec_bundles_approved_knowledge_and_dynamic_adapters(self) -> None:
         specification = (PROJECT_ROOT / "NEAT.spec").read_text(encoding="utf-8")
-        self.assertIn('"docs" / "assistant"', specification)
+        self.assertIn('"NEAT" / "knowledge"', specification)
+        self.assertNotIn('"docs" / "assistant"', specification)
         self.assertIn('collect_submodules("tools")', specification)
         self.assertIn('"shared_access.json"', specification)
         self.assertIn('"NEAT/config"', specification)

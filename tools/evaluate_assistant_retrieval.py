@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
+from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_retrieval import (
     BM25Retriever,
     evaluate_retriever,
@@ -16,8 +17,7 @@ from tools.assistant_retrieval import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_KNOWLEDGE_DIRECTORY = PROJECT_ROOT / "docs" / "assistant"
-DEFAULT_QUESTIONS_PATH = DEFAULT_KNOWLEDGE_DIRECTORY / "evaluation_questions.json"
+DEFAULT_QUESTIONS_PATH = PROJECT_ROOT / "docs" / "assistant" / "evaluation_questions.json"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--knowledge-directory",
         type=Path,
-        default=DEFAULT_KNOWLEDGE_DIRECTORY,
+        help="Optional filesystem override for the package-owned knowledge corpus.",
     )
     parser.add_argument(
         "--questions",
@@ -99,7 +99,12 @@ def main() -> int:
     if not 0.0 <= args.minimum_hit_rate <= 1.0:
         raise SystemExit("--minimum-hit-rate must be between 0 and 1")
 
-    sections = load_knowledge_base(args.knowledge_directory.resolve())
+    knowledge_root = (
+        args.knowledge_directory.resolve()
+        if args.knowledge_directory is not None
+        else assistant_knowledge_root()
+    )
+    sections = load_knowledge_base(knowledge_root)
     retriever = BM25Retriever(sections)
 
     if args.query:
