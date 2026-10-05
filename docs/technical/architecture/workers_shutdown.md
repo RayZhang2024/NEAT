@@ -11,7 +11,7 @@ instrument_applicability: [general]
 scientific_review: not-required
 source_paths: [NEAT/ui/main_window.py, NEAT/ui/mixins/preprocessing.py, NEAT/ui/mixins/fitting.py, NEAT/ui/assistant_panel.py, NEAT/workers/preprocessing.py, NEAT/workers/batch.py]
 source_symbols: [FitsViewer.cleanup_resources, AssistantDockWidget.shutdown, SummationWorker.stop, FullProcessWorker.stop, BatchFitEdgesWorker.stop, BatchFitWorker.stop]
-test_paths: [tests/test_preprocessing_workers.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_semantic_retrieval.py]
+test_paths: [tests/test_preprocessing_workers.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_semantic_retrieval.py, tests/test_pattern_batch_worker.py]
 ---
 
 # Worker ownership, progress, cancellation and shutdown
@@ -47,8 +47,12 @@ the calculation checks at safe points:
 
 Cancellation latency therefore depends on the current operation. A large file
 read, image write, curve fit, OpenAI request or other blocking call may finish
-before the flag is checked. A Stop acknowledgement means that cancellation was
-requested, not that the worker has already exited.
+before the flag is checked. `BatchFitWorker` uses an injected numerical engine
+and checks cancellation after a final box fit before writing results, so a stop
+requested during that fit discards unsaved partial results. A Stop
+acknowledgement means that cancellation was requested, not that the worker has
+already exited. `BatchFitEdgesWorker` still uses its existing GUI-owned fitting
+path; that worker is not decoupled here.
 
 The Full Process worker runs child preprocessing workers inside nested
 `QEventLoop` instances. Its own stop flag is checked between stages, but a

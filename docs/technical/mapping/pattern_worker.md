@@ -11,18 +11,18 @@ instrument_applicability: [known-phase image stacks]
 scientific_review: pending
 source_paths: [NEAT/ui/mixins/fitting.py, NEAT/workers/batch.py]
 source_symbols: [FittingMixin.batch_fit, BatchFitWorker]
-test_paths: []
+test_paths: [tests/test_pattern_batch_worker.py, tests/test_batch_mapping_outputs.py]
 ---
 
 # Pattern batch mapping worker
 
 The UI requires an initial full-pattern fit before mapping. For each box, the
-worker sums pixels at every wavelength and calls the MainWindow compatibility
-adapter `FittingMixin.fit_full_pattern_core`, which delegates numerical work to
-`FittingEngine.fit_full_pattern`. The worker still depends on its parent GUI
-object; direct worker-to-engine injection is deferred to Issue #5. Calls use
-`max_nfev=300`, baseline `curve_fit` limit 300, and do not update global lattice
-state.
+worker sums pixels at every wavelength and calls its explicitly injected
+`FittingEngine.fit_full_pattern` instance. The worker has no MainWindow parent
+or GUI callback dependency. Its nested plain-Python fitting configuration is
+deep-copied at construction, while wavelength and image arrays remain shared
+inputs (the worker does not copy the full image stack). Calls use
+`max_nfev=300`, `curve_fit_maxfev=300`, and do not update global lattice state.
 
 On the first successful box, it allocates full detector arrays for fitted
 lattice parameters and uncertainties plus per-edge `s`, `t`, `eta`, their
@@ -35,9 +35,11 @@ Stop is cooperative between boxes and is checked again before result writing,
 so cancellation discards partial unsaved results even when requested during
 the final fit.
 
-Height/FWHM are recalculated on a 14,000-point local model grid using fitted
-lattice/edge values. This expensive calculation occurs for every successful
-box and edge.
+Height/FWHM continue to be recalculated by the worker on a 14,000-point local
+model grid using fitted lattice/edge values; the engine's own height/width
+outputs are not substituted. This calculation occurs for every successful box
+and edge. This decoupling applies only to full-pattern `BatchFitWorker`;
+`BatchFitEdgesWorker` retains its GUI dependency pending Issue #7.
 
 ## Retrieval questions
 

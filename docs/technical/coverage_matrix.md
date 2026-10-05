@@ -31,7 +31,7 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
 | 3 | Fitting | [Uncertainty estimation](fitting/uncertainty.md) | `core/fitting.py`, estimator dialog | Core estimator and fitting tests | Required | P0 | code-verified |
 | 4 | Mapping | [Mapping ROI, boxes and steps](mapping/mapping_geometry.md) | fitting batch controls | ROI geometry and fitting tests | Sampling guidance | P1 | code-verified |
 | 4 | Mapping | [Individual-edge batch worker](mapping/individual_edge_worker.md) | `BatchFitEdgesWorker` | Partial fit-core coverage; no full-worker test | Required | P0 | code-verified |
-| 4 | Mapping | [Pattern batch worker](mapping/pattern_worker.md) | `BatchFitWorker` | Partial context/core tests | Required | P0 | code-verified |
+| 4 | Mapping | [Pattern batch worker](mapping/pattern_worker.md) | `BatchFitWorker`, injected `FittingEngine` | Worker-level engine, failure, cancellation, persistence and signal tests | Required | P0 | code-verified |
 | 4 | Mapping | [Interpolation and missing values](mapping/interpolation_missing.md) | batch worker interpolation | Focused individual interpolation test | Interpretation limits | P0 | code-verified |
 | 4 | Output | [Result CSV schemas and metadata](mapping/result_csv_schema.md) | batch CSV writers | Focused schema snapshot test | Parameter meaning | P0 | code-verified |
 | 5 | Post-processing | [CSV ingestion and metric buttons](postprocessing/csv_ingestion_metrics.md) | `PostProcessingMixin` | No focused parser test | Parameter meaning | P0 | code-verified |
