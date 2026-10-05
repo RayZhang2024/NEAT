@@ -8,9 +8,11 @@ import re
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Iterable, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Iterable, Optional, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from importlib.resources.abc import Traversable
 
 
 KNOWLEDGE_FILENAMES = (

@@ -1,7 +1,12 @@
 """Package-owned runtime resources exposed through Traversable objects."""
 
+from __future__ import annotations
+
 from importlib.resources import files
-from importlib.resources.abc import Traversable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from importlib.resources.abc import Traversable
 
 
 def assistant_knowledge_root() -> Traversable:
