@@ -142,7 +142,7 @@ jobs:
       - name: Validate silent MSI install, launch, and uninstall
         shell: pwsh
         run: |
-          ./tools/windows_msi_smoke.ps1 -MsiPath $env:DISTRIBUTION_MSI `
+          ./tools/windows_msi_smoke.ps1 -MsiPath "dist\$env:DISTRIBUTION_MSI" `
             -ManifestPath "dist\NEAT-payload-manifest.json" `
             -LogDirectory (Join-Path $env:RUNNER_TEMP "neat-msi-smoke-logs")
 

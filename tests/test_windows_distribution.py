@@ -241,6 +241,7 @@ class WindowsDistributionTests(unittest.TestCase):
         self.assertIn("--no-input", workflow)
         self.assertIn("--release-smoke-test", workflow)
         self.assertIn("windows_msi_smoke.ps1", workflow)
+        self.assertIn('-MsiPath "dist\\$env:DISTRIBUTION_MSI"', workflow)
         self.assertIn("issue18-dummy-only", workflow)
         self.assertIn("NEAT-v${{ env.RELEASE_VERSION }}-portable.zip", workflow)
         self.assertNotIn("action-gh-release", workflow)
