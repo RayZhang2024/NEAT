@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import contextlib
 import io
+import shutil
 import tempfile
 import unittest
 import uuid
@@ -22,6 +23,7 @@ from tools.windows_distribution import (
     create_manifest,
     create_portable_zip,
     verify_directory,
+    verify_installed_directory,
     verify_briefcase_output,
     verify_portable_zip,
     write_manifest,
@@ -87,6 +89,24 @@ class WindowsDistributionTests(unittest.TestCase):
             (payload / "z-resource.dat").unlink()
             with self.assertRaisesRegex(DistributionError, "missing"):
                 verify_directory(payload, manifest_path)
+
+    def test_installed_verification_allows_only_briefcase_msi_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self.make_payload(root)
+            manifest_path = root / "manifest.json"
+            write_manifest(payload, manifest_path)
+            installed = root / "installed"
+            shutil.copytree(payload, installed)
+            hooks = installed / "_installer"
+            hooks.mkdir()
+            (hooks / "run_post_install.bat").write_text("installer hook", encoding="utf-8")
+            (hooks / "run_pre_uninstall.bat").write_text("uninstaller hook", encoding="utf-8")
+
+            verify_installed_directory(installed, manifest_path)
+            (hooks / "unexpected.bat").write_text("not a Briefcase hook", encoding="utf-8")
+            with self.assertRaisesRegex(DistributionError, "extra"):
+                verify_installed_directory(installed, manifest_path)
 
     def test_portable_zip_contains_exact_payload_under_one_neat_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -251,6 +271,7 @@ class WindowsDistributionTests(unittest.TestCase):
             self.assertIn(marker, msi_smoke)
         self.assertIn("assistant_settings.json", msi_smoke)
         self.assertIn("assistant_cache", msi_smoke)
+        self.assertIn("verify-installed", msi_smoke)
 
 
 if __name__ == "__main__":

@@ -84,7 +84,7 @@ try {
         throw "MSI completed but the expected installed executable was not found: $installedExe"
     }
 
-    python -m tools.windows_distribution verify-directory --payload $installRoot --manifest $manifest
+    python -m tools.windows_distribution verify-installed --payload $installRoot --manifest $manifest
     if ($LASTEXITCODE -ne 0) { throw "Installed payload does not match its manifest." }
 
     $registryEntries = @(Get-NeatUninstallEntries)

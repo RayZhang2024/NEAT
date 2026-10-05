@@ -147,6 +147,27 @@ def verify_directory(payload_root: Path, manifest_path: Path) -> None:
     _compare_manifests(expected, actual, str(payload_root))
 
 
+def verify_installed_directory(payload_root: Path, manifest_path: Path) -> None:
+    """Compare an MSI install with the payload, excluding only Briefcase's two MSI hooks."""
+
+    expected = read_manifest(manifest_path)
+    actual = create_manifest(payload_root)
+    briefcase_hooks = {
+        "_installer/run_post_install.bat",
+        "_installer/run_pre_uninstall.bat",
+    }
+    actual_paths = {entry["path"] for entry in actual["files"]}
+    present_hooks = actual_paths & briefcase_hooks
+    if present_hooks != briefcase_hooks:
+        missing_hooks = sorted(briefcase_hooks - present_hooks)
+        raise DistributionError(f"MSI install is missing expected Briefcase hooks: {missing_hooks}")
+    filtered = {
+        **actual,
+        "files": [entry for entry in actual["files"] if entry["path"] not in briefcase_hooks],
+    }
+    _compare_manifests(expected, filtered, str(payload_root))
+
+
 def create_portable_zip(payload_root: Path, manifest_path: Path, archive_path: Path) -> None:
     root = Path(payload_root).resolve(strict=True)
     destination = Path(archive_path).resolve()
@@ -280,6 +301,12 @@ def main() -> int:
     directory_parser.add_argument("--payload", type=Path, required=True)
     directory_parser.add_argument("--manifest", type=Path, required=True)
 
+    installed_parser = commands.add_parser(
+        "verify-installed", help="verify an MSI install against a payload manifest"
+    )
+    installed_parser.add_argument("--payload", type=Path, required=True)
+    installed_parser.add_argument("--manifest", type=Path, required=True)
+
     briefcase_parser = commands.add_parser(
         "verify-briefcase", help="verify the generated external-app MSI configuration"
     )
@@ -298,6 +325,9 @@ def main() -> int:
             print(f"Portable payload matches manifest: {args.archive}")
         elif args.command == "verify-briefcase":
             verify_briefcase_output(args.project_root)
+        elif args.command == "verify-installed":
+            verify_installed_directory(args.payload, args.manifest)
+            print(f"Installed payload matches manifest plus Briefcase MSI hooks: {args.payload}")
         else:
             verify_directory(args.payload, args.manifest)
             print(f"Directory payload matches manifest: {args.payload}")

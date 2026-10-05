@@ -68,8 +68,11 @@ distribution workflow. Its MSI smoke silently installs to a temporary
 per-user location, compares files to the payload manifest, launches
 `NEAT.exe --release-smoke-test`, then silently uninstalls and checks that the
 Start Menu shortcut and uninstall registration are gone while user settings
-and cache sentinels remain. On failure, retain the verbose install/uninstall
-logs as workflow artifacts. For manual acceptance, use the generated MSI on a
+and cache sentinels remain. The installed-file comparison permits only the two
+Briefcase-generated `_installer/run_post_install.bat` and
+`_installer/run_pre_uninstall.bat` hooks beyond the manifest; other extra files
+fail validation. On failure, retain the verbose install/uninstall logs as
+workflow artifacts. For manual acceptance, use the generated MSI on a
 clean Windows account and verify the same install, launch and uninstall steps;
 do not substitute a machine-wide `Program Files` install.
 
