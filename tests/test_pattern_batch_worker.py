@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from NEAT.core import fitting_function_3
+from NEAT.domain import FullPatternFitConfig
 from NEAT.services.fitting_engine import FittingEngine
 from NEAT.workers.batch import BatchFitWorker
 
@@ -48,6 +49,11 @@ class TestPatternBatchWorker(unittest.TestCase):
             },
             "selected_phase": "Fe_bcc",
             "flight_path": 10.0,
+            "flight_path_source": "settings",
+            "data_source": "images",
+            "input_file": "source.fits",
+            "min_wavelength": 1.0,
+            "max_wavelength": 2.2,
             "bragg_rows_text": ["(1;1;0)|row"],
             "bragg_rows": [
                 {
@@ -84,11 +90,19 @@ class TestPatternBatchWorker(unittest.TestCase):
                        for index in range(len(intensities))]
 
     def make_worker(self, folder, engine=None, *, fix_s=False, fix_t=False, fix_eta=False):
+        output_metadata = {
+            key: self.fit_context.get(key)
+            for key in (
+                "flight_path", "flight_path_source", "data_source", "input_file",
+                "min_wavelength", "max_wavelength", "selected_phase", "bragg_rows_text",
+            )
+        }
         return BatchFitWorker(
             fitting_engine=engine or FittingEngine(),
             images=self.images,
             wavelengths=self.wavelengths,
-            fit_context=self.fit_context,
+            fit_config=FullPatternFitConfig.from_legacy_dict(self.fit_context),
+            output_metadata=output_metadata,
             min_x=0,
             max_x=1,
             min_y=0,
@@ -139,16 +153,25 @@ class TestPatternBatchWorker(unittest.TestCase):
             self.assertFalse(engine.last_fit_kwargs["fix_s"])
             self.assertFalse(engine.last_fit_kwargs["fix_t"])
             self.assertFalse(engine.last_fit_kwargs["fix_eta"])
-            engine_width = engine.fit_full_pattern(
+            engine_result, engine_error = engine.fit_full_pattern(
                 wavelengths=self.wavelengths,
                 intensities=np.asarray([image[0, 0] for image in self.images]),
-                fit_config=worker.fit_context,
+                fit_config=worker.fit_config,
                 max_nfev=300,
                 curve_fit_maxfev=300,
-            )[0]["edge_widths"][self.hkl]
-            self.assertNotAlmostEqual(worker.width_array[0, 0, 0], engine_width, delta=1e-5)
+            )
+            self.assertIsNone(engine_error)
+            self.assertNotAlmostEqual(
+                worker.width_array[0, 0, 0], engine_result.edge_widths[self.hkl], delta=1e-5
+            )
             csv_text = paths[0].read_text(encoding="utf-8")
             self.assertIn("selected_phase,Fe_bcc", csv_text)
+            self.assertIn("flight_path,10.0", csv_text)
+            self.assertIn("flight_path_source,settings", csv_text)
+            self.assertIn("data_source,images", csv_text)
+            self.assertIn("input_file,source.fits", csv_text)
+            self.assertIn("min_wavelength,1.0", csv_text)
+            self.assertIn("max_wavelength,2.2", csv_text)
             self.assertIn("bragg_table_row_1,(1;1;0)|row", csv_text)
             self.assertIn("s_110", csv_text)
 
@@ -207,12 +230,12 @@ class TestPatternBatchWorker(unittest.TestCase):
             self.fit_context["fitting_parameter_bounds"]["s"] = (9.0, 10.0)
             self.fit_context["bragg_rows_text"][0] = "changed"
 
-            self.assertEqual(worker.fit_context["lattice_params"]["a"], 1.2)
+            self.assertEqual(worker.fit_config.lattice_params["a"], 1.2)
             self.assertEqual(
-                worker.fit_context["bragg_rows"][0]["regions"][0]["min_wavelength"],
+                worker.fit_config.bragg_rows[0].regions[0].min_wavelength,
                 1.4,
             )
-            self.assertEqual(worker.fit_context["fitting_parameter_bounds"]["s"], (0.0001, 0.02))
+            self.assertEqual(worker.fit_config.fitting_parameter_bounds.s, (0.0001, 0.02))
             self.assertEqual(worker.metadata_snapshot["bragg_rows_text"], ["(1;1;0)|row"])
             self.assertIs(worker.images, self.images)
             self.assertIs(worker.images[0], self.images[0])

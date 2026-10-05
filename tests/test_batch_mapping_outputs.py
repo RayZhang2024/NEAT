@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from NEAT.domain import FullPatternFitConfig
 from NEAT.services.fitting_engine import FittingEngine
 from NEAT.workers.batch import (
     BatchFitWorker,
@@ -126,7 +127,8 @@ class TestBatchMappingOutputs(unittest.TestCase):
                 fitting_engine=UnexpectedPatternFit(),
                 images=[np.zeros((5, 5), dtype=np.float32)],
                 wavelengths=np.array([1.0]),
-                fit_context={},
+                fit_config=FullPatternFitConfig(),
+                output_metadata={},
                 min_x=0,
                 max_x=1,
                 min_y=0,
@@ -153,7 +155,8 @@ class TestBatchMappingOutputs(unittest.TestCase):
                 fitting_engine=FittingEngine(),
                 images=[image],
                 wavelengths=np.array([1.0]),
-                fit_context={},
+                fit_config=FullPatternFitConfig(),
+                output_metadata={},
                 min_x=0,
                 max_x=5,
                 min_y=0,

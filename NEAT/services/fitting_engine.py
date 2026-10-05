@@ -2,26 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import numpy as np
 from scipy.optimize import curve_fit, least_squares
 
 from ..core import fitting_function_1, fitting_function_2, fitting_function_3
 from ..core.fitting import (
-    DEFAULT_FITTING_PARAMETER_BOUNDS,
     calculate_x_hkl_general,
     initial_value_within_bounds,
-    normalize_fitting_parameter_bounds,
 )
+from ..domain import FullPatternEdgeFit, FullPatternFitConfig, FullPatternFitResult
 
 
 class FittingEngine:
-    """Run full-pattern fitting from explicit arrays and plain-Python config.
-
-    ``fit_config`` uses the existing dictionary representation intentionally;
-    introducing dedicated config/result models is reserved for Issue #6.
-    """
+    """Run full-pattern fitting from explicit arrays and typed scientific config."""
 
     _STRUCTURE_CONFIG: ClassVar[dict[str, list[str]]] = {
         "cubic": ["a"],
@@ -36,57 +31,54 @@ class FittingEngine:
         self,
         wavelengths: np.ndarray,
         intensities: np.ndarray,
-        fit_config: dict[str, Any],
+        fit_config: FullPatternFitConfig,
         *,
         fix_s: bool = False,
         fix_t: bool = False,
         fix_eta: bool = False,
         max_nfev: int = 300,
         curve_fit_maxfev: int | None = None,
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        """Fit a spectrum using explicit arrays and a batch-context snapshot."""
-        structure_type = fit_config.get("structure_type", "cubic")
+    ) -> tuple[FullPatternFitResult | None, str | None]:
+        """Fit a spectrum using the typed full-pattern scientific contract."""
+        if not isinstance(fit_config, FullPatternFitConfig):
+            raise TypeError("fit_config must be FullPatternFitConfig")
+        structure_type = fit_config.structure_type
         if structure_type not in self._STRUCTURE_CONFIG:
             return None, f"Unsupported structure type: {structure_type}"
 
         required_params = self._STRUCTURE_CONFIG[structure_type]
-        lattice_params = dict(fit_config.get("lattice_params") or {})
+        lattice_params = dict(fit_config.lattice_params)
         if not lattice_params:
             return None, "Lattice parameters not initialized"
         missing_params = [name for name in required_params if name not in lattice_params]
         if missing_params:
             return None, f"Missing parameters for {structure_type}: {missing_params}"
 
-        try:
-            parameter_bounds = normalize_fitting_parameter_bounds(
-                fit_config.get("fitting_parameter_bounds", DEFAULT_FITTING_PARAMETER_BOUNDS)
-            )
-        except ValueError:
-            parameter_bounds = normalize_fitting_parameter_bounds()
+        parameter_bounds = fit_config.fitting_parameter_bounds
 
         wavelengths_data = np.asarray(wavelengths)
         intensities_data = np.asarray(intensities)
         if wavelengths_data.shape != intensities_data.shape:
             return None, "Wavelength and intensity arrays must have the same shape"
 
-        source_rows = list(fit_config.get("bragg_rows") or [])
+        source_rows = fit_config.bragg_rows
         if not source_rows:
             return None, "No Bragg edges to fit"
 
-        bragg_edges = []
-        for row, row_data in enumerate(source_rows):
-            if not row_data.get("valid"):
+        bragg_edges: list[FullPatternEdgeFit] = []
+        for row_data in source_rows:
+            if not row_data.valid:
                 continue
-            hkl = row_data.get("hkl")
-            regions = row_data.get("regions")
+            hkl = row_data.hkl
+            regions = row_data.regions
             if hkl is None or not regions or len(regions) < 3:
                 continue
-            s_val = row_data.get("s", 0.001)
-            t_val = row_data.get("t", 0.01)
-            eta_val = row_data.get("eta", 0.5)
+            s_val, t_val, eta_val = row_data.s, row_data.t, row_data.eta
+            if s_val is None or t_val is None or eta_val is None:
+                continue
 
-            r3_min = regions[2]["min_wavelength"]
-            r3_max = regions[2]["max_wavelength"]
+            r3_min = regions[2].min_wavelength
+            r3_max = regions[2].max_wavelength
             mask_r3 = (wavelengths_data >= r3_min) & (wavelengths_data <= r3_max)
             x_r3 = wavelengths_data[mask_r3]
             y_r3 = intensities_data[mask_r3]
@@ -94,8 +86,8 @@ class FittingEngine:
                 continue
 
             try:
-                mask_r1 = (wavelengths_data >= regions[1]["min_wavelength"]) & (
-                    wavelengths_data <= regions[1]["max_wavelength"]
+                mask_r1 = (wavelengths_data >= regions[1].min_wavelength) & (
+                    wavelengths_data <= regions[1].max_wavelength
                 )
                 x_r1, y_r1 = wavelengths_data[mask_r1], intensities_data[mask_r1]
                 cf_kwargs = {} if curve_fit_maxfev is None else {"maxfev": curve_fit_maxfev}
@@ -109,8 +101,8 @@ class FittingEngine:
                 )
                 a0, b0 = popt_r1
 
-                mask_r2 = (wavelengths_data >= regions[0]["min_wavelength"]) & (
-                    wavelengths_data <= regions[0]["max_wavelength"]
+                mask_r2 = (wavelengths_data >= regions[0].min_wavelength) & (
+                    wavelengths_data <= regions[0].max_wavelength
                 )
                 x_r2, y_r2 = wavelengths_data[mask_r2], intensities_data[mask_r2]
                 popt_r2, _ = curve_fit(
@@ -124,21 +116,11 @@ class FittingEngine:
             except (RuntimeError, ValueError, TypeError, FloatingPointError) as exc:
                 return None, f"Fitting error for hkl{hkl}: {exc}"
 
-            bragg_edges.append(
-                {
-                    "hkl": hkl,
-                    "a0": a0,
-                    "b0": b0,
-                    "a_hkl": a_hkl,
-                    "b_hkl": b_hkl,
-                    "s": s_val,
-                    "t": t_val,
-                    "eta": eta_val,
-                    "x_r3": x_r3,
-                    "y_r3": y_r3,
-                    "regions": regions,
-                }
-            )
+            bragg_edges.append(FullPatternEdgeFit(
+                hkl=hkl, a0=a0, b0=b0, a_hkl=a_hkl, b_hkl=b_hkl,
+                s=s_val, t=t_val, eta=eta_val,
+                x_r3=x_r3, y_r3=y_r3, regions=regions,
+            ))
 
         if not bragg_edges:
             return None, "No valid edges with Region 3 data"
@@ -149,15 +131,15 @@ class FittingEngine:
         upper_bounds = [value * 1.05 for value in lattice_initial]
         for edge in bragg_edges:
             for key in ("a0", "b0", "a_hkl", "b_hkl"):
-                value = edge[key]
+                value = getattr(edge, key)
                 half = max(abs(value), 1)
                 initial_guess.append(value)
                 lower_bounds.append(value - half)
                 upper_bounds.append(value + half)
 
-        s_initial = [edge["s"] for edge in bragg_edges]
-        t_initial = [edge["t"] for edge in bragg_edges]
-        eta_initial = [edge["eta"] for edge in bragg_edges]
+        s_initial = [edge.s for edge in bragg_edges]
+        t_initial = [edge.t for edge in bragg_edges]
+        eta_initial = [edge.eta for edge in bragg_edges]
         for fixed, values, name in (
             (fix_s, s_initial, "s"),
             (fix_t, t_initial, "t"),
@@ -170,10 +152,10 @@ class FittingEngine:
                     lower_bounds.append(lower)
                     upper_bounds.append(upper)
 
-        concatenated_x = np.concatenate([edge["x_r3"] for edge in bragg_edges])
-        concatenated_y = np.concatenate([edge["y_r3"] for edge in bragg_edges])
+        concatenated_x = np.concatenate([edge.x_r3 for edge in bragg_edges])
+        concatenated_y = np.concatenate([edge.y_r3 for edge in bragg_edges])
         edge_indices = np.concatenate(
-            [np.full_like(edge["x_r3"], i, dtype=int) for i, edge in enumerate(bragg_edges)]
+            [np.full_like(edge.x_r3, i, dtype=int) for i, edge in enumerate(bragg_edges)]
         )
         n_lat = len(required_params)
         n_edge = len(bragg_edges)
@@ -200,8 +182,8 @@ class FittingEngine:
             for edge_idx, edge in enumerate(bragg_edges):
                 mask = edge_indices == edge_idx
                 a0_fit, b0_fit, a_hkl_fit, b_hkl_fit = ab_block[edge_idx]
-                r3_min = edge["regions"][2]["min_wavelength"]
-                r3_max = edge["regions"][2]["max_wavelength"]
+                r3_min = edge.regions[2].min_wavelength
+                r3_max = edge.regions[2].max_wavelength
                 model[mask] = fitting_function_3(
                     concatenated_x[mask],
                     a0_fit,
@@ -211,7 +193,7 @@ class FittingEngine:
                     s_params[edge_idx],
                     t_params[edge_idx],
                     eta_params[edge_idx],
-                    [edge["hkl"]],
+                    [edge.hkl],
                     r3_min,
                     r3_max,
                     structure_type,
@@ -282,38 +264,15 @@ class FittingEngine:
             fitted_eta_vals,
             eta_uncertainties,
         ):
-            s_unc_dict[edge["hkl"]] = s_unc
-            t_unc_dict[edge["hkl"]] = t_unc
-            eta_unc_dict[edge["hkl"]] = eta_unc
+            s_unc_dict[edge.hkl] = s_unc
+            t_unc_dict[edge.hkl] = t_unc
+            eta_unc_dict[edge.hkl] = eta_unc
 
         model_vals = concatenated_y - final_res
         order = np.argsort(concatenated_x)
-        result_dict = {
-            "ab_fits": {
-                edge["hkl"]: tuple(ab_fit_block[i]) for i, edge in enumerate(bragg_edges)
-            },
-            "bragg_edges": bragg_edges,
-            "structure_type": structure_type,
-            "lattice_params": lattice_fit,
-            "lattice_uncertainties": lattice_uncertainties,
-            "fitted_s": {edge["hkl"]: value for edge, value in zip(bragg_edges, fitted_s_vals)},
-            "fitted_t": {edge["hkl"]: value for edge, value in zip(bragg_edges, fitted_t_vals)},
-            "fitted_eta": {edge["hkl"]: value for edge, value in zip(bragg_edges, fitted_eta_vals)},
-            "s_uncertainties": s_unc_dict,
-            "t_uncertainties": t_unc_dict,
-            "eta_uncertainties": eta_unc_dict,
-            "x_data": concatenated_x[order],
-            "y_data": model_vals[order],
-            "x_exp_sorted": concatenated_x[order],
-            "y_exp_sorted": concatenated_y[order],
-            "residuals": final_res,
-            "success": result.success,
-            "message": result.message,
-        }
-
         edge_heights, edge_widths = {}, {}
         for i, edge in enumerate(bragg_edges):
-            hkl = edge["hkl"]
+            hkl = edge.hkl
             x_vals = calculate_x_hkl_general(structure_type, lattice_fit, [hkl])
             d_hkl = x_vals[0] / 2.0 if x_vals and not np.isnan(x_vals[0]) else np.nan
             if np.isnan(d_hkl) or d_hkl <= 0:
@@ -326,8 +285,8 @@ class FittingEngine:
                 fitted_t_vals[i],
                 fitted_eta_vals[i],
             )
-            r3_min = edge["regions"][2]["min_wavelength"]
-            r3_max = edge["regions"][2]["max_wavelength"]
+            r3_min = edge.regions[2].min_wavelength
+            r3_max = edge.regions[2].max_wavelength
             try:
                 xx_h = np.linspace(r3_min, r3_max, 4000)
                 yy_h = fitting_function_3(
@@ -364,6 +323,25 @@ class FittingEngine:
             edge_heights[hkl] = edge_height
             edge_widths[hkl] = edge_width
 
-        result_dict["edge_heights"] = edge_heights
-        result_dict["edge_widths"] = edge_widths
-        return result_dict, None
+        return FullPatternFitResult(
+            ab_fits={edge.hkl: tuple(ab_fit_block[i]) for i, edge in enumerate(bragg_edges)},
+            bragg_edges=tuple(bragg_edges),
+            structure_type=structure_type,
+            lattice_params=lattice_fit,
+            lattice_uncertainties=lattice_uncertainties,
+            fitted_s={edge.hkl: value for edge, value in zip(bragg_edges, fitted_s_vals)},
+            fitted_t={edge.hkl: value for edge, value in zip(bragg_edges, fitted_t_vals)},
+            fitted_eta={edge.hkl: value for edge, value in zip(bragg_edges, fitted_eta_vals)},
+            s_uncertainties=s_unc_dict,
+            t_uncertainties=t_unc_dict,
+            eta_uncertainties=eta_unc_dict,
+            x_data=concatenated_x[order],
+            y_data=model_vals[order],
+            x_exp_sorted=concatenated_x[order],
+            y_exp_sorted=concatenated_y[order],
+            residuals=final_res,
+            success=result.success,
+            message=result.message,
+            edge_heights=edge_heights,
+            edge_widths=edge_widths,
+        ), None

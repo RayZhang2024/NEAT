@@ -5,22 +5,31 @@ doc_type: technical_reference
 functional_area: fitting
 audience: [user, scientist, developer]
 neat_version: 4.8.0
-verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
+verified_commit: 1fae0f0f2cd5d7736c7be06c8575a13234dd6e81
 status: code-verified
 instrument_applicability: [known phases]
 scientific_review: pending
-source_paths: [NEAT/services/fitting_engine.py, NEAT/ui/mixins/fitting.py]
-source_symbols: [FittingEngine.fit_full_pattern, FittingMixin.fit_full_pattern_core, FittingMixin.fit_full_pattern]
-test_paths: [tests/test_fitting_engine.py, tests/test_fitting_headless.py]
+source_paths: [NEAT/domain/fitting.py, NEAT/services/fitting_engine.py, NEAT/ui/mixins/fitting.py]
+source_symbols: [FullPatternFitConfig, FullPatternFitResult, FullPatternEdgeFit, FittingEngine.fit_full_pattern, FittingMixin.fit_full_pattern_core, FittingMixin.fit_full_pattern]
+test_paths: [tests/test_fitting_domain.py, tests/test_fitting_engine.py, tests/test_fitting_headless.py]
 ---
 
 # Multi-edge pattern fitting
 
 `FittingEngine.fit_full_pattern` performs the numerical pattern fit from
-explicit wavelength/intensity arrays and a plain-Python fit-context snapshot.
+explicit wavelength/intensity arrays and `FullPatternFitConfig`. Its primary
+result is `FullPatternFitResult`, including ordered typed `FullPatternEdgeFit`
+entries. Fixed/free flags and solver limits remain explicit call arguments.
 The UI-facing `FittingMixin.fit_full_pattern_core` remains a compatibility
-adapter: it snapshots UI inputs, delegates to the engine, and applies the
-successful lattice update when requested.
+adapter: it converts the legacy table/context dictionary to the typed config,
+delegates to the engine, converts a successful result back to the existing
+dictionary shape, and applies the lattice update when requested.
+
+`_build_batch_fit_context()` still returns the plain shared table snapshot
+used by both batch modes. Only the full-pattern path converts its scientific
+fields to typed models; `BatchFitEdgesWorker` continues using the legacy
+dictionary until Issue #7. Output provenance and mapping geometry are not
+part of the scientific config.
 
 Pattern fitting requires a supported known structure and its required lattice
 parameters. Valid Edge Table rows with Region 3 data are collected. Each edge’s
@@ -31,9 +40,12 @@ parameters per edge. Each unfixed shape parameter is still independent per
 edge. Lattice values are bounded ±5%. Baseline bounds use
 `value ± max(abs(value),1)`. Unfixed pattern bounds are:
 
-- `s`: 0.0005–0.01, initial 0.01
-- `t`: 0.01–0.1, initial 0.02
-- `eta`: 0–1, initial 0.5
+- `s`: 0.0001–0.01
+- `t`: 0.01–0.1
+- `eta`: 0–1
+
+Initial shape values come from the valid Edge Table rows, subject to the
+configured bounds when those values are free.
 
 Default `max_nfev` is 300. The residual returned to the solver is
 `observed-model`. A failed solver returns no result. Successful fitting can

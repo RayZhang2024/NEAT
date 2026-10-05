@@ -67,6 +67,7 @@ from ...core.fitting import (
     initial_value_within_bounds,
     normalize_fitting_parameter_bounds,
 )
+from ...domain import FullPatternFitConfig
 from ...services.fitting_engine import FittingEngine
 from ...workers.batch import (
     BatchFitEdgesWorker,
@@ -1681,10 +1682,11 @@ class FittingMixin:
 
         wavelengths_data = self.wavelengths if wavelengths is None else np.asarray(wavelengths)
         intensities_data = self.intensities if intensities is None else np.asarray(intensities)
-        result_dict, error_msg = FittingEngine().fit_full_pattern(
+        fit_config = FullPatternFitConfig.from_legacy_dict(context)
+        result, error_msg = FittingEngine().fit_full_pattern(
             wavelengths_data,
             intensities_data,
-            context,
+            fit_config,
             fix_s=fix_s,
             fix_t=fix_t,
             fix_eta=fix_eta,
@@ -1693,13 +1695,13 @@ class FittingMixin:
         )
 
         if (
-            result_dict is not None
+            result is not None
             and error_msg is None
             and apply_lattice_update
             and hasattr(self, "lattice_params")
         ):
-            self.lattice_params.update(result_dict["lattice_params"])
-        return result_dict, error_msg
+            self.lattice_params.update(result.lattice_params)
+        return result.to_legacy_dict() if result is not None else None, error_msg
 
     def fit_full_pattern(self, skip_plot=False):
         """High-level method that calls fit_full_pattern_core and updates GUI elements."""
@@ -5889,13 +5891,21 @@ class FittingMixin:
         fix_t = self.fix_t_enabled()
         fix_eta = self.fix_eta_enabled()
         fit_context = self._build_batch_fit_context()
+        output_metadata = {
+            key: fit_context.get(key)
+            for key in (
+                "flight_path", "flight_path_source", "data_source", "input_file",
+                "min_wavelength", "max_wavelength", "selected_phase", "bragg_rows_text",
+            )
+        }
 
         # Start the batch fitting worker
         self.batch_fit_worker = BatchFitWorker(
             fitting_engine=FittingEngine(),
             images=self.images,
             wavelengths=self.wavelengths,
-            fit_context=fit_context,
+            fit_config=FullPatternFitConfig.from_legacy_dict(fit_context),
+            output_metadata=output_metadata,
             min_x=min_x,
             max_x=max_x,
             min_y=min_y,

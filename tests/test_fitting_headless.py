@@ -14,8 +14,10 @@ from NEAT.core.fitting import (
     initial_value_within_bounds,
     normalize_fitting_parameter_bounds,
 )
+from NEAT.domain import FullPatternFitConfig
 from NEAT.ui.mixins.fitting import FittingMixin
 from NEAT.workers.batch import (
+    BatchFitEdgesWorker,
     get_nexus_image_stack_info,
     get_raden_tiff_stack_info,
     load_nexus_image_stack,
@@ -326,6 +328,17 @@ class TestFittingHeadless(unittest.TestCase):
         self.assertEqual(ctx["bragg_rows"][0]["regions"][2]["min_wavelength"], 1.20)
         self.assertEqual(ctx["bragg_rows"][0]["regions"][2]["max_wavelength"], 1.95)
         self.assertIn("(1; 1; 0)", ctx["bragg_rows_text"][0])
+        with tempfile.TemporaryDirectory() as directory:
+            worker = BatchFitEdgesWorker(
+                parent=object(), images=[np.ones((1, 1))],
+                wavelengths=np.array([1.2]), fit_context=ctx,
+                min_x=0, max_x=1, min_y=0, max_y=1,
+                box_width=1, box_height=1, step_x=1, step_y=1,
+                total_boxes=1, interpolation_enabled=False,
+                work_directory=directory,
+            )
+            self.assertEqual(worker.num_edges, 1)
+            self.assertIs(worker.valid_row_configs[0], ctx["bragg_rows"][0])
 
     def test_build_batch_fit_context_marks_invalid_bounds(self):
         obj = _HeadlessFitting()
@@ -776,6 +789,19 @@ class TestFittingHeadless(unittest.TestCase):
         self.assertIsNone(error)
         self.assertIsInstance(result, dict)
         self.assertAlmostEqual(float(result["lattice_params"]["a"]), a_lattice, places=2)
+        self.assertEqual(set(result), {
+            "ab_fits", "bragg_edges", "structure_type", "lattice_params",
+            "lattice_uncertainties", "fitted_s", "fitted_t", "fitted_eta",
+            "s_uncertainties", "t_uncertainties", "eta_uncertainties",
+            "x_data", "y_data", "x_exp_sorted", "y_exp_sorted", "residuals",
+            "success", "message", "edge_heights", "edge_widths",
+        })
+        self.assertEqual([edge["hkl"] for edge in result["bragg_edges"]], [hkl])
+        self.assertEqual(result["bragg_edges"][0]["regions"], fit_context["bragg_rows"][0]["regions"])
+        np.testing.assert_array_equal(
+            result["bragg_edges"][0]["x_r3"],
+            wavelengths[(wavelengths >= 1.55) & (wavelengths <= 1.95)],
+        )
         self.assertIn(hkl, result["edge_heights"])
         self.assertIn(hkl, result["edge_widths"])
         self.assertTrue(np.isfinite(result["edge_heights"][hkl]))
@@ -810,6 +836,41 @@ class TestFittingHeadless(unittest.TestCase):
         )
         self.assertIsNone(update_error)
         self.assertAlmostEqual(obj.lattice_params["a"], updated_result["lattice_params"]["a"])
+
+        invalid_bounds = dict(fit_context, fitting_parameter_bounds={"s": (0.02, 0.01)})
+        fallback_result, fallback_error = obj.fit_full_pattern_core(
+            fit_context=invalid_bounds, wavelengths=wavelengths,
+            intensities=intensities, curve_fit_maxfev=5000,
+            apply_lattice_update=False,
+        )
+        self.assertIsNone(fallback_error)
+        self.assertAlmostEqual(fallback_result["fitted_s"][hkl], s_val, places=4)
+
+    def test_interactive_pattern_compatibility_path_still_returns_dict(self):
+        obj = _HeadlessFitting()
+        obj.bragg_table = _DummyTable([[
+            "(1, 1, 0)", "1.697", "1.2", "1.35", "1.4", "1.95",
+            "1.55", "1.95", "0.006", "0.05", "0.35",
+        ]])
+        obj.phase_dropdown = _DummyDropdown("Fe_bcc")
+        obj.structure_type = "bcc"
+        obj.lattice_params = {"a": 1.2}
+        obj.wavelengths = np.linspace(1.0, 2.2, 1600)
+        obj.intensities = fitting_function_3(
+            obj.wavelengths, 0.3, 0.2, 0.15, 0.07, 0.006, 0.05, 0.35,
+            [(1, 1, 0)], 1.55, 1.95, "bcc", {"a": 1.2},
+        )
+        legacy_context = obj._build_batch_fit_context()
+        self.assertIsInstance(legacy_context, dict)
+        self.assertIsInstance(legacy_context["bragg_rows"][0], dict)
+        self.assertIsInstance(FullPatternFitConfig.from_legacy_dict(legacy_context), FullPatternFitConfig)
+
+        result, error = obj.fit_full_pattern_core(
+            curve_fit_maxfev=5000, apply_lattice_update=False
+        )
+        self.assertIsNone(error)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["bragg_edges"][0]["hkl"], (1, 1, 0))
 
     def test_canvas_corner_press_without_ctrl_moves_small_roi(self):
         obj = _HeadlessFitting()
