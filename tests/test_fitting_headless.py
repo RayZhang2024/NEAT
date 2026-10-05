@@ -14,7 +14,8 @@ from NEAT.core.fitting import (
     initial_value_within_bounds,
     normalize_fitting_parameter_bounds,
 )
-from NEAT.domain import FullPatternFitConfig
+from NEAT.domain import FullPatternFitConfig, FittingParameterBounds, IndividualEdgeFitConfig
+from NEAT.services.fitting_engine import FittingEngine
 from NEAT.ui.mixins.fitting import FittingMixin
 from NEAT.workers.batch import (
     BatchFitEdgesWorker,
@@ -210,7 +211,7 @@ class TestFittingHeadless(unittest.TestCase):
             p0_array = np.asarray(p0, dtype=float)
             return p0_array, np.eye(len(p0_array))
 
-        with patch("NEAT.ui.mixins.fitting.curve_fit", side_effect=capture_curve_fit):
+        with patch("NEAT.services.individual_edge.curve_fit", side_effect=capture_curve_fit):
             result = obj.fit_region(
                 0,
                 skip_ui_updates=True,
@@ -330,15 +331,23 @@ class TestFittingHeadless(unittest.TestCase):
         self.assertIn("(1; 1; 0)", ctx["bragg_rows_text"][0])
         with tempfile.TemporaryDirectory() as directory:
             worker = BatchFitEdgesWorker(
-                parent=object(), images=[np.ones((1, 1))],
-                wavelengths=np.array([1.2]), fit_context=ctx,
+                fitting_engine=FittingEngine(),
+                edge_configs=(IndividualEdgeFitConfig.from_legacy_row(
+                    ctx["bragg_rows"][0], source_row=ctx["bragg_rows"][0]["row"],
+                    is_known_phase=True, structure_type=ctx["structure_type"],
+                    lattice_params=ctx["lattice_params"],
+                    fitting_parameter_bounds=FittingParameterBounds.from_legacy_dict(
+                        ctx["fitting_parameter_bounds"]),
+                ),),
+                images=[np.ones((1, 1))],
+                wavelengths=np.array([1.2]), output_metadata=ctx,
                 min_x=0, max_x=1, min_y=0, max_y=1,
                 box_width=1, box_height=1, step_x=1, step_y=1,
                 total_boxes=1, interpolation_enabled=False,
                 work_directory=directory,
             )
             self.assertEqual(worker.num_edges, 1)
-            self.assertIs(worker.valid_row_configs[0], ctx["bragg_rows"][0])
+            self.assertEqual(worker.edge_configs[0].source_row, ctx["bragg_rows"][0]["row"])
 
     def test_build_batch_fit_context_marks_invalid_bounds(self):
         obj = _HeadlessFitting()

@@ -8,6 +8,12 @@ from .fitting import (
     PatternFitRow,
     WavelengthRegion,
 )
+from .individual_edge import (
+    IndividualEdgeFitAttempt,
+    IndividualEdgeFitConfig,
+    IndividualEdgeFitResult,
+    RegionFitCurve,
+)
 
 __all__ = [
     "FittingParameterBounds",
@@ -16,4 +22,8 @@ __all__ = [
     "FullPatternFitResult",
     "PatternFitRow",
     "WavelengthRegion",
+    "IndividualEdgeFitAttempt",
+    "IndividualEdgeFitConfig",
+    "IndividualEdgeFitResult",
+    "RegionFitCurve",
 ]

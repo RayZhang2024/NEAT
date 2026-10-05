@@ -12,7 +12,11 @@ from ..core.fitting import (
     calculate_x_hkl_general,
     initial_value_within_bounds,
 )
-from ..domain import FullPatternEdgeFit, FullPatternFitConfig, FullPatternFitResult
+from ..domain import (
+    FullPatternEdgeFit, FullPatternFitConfig, FullPatternFitResult,
+    IndividualEdgeFitAttempt, IndividualEdgeFitConfig,
+)
+from .individual_edge import fit_individual_edge as _fit_individual_edge
 
 
 class FittingEngine:
@@ -26,6 +30,21 @@ class FittingEngine:
         "hexagonal": ["a", "c"],
         "orthorhombic": ["a", "b", "c"],
     }
+
+    def fit_individual_edge(
+        self,
+        wavelengths: np.ndarray,
+        intensities: np.ndarray,
+        fit_config: IndividualEdgeFitConfig,
+        *,
+        fix_s: bool = False,
+        fix_t: bool = False,
+        fix_eta: bool = False,
+    ) -> IndividualEdgeFitAttempt:
+        return _fit_individual_edge(
+            wavelengths, intensities, fit_config,
+            fix_s=fix_s, fix_t=fix_t, fix_eta=fix_eta,
+        )
 
     def fit_full_pattern(
         self,
