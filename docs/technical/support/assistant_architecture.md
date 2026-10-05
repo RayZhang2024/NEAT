@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: assistant
 audience: [user, developer, support, scientist]
 neat_version: 4.8.0
-verified_commit: fba075039698d3e2274cb9e547c436630203c6d3
+verified_commit: e2e85f6d7275b295d6865f347ef59f1d2616c587
 status: code-verified
 instrument_applicability: [general]
 scientific_review: pending
