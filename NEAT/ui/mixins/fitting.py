@@ -53,21 +53,16 @@ from PyQt5.QtWidgets import (
 )
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.patches import Rectangle
-from scipy.optimize import curve_fit
-
-from ...core import (
-    PHASE_DATA,
-    calculate_x_hkl_general,
-    fitting_function_1,
-    fitting_function_2,
-    fitting_function_3,
-)
+from ...core import PHASE_DATA
 from ...core.fitting import (
     DEFAULT_FITTING_PARAMETER_BOUNDS,
-    initial_value_within_bounds,
     normalize_fitting_parameter_bounds,
 )
-from ...domain import FullPatternFitConfig
+from ...domain import (
+    FittingParameterBounds,
+    FullPatternFitConfig,
+    IndividualEdgeFitConfig,
+)
 from ...services.fitting_engine import FittingEngine
 from ...workers.batch import (
     BatchFitEdgesWorker,
@@ -1566,13 +1561,36 @@ class FittingMixin:
         fix_eta = self.fix_eta_enabled()
         interpolation_enabled = self.interpolation_checkbox.isChecked()
 
-        # Start the worker
+        # Keep the shared legacy snapshot; convert only batch-valid scientific rows.
         fit_context = self._build_batch_fit_context()
+        is_known_phase = fit_context.get("selected_phase") != "Unknown_Phase"
+        bounds = FittingParameterBounds.from_legacy_dict(
+            fit_context.get("fitting_parameter_bounds")
+        )
+        edge_configs = tuple(
+            IndividualEdgeFitConfig.from_legacy_row(
+                row,
+                source_row=row["row"],
+                is_known_phase=is_known_phase,
+                structure_type=fit_context.get("structure_type", "cubic"),
+                lattice_params=fit_context.get("lattice_params") or {},
+                fitting_parameter_bounds=bounds,
+            )
+            for row in fit_context.get("bragg_rows", []) if row.get("valid")
+        )
+        output_metadata = {
+            key: fit_context.get(key)
+            for key in (
+                "flight_path", "flight_path_source", "data_source", "input_file",
+                "min_wavelength", "max_wavelength", "selected_phase", "bragg_rows_text",
+            )
+        }
         self.batch_fit_edges_worker = BatchFitEdgesWorker(
-            parent=self,
+            fitting_engine=FittingEngine(),
+            edge_configs=edge_configs,
             images=self.images,
             wavelengths=self.wavelengths,
-            fit_context=fit_context,
+            output_metadata=output_metadata,
             min_x=min_x,
             max_x=max_x,
             min_y=min_y,
@@ -5354,464 +5372,126 @@ class FittingMixin:
         update_table=True,
         only_update_unfixed=False,
     ):
-
+        """Legacy UI/table adapter for the GUI-independent individual-edge fit."""
         draw_plots = not skip_ui_updates
         emit_messages = bool(emit_messages and draw_plots)
         update_table = bool(update_table and draw_plots)
-        if fit_flags is None:
-            fix_s = self.fix_s_enabled()
-            fix_t = self.fix_t_enabled()
-            fix_eta = self.fix_eta_enabled()
-        else:
-            fix_s, fix_t, fix_eta = fit_flags
-        selected_phase = selected_phase if selected_phase is not None else self.phase_dropdown.currentText()
-        is_known_phase = selected_phase != "Unknown_Phase"
-        wavelengths_data = self.wavelengths if wavelengths is None else np.asarray(wavelengths)
-        intensities_data = self.intensities if intensities is None else np.asarray(intensities)
-        lattice_params_data = dict(lattice_params if lattice_params is not None else getattr(self, "lattice_params", {}))
-        structure_type_data = structure_type if structure_type is not None else getattr(self, "structure_type", "fcc" if is_known_phase else "unknown")
-        parameter_bounds = self.get_fitting_parameter_bounds(
-            {"fitting_parameter_bounds": fitting_parameter_bounds}
-            if fitting_parameter_bounds is not None
-            else None
-        )
-        params_store = {}
-        if draw_plots:
-            if not hasattr(self, "params_unknown"):
-                self.params_unknown = {}
-            params_store = self.params_unknown
-
         try:
-            # Validate structure type
-            # if is_known_phase:
-            #     structure_type = self.structure_type
-            #     if structure_type != "cubic":
-            #         raise ValueError(f"Non-cubic structure '{structure_type}' not supported. "
-            #                           "Only cubic structures allowed.")
-
-            # Get lattice parameter (cubic-specific logic)
-            if is_known_phase:
-                # Cubic structure requires only 'a'
-                if "a" not in lattice_params_data:
-                    raise ValueError("Missing cubic lattice parameter 'a'")
-                a_guess = lattice_params_data["a"]
+            if fit_flags is None:
+                fix_s = self.fix_s_enabled()
+                fix_t = self.fix_t_enabled()
+                fix_eta = self.fix_eta_enabled()
             else:
-                # Unknown phase: use 'd' value from table as 'a' estimate
-                if row_data is not None:
-                    d_val = row_data.get("d")
-                    if d_val is None:
-                        raise ValueError("Missing 'd' value for unknown phase")
-                    a_guess = float(d_val) / 2.0
-                else:
-                    d_item = self.bragg_table.item(row_number, 1)
-                    if not d_item or not d_item.text().strip():
-                        raise ValueError("Missing 'd' value for unknown phase")
-                    a_guess = float(d_item.text())/2
-
-            # Get region boundaries and parameters
-            if row_data is not None:
-                regions = row_data.get("regions") or []
-                if len(regions) != 3:
-                    raise ValueError("Invalid region bounds for selected edge")
-                r1_min, r1_max = regions[1]["min_wavelength"], regions[1]["max_wavelength"]
-                r2_min, r2_max = regions[0]["min_wavelength"], regions[0]["max_wavelength"]
-                r3_min, r3_max = regions[2]["min_wavelength"], regions[2]["max_wavelength"]
-                s_val = float(row_data.get("s"))
-                t_val = float(row_data.get("t"))
-                eta_val = float(row_data.get("eta"))
-            else:
+                fix_s, fix_t, fix_eta = fit_flags
+            selected_phase = selected_phase if selected_phase is not None else self.phase_dropdown.currentText()
+            is_known_phase = selected_phase != "Unknown_Phase"
+            wavelengths_data = self.wavelengths if wavelengths is None else np.asarray(wavelengths)
+            intensities_data = self.intensities if intensities is None else np.asarray(intensities)
+            lattice_params_data = dict(
+                lattice_params if lattice_params is not None else getattr(self, "lattice_params", {})
+            )
+            structure_type_data = structure_type if structure_type is not None else getattr(
+                self, "structure_type", "fcc" if is_known_phase else "unknown"
+            )
+            bounds = FittingParameterBounds.from_legacy_dict(
+                self.get_fitting_parameter_bounds(
+                    {"fitting_parameter_bounds": fitting_parameter_bounds}
+                    if fitting_parameter_bounds is not None else None
+                )
+            )
+            if row_data is None:
                 self._sync_derived_region3_bounds(row_number)
-                r1_min = float(self.bragg_table.item(row_number, 4).text())
-                r1_max = float(self.bragg_table.item(row_number, 5).text())
-                r2_min = float(self.bragg_table.item(row_number, 2).text())
-                r2_max = float(self.bragg_table.item(row_number, 3).text())
-                r3_min = float(self.bragg_table.item(row_number, 6).text())
-                r3_max = float(self.bragg_table.item(row_number, 7).text())
-                s_val = float(self.bragg_table.item(row_number, 8).text())
-                t_val = float(self.bragg_table.item(row_number, 9).text())
-                eta_val = float(self.bragg_table.item(row_number, 10).text())
-
-        except Exception as e:
-            if emit_messages:
-                self._append_fit_message(f"  Edge {row_number + 1}: setup failed - {e}")
-            return
-        # -------------------------------------------------
-        #  Region 1 Fitting
-        # -------------------------------------------------
-        try:
-            mask_r1 = (wavelengths_data >= r1_min) & (wavelengths_data <= r1_max)
-            x_r1 = wavelengths_data[mask_r1]
-            y_r1 = intensities_data[mask_r1]
-
-            if x_r1.size == 0:
-                if emit_messages:
-                    self._append_fit_message(f"  Edge {row_number + 1}: Region 1 has no data in range")
-                return
-
-            if draw_plots and not self.is_single_fit_canvas_mode():
-                ax_r1_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_c)
-                ax_r1_main.plot(
-                    x_r1,
-                    y_r1,
-                    'o',
-                    markersize=getattr(self, "symbol_size", 4),
-                    markerfacecolor='blue',
-                    markeredgecolor='none',
-                )
-            p0 = [0,0]
-            lower = [-10, -10]
-            upper = [10, 10]
-            popt_r1, _ = curve_fit(fitting_function_1, x_r1, y_r1, p0=p0, bounds=(lower, upper))
-            a0, b0 = popt_r1
-            params_store[row_number, 1] = popt_r1  # (a0, b0)
-            fit_y1 = fitting_function_1(x_r1, *popt_r1)
-
-            if draw_plots and not self.is_single_fit_canvas_mode():
-                ax_r1_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_c)
-                ax_r1_main.plot(x_r1, fit_y1, 'r-', 
-                                             # label=f"Edge {row_number + 1} Fit R1"
-                                             )
-                self._plot_residual_line(self.plot_canvas_c, x_r1, y_r1, fit_y1)
-                # self.plot_canvas_c.axes.legend()
-                self.plot_canvas_c.draw()
-        except Exception as e:
-            if emit_messages:
-                self._append_fit_message(f"  Edge {row_number + 1}: Region 1 fit failed - {e}")
-            return
-
-        # -------------------------------------------------
-        #  Region 2 Fitting
-        # -------------------------------------------------
-        try:
-            if (row_number, 1) not in params_store:
-                # Region 1 must be fitted first
-                return
-            a0, b0 = params_store[row_number, 1]
-
-            mask_r2 = (wavelengths_data >= r2_min) & (wavelengths_data <= r2_max)
-            x_r2 = wavelengths_data[mask_r2]
-            y_r2 = intensities_data[mask_r2]
-
-            if x_r2.size == 0:
-                if emit_messages:
-                    self._append_fit_message(f"  Edge {row_number + 1}: Region 2 has no data in range")
-                return
-
-            if draw_plots and not self.is_single_fit_canvas_mode():
-                ax_r2_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_b)
-                ax_r2_main.plot(
-                    x_r2,
-                    y_r2,
-                    'o',
-                    markersize=getattr(self, "symbol_size", 4),
-                    markerfacecolor='blue',
-                    markeredgecolor='none',
-                )
-
-            popt_r2, _ = curve_fit(
-                lambda xx, a_hkl, b_hkl: fitting_function_2(xx, a_hkl, b_hkl, a0, b0),
-                x_r2, y_r2, p0=[0, 0]
-            )
-            a_hkl, b_hkl = popt_r2
-            params_store[row_number, 2] = popt_r2  # (a_hkl, b_hkl)
-            fit_y2 = fitting_function_2(x_r2, *popt_r2, a0, b0)
-
-            if draw_plots and not self.is_single_fit_canvas_mode():
-                ax_r2_main, _ = self._ensure_fit_canvas_axes(self.plot_canvas_b)
-                ax_r2_main.plot(
-                    x_r2, fit_y2, 'r-', 
-                    # label=f"Edge {row_number + 1} Fit R2"
-                    )
-                self._plot_residual_line(self.plot_canvas_b, x_r2, y_r2, fit_y2)
-                # self.plot_canvas_b.axes.legend()
-                self.plot_canvas_b.draw()
-        except Exception as e:
-            if emit_messages:
-                self._append_fit_message(f"  Edge {row_number + 1}: Region 2 fit failed - {e}")
-            return
-
-        # -------------------------------------------------
-        #  Region 3 Fitting
-        # -------------------------------------------------
-        try:
-            def span50(x):
-                """Return (lower, upper) for a ±50 % interval around x."""
-                d = 1 * max(abs(x), 1)        # half-width
-                return x - d, x + d       # works for positives and negatives
-
-            # 1. pull stage-1/2 estimates -----------------------------------------
-            a0_hat,  b0_hat  = params_store[row_number, 1]
-            a_hkl_hat, b_hkl_hat = params_store[row_number, 2]
-
-            # 2. first four bounds ( ±50 % each ) ---------------------------------
-            lb4, ub4 = zip(*(span50(p) for p in (a0_hat, b0_hat, a_hkl_hat, b_hkl_hat)))
-
-            # ---------- hkl tuple ---------------------------------
-            if is_known_phase:
-                if row_data is not None and row_data.get("hkl") is not None:
-                    h, k, l = row_data["hkl"]
-                else:
-                    hkl_item = self.bragg_table.item(row_number, 0)
-                    h, k, l = map(int, hkl_item.text().strip("()").split(","))
-                hkl = (h, k, l)
-            else:
-                hkl = f"edge{row_number+1}"        # label for unknown
-
-            # ---------- masks & data ------------------------------
-            mask_r3 = (wavelengths_data >= r3_min) & (wavelengths_data <= r3_max)
-            x_r3    = wavelengths_data[mask_r3]
-            y_r3    = intensities_data[mask_r3]
-
-            if draw_plots:
-                final_canvas = self._final_fit_canvas()
-                ax_r3_main, _ = self._ensure_fit_canvas_axes(final_canvas)
-                ax_r3_main.plot(
-                    x_r3,
-                    y_r3,
-                    "o",
-                    markersize=getattr(self, "symbol_size", 4),
-                    markerfacecolor='blue',
-                    markeredgecolor='none',
-                )
-
-            # ---------- build p0 / bounds -------------------------
-            p0 = [a0_hat, b0_hat, a_hkl_hat, b_hkl_hat, a_guess]
-            lb = list(lb4) + [a_guess * 0.95]
-            ub = list(ub4) + [a_guess * 1.05]
-            for name, fixed, value in (
-                ("s", fix_s, s_val),
-                ("t", fix_t, t_val),
-                ("eta", fix_eta, eta_val),
-            ):
-                if not fixed:
-                    p0.append(initial_value_within_bounds(value, parameter_bounds[name]))
-                    lb.append(parameter_bounds[name][0])
-                    ub.append(parameter_bounds[name][1])
-
-            # ----------------- inside Region-3: helper -----------------
-            def func_r3(x, *params):
-                a0_fit, b0_fit, a_hkl_fit, b_hkl_fit = params[:4]
-                idx = 4                      # start right after a_fit
-
-                a_fit  = params[idx]; idx += 1
-                s_fit  = s_val   if fix_s  else params[idx]; idx += (0 if fix_s  else 1)
-                t_fit  = t_val   if fix_t  else params[idx]; idx += (0 if fix_t  else 1)
-                eta_fit = eta_val if fix_eta else params[idx]
-
-                return fitting_function_3(
-                    x, a0_fit, b0_fit, a_hkl_fit, b_hkl_fit,
-                    s_fit, t_fit, eta_fit,
-                    [hkl] if is_known_phase else [],
-                    r3_min, r3_max,
-                    "cubic", {"a": a_fit}
-                )
-
-
-            # ---------- run curve_fit ----------------------------
-            popt_3, pcov_3 = curve_fit(
-                func_r3, x_r3, y_r3, p0=p0,
-                bounds=(lb, ub), maxfev=300
-            )
-
-            y3_fit   = func_r3(x_r3, *popt_3)
-            resid_3  = y_r3 - y3_fit
-            rms_3    = np.sqrt(np.mean(resid_3**2))
-
-            # ----- 4. unpack results (now 8+ parameters) --
-            a0_fit, b0_fit, a_hkl_fit, b_hkl_fit = popt_3[:4]
-            idx = 4
-            a_fit  = popt_3[idx]*2;  a_unc = np.sqrt(pcov_3[idx, idx])*2; idx += 1
-            if not fix_s:   s_fit  = popt_3[idx]; s_unc  = np.sqrt(pcov_3[idx, idx]); idx += 1
-            else:           s_fit, s_unc = s_val, np.nan
-            if not fix_t:   t_fit  = popt_3[idx]; t_unc  = np.sqrt(pcov_3[idx, idx]); idx += 1
-            else:           t_fit, t_unc = t_val, np.nan
-            if not fix_eta: eta_fit = popt_3[idx]; eta_unc = np.sqrt(pcov_3[idx, idx])
-            else:           eta_fit, eta_unc = eta_val, np.nan
-
-
-            # ----- convert a → d (for known phase) ---------------
-            if is_known_phase:
-                denom    = np.sqrt(h**2 + k**2 + l**2)
-                d_fit    = a_fit / denom
-                d_unc    = a_unc / denom
-                x_edge   = d_fit
-            else:
-                d_fit    = a_fit               # use lattice‑like value
-                d_unc    = a_unc
-                x_edge   = a_fit
-
-            # # ----- edge height (same formula) --------------------
-            # f1 = np.exp(-(a0_fit + b0_fit * x_edge))
-            # f2 = f1 * np.exp(-(a_hkl_fit + b_hkl_fit * x_edge))
-            # edge_height = f1 - f2
-            # self.params_unknown[row_number, 4] = edge_height
-
-
-            # Use the same approach as pattern fitting for height/width
-            # Height: max-min of fitted Region3 curve over its span
-            # Width : FWHM of derivative of Region3 model around the edge
-            try:
+                table = self.bragg_table
+                def cell(column):
+                    item = table.item(row_number, column)
+                    return item.text() if item is not None else None
+                hkl = None
                 if is_known_phase:
-                    # Known phase: derive d-spacing from lattice + hkl.
-                    structure = structure_type_data
-                    lat = lattice_params_data or {"a": a_fit}
-                    d_vals = calculate_x_hkl_general(structure, lat, [(h, k, l)])
-                    d_hkl = d_vals[0] / 2.0 if d_vals and not np.isnan(d_vals[0]) else np.nan
-                else:
-                    # Unknown phase: a_fit is lambda_hkl, so d = lambda/2.
-                    structure = "cubic"
-                    d_hkl = a_fit / 2.0
-                    lat = {"a": d_hkl}
-            except (TypeError, ValueError, KeyError):
-                d_hkl = np.nan
-
-            if np.isnan(d_hkl) or d_hkl <= 0:
-                edge_height = np.nan
-                edge_width = np.nan
-            else:
-                x_edge = 2.0 * d_hkl
-
-                # Height: plateau difference over Region 3
-                try:
-                    xx_h = np.linspace(r3_min, r3_max, 4000)
-                    yy_h = fitting_function_3(
-                        xx_h, a0_fit, b0_fit, a_hkl_fit, b_hkl_fit,
-                        s_fit, t_fit, eta_fit, [hkl] if is_known_phase else [],
-                        r3_min, r3_max,
-                        structure, lat
-                    )
-                    edge_height = yy_h.max() - yy_h.min() if yy_h.size else np.nan
-                except (ValueError, FloatingPointError):
-                    edge_height = np.nan
-
-                try:
-                    span = max(0.2, 0.1 * (r3_max - r3_min))
-                    start = max(r3_min, x_edge - span)
-                    end = min(r3_max, x_edge + span)
-                    if end <= start:
-                        raise ValueError("Invalid span for width computation")
-                    xx = np.linspace(start, end, 4000)
-                    yy = fitting_function_3(
-                        xx, a0_fit, b0_fit, a_hkl_fit, b_hkl_fit,
-                        s_fit, t_fit, eta_fit, [hkl] if is_known_phase else [],
-                        start, end,
-                        structure, lat
-                    )
-                    if yy.size < 5:
-                        raise ValueError("Insufficient points for width computation")
-                    dy = np.gradient(yy, xx)
-                    dy_max = dy.max()
-                    if dy_max <= 0:
-                        raise ValueError("Non-positive derivative peak")
-                    half = dy_max / 2.0
-                    indices = np.where(dy >= half)[0]
-                    if indices.size == 0:
-                        raise ValueError("No points above half maximum")
-                    edge_width = xx[indices[-1]] - xx[indices[0]]
-                except (ValueError, FloatingPointError):
-                    edge_width = np.nan
-
-            params_store[row_number, 4] = edge_height
-            params_store[row_number, 5] = edge_width
-
-            # <<< END NEW ----------------------------------------
-
-            # ----- store everything for later use ----------------
-            params_store[row_number, 3] = (
-                d_fit, s_fit, t_fit, eta_fit,
-                d_unc, s_unc, t_unc, eta_unc
-            )
-
-            # ----- return dict when skip_ui_updates --------------
-            if skip_ui_updates:
-                return {
-                    "hkl":      hkl,
-                    "x":        x_r3,
-                    "fit":      func_r3(x_r3, *popt_3),
-
-                    #  numbers for info box
-                    "d_fit":    d_fit,   "d_unc":  d_unc,
-                    "s_fit":    s_fit,   "s_unc":  s_unc,
-                    "t_fit":    t_fit,   "t_unc":  t_unc,
-                    "eta_fit":  eta_fit, "eta_unc":eta_unc,
-                    "fit_params": (d_fit, s_fit, t_fit, eta_fit, d_unc, s_unc, t_unc, eta_unc),
-                    "edge_height": edge_height,
-                    "edge_width": edge_width,
-                    "rms": rms_3,
-                    "baseline_params": {
-                        "a0": a0_fit,
-                        "b0": b0_fit,
-                        "a_hkl": a_hkl_fit,
-                        "b_hkl": b_hkl_fit,
-                    },
+                    try:
+                        hkl = tuple(map(int, cell(0).strip("()").split(",")))
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                row_data = {
+                    "hkl": hkl,
+                    "d": cell(1) if not is_known_phase else None,
+                    "regions": [
+                        {"min_wavelength": float(cell(2)), "max_wavelength": float(cell(3))},
+                        {"min_wavelength": float(cell(4)), "max_wavelength": float(cell(5))},
+                        {"min_wavelength": float(cell(6)), "max_wavelength": float(cell(7))},
+                    ],
+                    "s": float(cell(8)), "t": float(cell(9)), "eta": float(cell(10)),
                 }
-
-            # ---------- live plotting / messages (GUI) -----------
-            if draw_plots:
-                final_canvas = self._final_fit_canvas()
-                ax_r3_main, _ = self._ensure_fit_canvas_axes(final_canvas)
-                ax_r3_main.plot(
-                    x_r3, func_r3(x_r3, *popt_3), "r-",
-                    # label=f"Edge {hkl} Fit R3"
-                )
-                self._plot_residual_line(final_canvas, x_r3, y_r3, y3_fit)
-                # self.plot_canvas_d.axes.legend()
-                final_canvas.draw()
-            if False and emit_messages:
-                self.message_box.append(
-                    f"Edge {row_number + 1} - Fitted Region 1: "
-                    f"a0_fit={a0_fit:.6f}, b0={b0_fit:.6f}")
-                self.message_box.append(
-                    f"Edge {row_number + 1} - Fitted Region 2: "
-                    f"a_hkl_fit={a_hkl_fit:.6f}, b_hkl={b_hkl_fit:.6f}")
-
-                msg = [f"d{hkl}: {d_fit:.6f} ± {d_unc:.6f}",
-                       f"Edge Height = {edge_height:.6f}",
-                       f"FWHM = {edge_width:.6f} Å",
-                       f"RMS (Region-3) = {rms_3:.6f}",
-                       # f"half = {half:.6f} Å"
-                       ]
-                if not fix_s:
-                    msg.append(f"s: {s_fit:.6f} ± {s_unc:.6f}")
-                if not fix_t:
-                    msg.append(f"t: {t_fit:.6f} ± {t_unc:.6f}")
-                if not fix_eta:
-                    msg.append(f"η: {eta_fit:.3f} ± {eta_unc:.3f}")
-                self.message_box.append(
-                    f"Edge {hkl} – Fit Results:\n" + "\n".join(msg)
-                )
-
-            if update_table:
-                if not only_update_unfixed or not fix_s:
-                    self._update_cell(row_number, 8,  f"{s_fit:.4f}")
-                if not only_update_unfixed or not fix_t:
-                    self._update_cell(row_number, 9,  f"{t_fit:.4f}")
-                if not only_update_unfixed or not fix_eta:
-                    self._update_cell(row_number, 10, f"{eta_fit:.3f}")
-            return {
-                "hkl": hkl,
-                "x": x_r3,
-                "y": y_r3,
-                "fit": y3_fit,
-                "fit_params": (d_fit, s_fit, t_fit, eta_fit, d_unc, s_unc, t_unc, eta_unc),
-                "edge_height": edge_height,
-                "edge_width": edge_width,
-                "rms": rms_3,
-                "baseline_params": {
-                    "a0": a0_fit,
-                    "b0": b0_fit,
-                    "a_hkl": a_hkl_fit,
-                    "b_hkl": b_hkl_fit,
-                },
-            }
-
-        except Exception as e:
+            config = IndividualEdgeFitConfig.from_legacy_row(
+                row_data,
+                source_row=row_number,
+                is_known_phase=is_known_phase,
+                structure_type=structure_type_data,
+                lattice_params=lattice_params_data,
+                fitting_parameter_bounds=bounds,
+            )
+        except Exception as exc:
             if emit_messages:
-                self._append_fit_message(f"  Edge {row_number + 1}: Region 3 fit failed - {e}")
-            if False and emit_messages:
-                self.message_box.append(
-                    f"Edge {row_number+1} – Region‑3 Fit Error: {e}"
+                self._append_fit_message(f"  Edge {row_number + 1}: setup failed - {exc}")
+            return None
+
+        attempt = FittingEngine().fit_individual_edge(
+            wavelengths_data, intensities_data, config,
+            fix_s=fix_s, fix_t=fix_t, fix_eta=fix_eta,
+        )
+
+        if draw_plots and not self.is_single_fit_canvas_mode():
+            for curve, canvas in (
+                (attempt.region1, self.plot_canvas_c),
+                (attempt.region2, self.plot_canvas_b),
+            ):
+                if curve is None:
+                    continue
+                axes, _ = self._ensure_fit_canvas_axes(canvas)
+                axes.plot(
+                    curve.x, curve.y, 'o',
+                    markersize=getattr(self, "symbol_size", 4),
+                    markerfacecolor='blue', markeredgecolor='none',
                 )
+                if curve.fit is not None:
+                    axes, _ = self._ensure_fit_canvas_axes(canvas)
+                    axes.plot(curve.x, curve.fit, 'r-')
+                    self._plot_residual_line(canvas, curve.x, curve.y, curve.fit)
+                    canvas.draw()
+
+        if draw_plots and attempt.region3 is not None:
+            final_canvas = self._final_fit_canvas()
+            axes, _ = self._ensure_fit_canvas_axes(final_canvas)
+            axes.plot(
+                attempt.region3.x, attempt.region3.y, "o",
+                markersize=getattr(self, "symbol_size", 4),
+                markerfacecolor='blue', markeredgecolor='none',
+            )
+            if attempt.region3.fit is not None and attempt.result is not None:
+                axes, _ = self._ensure_fit_canvas_axes(final_canvas)
+                axes.plot(attempt.region3.x, attempt.region3.fit, "r-")
+                self._plot_residual_line(
+                    final_canvas, attempt.region3.x, attempt.region3.y, attempt.region3.fit
+                )
+                final_canvas.draw()
+
+        if attempt.result is None:
+            if emit_messages and attempt.error_stage:
+                if attempt.error_stage == "setup" or attempt.error_stage.endswith(" fit"):
+                    detail = f"{attempt.error_stage} failed - {attempt.error_message}"
+                else:
+                    detail = f"{attempt.error_stage} {attempt.error_message}"
+                self._append_fit_message(f"  Edge {row_number + 1}: {detail}")
+            return None
+
+        result = attempt.result
+        if update_table:
+            if not only_update_unfixed or not fix_s:
+                self._update_cell(row_number, 8, f"{result.s_fit:.4f}")
+            if not only_update_unfixed or not fix_t:
+                self._update_cell(row_number, 9, f"{result.t_fit:.4f}")
+            if not only_update_unfixed or not fix_eta:
+                self._update_cell(row_number, 10, f"{result.eta_fit:.3f}")
+        return result.to_legacy_dict(skip_ui_updates=skip_ui_updates)
 
     def batch_fit(self):
         """

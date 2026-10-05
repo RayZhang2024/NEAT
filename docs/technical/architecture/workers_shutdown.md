@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer, support]
 neat_version: 4.8.0
-verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
+verified_commit: 74ac16ecc3be77373f5078f4ec983d6caba7c927
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [NEAT/ui/main_window.py, NEAT/ui/mixins/preprocessing.py, NEAT/ui/mixins/fitting.py, NEAT/ui/assistant_panel.py, NEAT/workers/preprocessing.py, NEAT/workers/batch.py]
+source_paths: [NEAT/ui/main_window.py, NEAT/ui/mixins/preprocessing.py, NEAT/ui/mixins/fitting.py, NEAT/ui/assistant_panel.py, NEAT/services/fitting_engine.py, NEAT/workers/preprocessing.py, NEAT/workers/batch.py]
 source_symbols: [FitsViewer.cleanup_resources, AssistantDockWidget.shutdown, SummationWorker.stop, FullProcessWorker.stop, BatchFitEdgesWorker.stop, BatchFitWorker.stop]
-test_paths: [tests/test_preprocessing_workers.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_semantic_retrieval.py, tests/test_pattern_batch_worker.py]
+test_paths: [tests/test_preprocessing_workers.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_semantic_retrieval.py, tests/test_pattern_batch_worker.py, tests/test_batch_mapping_outputs.py]
 ---
 
 # Worker ownership, progress, cancellation and shutdown
@@ -51,8 +51,10 @@ before the flag is checked. `BatchFitWorker` uses an injected numerical engine
 and checks cancellation after a final box fit before writing results, so a stop
 requested during that fit discards unsaved partial results. A Stop
 acknowledgement means that cancellation was requested, not that the worker has
-already exited. `BatchFitEdgesWorker` still uses its existing GUI-owned fitting
-path; that worker is not decoupled here.
+already exited. `BatchFitEdgesWorker` now uses an injected fitting engine,
+checks Stop between boxes and before saving, and does not add a per-edge
+check. The current box may finish its remaining edge fits after Stop before
+exiting without output files.
 
 The Full Process worker runs child preprocessing workers inside nested
 `QEventLoop` instances. Its own stop flag is checked between stages, but a

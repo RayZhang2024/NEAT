@@ -74,7 +74,7 @@ from scipy.interpolate import griddata
 from scipy.optimize import curve_fit, least_squares
 
 from ..core import calculate_x_hkl_general, fitting_function_3
-from ..domain import FullPatternFitConfig
+from ..domain import FullPatternFitConfig, IndividualEdgeFitConfig
 from ..services.fitting_engine import FittingEngine
 
 
@@ -502,16 +502,17 @@ class BatchFitEdgesWorker(QThread):
     message = pyqtSignal(str)
     current_box_changed = pyqtSignal(int, int, int, int)
 
-    def __init__(self, parent, images, wavelengths, fit_context,
+    def __init__(self, fitting_engine: FittingEngine, edge_configs: tuple[IndividualEdgeFitConfig, ...],
+                 images, wavelengths, output_metadata: Mapping[str, Any],
                  min_x, max_x, min_y, max_y,
                  box_width, box_height, step_x, step_y,
                  total_boxes, interpolation_enabled, work_directory,
                  fix_s=False, fix_t=False, fix_eta=False):
         super().__init__()
-        self.parent = parent
+        self.fitting_engine = fitting_engine
+        self.edge_configs = tuple(edge_configs)
         self.images = images
         self.wavelengths = wavelengths
-        self.fit_context = fit_context or {}
         self.min_x = min_x
         self.max_x = max_x
         self.min_y = min_y
@@ -534,30 +535,29 @@ class BatchFitEdgesWorker(QThread):
         # Dimensions of the first image
         self.image_height, self.image_width = self.images[0].shape
 
-        all_rows = list(self.fit_context.get("bragg_rows", []))
-        self.valid_row_configs = [row for row in all_rows if row.get("valid")]
-        self.num_edges = len(self.valid_row_configs)
+        self.num_edges = len(self.edge_configs)
         if self.num_edges == 0:
             self.message.emit("No valid edge rows available. Aborting.")
             return
 
-        self.hkl_list = []
-        for idx, row_cfg in enumerate(self.valid_row_configs):
-            hkl = row_cfg.get("hkl")
+        self.hkl_list: list[tuple[int, int, int] | tuple[str, int, int]] = []
+        for idx, edge_config in enumerate(self.edge_configs):
+            hkl = edge_config.hkl
             if hkl is None:
                 self.hkl_list.append(("edge", idx + 1, 0))
             else:
                 self.hkl_list.append(hkl)
 
+        metadata = copy.deepcopy(output_metadata or {})
         self.metadata_snapshot = {
-            "flight_path": self.fit_context.get("flight_path"),
-            "flight_path_source": self.fit_context.get("flight_path_source"),
-            "data_source": self.fit_context.get("data_source"),
-            "input_file": self.fit_context.get("input_file"),
-            "min_wavelength": self.fit_context.get("min_wavelength"),
-            "max_wavelength": self.fit_context.get("max_wavelength"),
-            "selected_phase": self.fit_context.get("selected_phase"),
-            "bragg_rows_text": list(self.fit_context.get("bragg_rows_text", [])),
+            "flight_path": metadata.get("flight_path"),
+            "flight_path_source": metadata.get("flight_path_source"),
+            "data_source": metadata.get("data_source"),
+            "input_file": metadata.get("input_file"),
+            "min_wavelength": metadata.get("min_wavelength"),
+            "max_wavelength": metadata.get("max_wavelength"),
+            "selected_phase": metadata.get("selected_phase"),
+            "bragg_rows_text": list(metadata.get("bragg_rows_text", [])),
         }
 
         # Initialize arrays for storing final (Region 3) fit parameters
@@ -597,19 +597,6 @@ class BatchFitEdgesWorker(QThread):
 
         # Also initialize the height array
         self.height_array = np.full(shape_3d, np.nan)
-
-    @staticmethod
-    def _safe_float(widget_or_value, default=""):
-        """
-        Safely convert a widget or raw value to float, returning default on failure.
-        """
-        try:
-            if widget_or_value is None:
-                return default
-            value = widget_or_value.text() if hasattr(widget_or_value, "text") else widget_or_value
-            return float(value)
-        except (TypeError, ValueError):
-            return default
 
     def run(self):
         if self.num_edges == 0:
@@ -655,39 +642,26 @@ class BatchFitEdgesWorker(QThread):
                         self.assign_nan_to_pixel(center_row, center_col, edge_idx)
                     continue
 
-                # For each valid row => do fit_region
-                for i, row_cfg in enumerate(self.valid_row_configs):
-                    fit_result = self.parent.fit_region(
-                        row_cfg["row"],
-                        skip_ui_updates=True,
-                        row_data=row_cfg,
-                        wavelengths=self.wavelengths,
-                        intensities=intensities,
-                        fit_flags=(self.fix_s, self.fix_t, self.fix_eta),
-                        selected_phase=self.fit_context.get("selected_phase"),
-                        structure_type=self.fit_context.get("structure_type"),
-                        lattice_params=self.fit_context.get("lattice_params"),
-                        fitting_parameter_bounds=self.fit_context.get(
-                            "fitting_parameter_bounds"
-                        ),
+                # Preserve ordered, duplicate-safe edge slots and box-level cancellation.
+                for i, edge_config in enumerate(self.edge_configs):
+                    attempt = self.fitting_engine.fit_individual_edge(
+                        self.wavelengths, intensities, edge_config,
+                        fix_s=self.fix_s, fix_t=self.fix_t, fix_eta=self.fix_eta,
                     )
-                    fit_params = fit_result.get("fit_params") if isinstance(fit_result, dict) else None
-                    edge_height = fit_result.get("edge_height", np.nan) if isinstance(fit_result, dict) else np.nan
-                    width = fit_result.get("edge_width", np.nan) if isinstance(fit_result, dict) else np.nan
-
-                    if fit_params is None:
+                    result = attempt.result
+                    if result is None:
                         # Region 3 fit failed => store NaNs
                         self.assign_nan_to_pixel(center_row, center_col, i)
                     else:
                         # popt_3 = (a_fit, s_fit, t_fit)
                         (a_fit, s_fit, t_fit, eta_fit,
-                         a_unc, s_unc, t_unc, eta_unc) = fit_params
+                         a_unc, s_unc, t_unc, eta_unc) = result.fit_params
                         self.a_array[center_row, center_col, i] = a_fit
                         self.s_array[center_row, center_col, i] = s_fit
                         self.t_array[center_row, center_col, i] = t_fit
                         self.eta_array[center_row, center_col, i] = eta_fit
                         
-                        self.width_array[center_row, center_col, i] = width
+                        self.width_array[center_row, center_col, i] = result.edge_width
 
                         self.a_unc_array[center_row, center_col, i]   = a_unc
                         self.s_unc_array[center_row, center_col, i]   = s_unc
@@ -695,7 +669,7 @@ class BatchFitEdgesWorker(QThread):
                         self.eta_unc_array[center_row, center_col, i] = eta_unc
 
                         # Also store the edge height
-                        self.height_array[center_row, center_col, i] = edge_height
+                        self.height_array[center_row, center_col, i] = result.edge_height
 
         # A stop can be requested while the final box is being fitted. Check
         # again before writing so cancellation never produces partial files.
@@ -907,9 +881,6 @@ class BatchFitEdgesWorker(QThread):
         Y_flat = yy.flatten()
 
         data_dict = {"x": X_flat, "y": Y_flat}
-
-        # if not hasattr(self.parent, 'hkl_list') or len(self.parent.hkl_list) != e:
-        #     self.parent.hkl_list = [("edge", i + 1) for i in range(e)]
 
         for i, hkl in enumerate(self.hkl_list):
             # hkl is either (h,k,l) or the fallback ('edge', n)

@@ -25,12 +25,12 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
 | 3 | Spectrum | [Display, ROI and macro-pixel extraction](fitting/spectrum_roi.md) | fitting UI selection methods | ROI interaction tests | Sampling guidance | P1 | code-verified |
 | 3 | Fitting | [Edge Table and windows](fitting/edge_table_windows.md) | fitting table methods | Default-window and derived-window tests | Required | P0 | code-verified |
 | 3 | Fitting | [Pseudo-Voigt model](fitting/pseudo_voigt_model.md) | fitting functions and core helpers | Headless numerical fitting tests | Required | P0 | code-verified |
-| 3 | Fitting | [Individual-edge fitting](fitting/individual_edge_fitting.md) | `fit_region`, staged fitting | Known/unknown phase tests | Required | P0 | code-verified |
+| 3 | Fitting | [Individual-edge fitting](fitting/individual_edge_fitting.md) | `FittingEngine.fit_individual_edge`, `fit_region` adapter | Known/unknown golden and staged-failure tests | Required | P0 | code-verified |
 | 3 | Fitting | [Pattern fitting](fitting/pattern_fitting.md) | typed domain models, `FittingEngine.fit_full_pattern`, legacy GUI adapter | Domain ownership, typed engine, golden and adapter regressions | Required | P0 | code-verified |
 | 3 | Fitting | [Bounds, fixed parameters and diagnostics](fitting/bounds_diagnostics.md) | fitting UI/core | Fitting and residual helper tests | Required | P0 | code-verified |
 | 3 | Fitting | [Uncertainty estimation](fitting/uncertainty.md) | `core/fitting.py`, estimator dialog | Core estimator and fitting tests | Required | P0 | code-verified |
 | 4 | Mapping | [Mapping ROI, boxes and steps](mapping/mapping_geometry.md) | fitting batch controls | ROI geometry and fitting tests | Sampling guidance | P1 | code-verified |
-| 4 | Mapping | [Individual-edge batch worker](mapping/individual_edge_worker.md) | `BatchFitEdgesWorker` | Partial fit-core coverage; no full-worker test | Required | P0 | code-verified |
+| 4 | Mapping | [Individual-edge batch worker](mapping/individual_edge_worker.md) | `BatchFitEdgesWorker`, injected `FittingEngine` | Worker output, cancellation, ordering and CSV regressions | Required | P0 | code-verified |
 | 4 | Mapping | [Pattern batch worker](mapping/pattern_worker.md) | `BatchFitWorker`, typed `FittingEngine` contract | Worker-level engine, failure, cancellation, persistence and signal tests | Required | P0 | code-verified |
 | 4 | Mapping | [Interpolation and missing values](mapping/interpolation_missing.md) | batch worker interpolation | Focused individual interpolation test | Interpretation limits | P0 | code-verified |
 | 4 | Output | [Result CSV schemas and metadata](mapping/result_csv_schema.md) | batch CSV writers | Focused schema snapshot test | Parameter meaning | P0 | code-verified |
