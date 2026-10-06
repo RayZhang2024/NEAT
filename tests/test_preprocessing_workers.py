@@ -199,6 +199,72 @@ class TestSummationWorker(unittest.TestCase):
 
 
 class TestOutlierFilteringWorker(unittest.TestCase):
+    def test_adapter_retains_structured_success_and_legacy_signals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            worker = OutlierFilteringWorker(
+                [{"folder_path": tmp, "images": {"10": np.ones((2, 2))},
+                  "load_errors": ["not a Clean rejection"]}], str(output), "clean"
+            )
+            progress, messages, finished = [], [], []
+            worker.progress_updated.connect(progress.append)
+            worker.message.connect(messages.append)
+            worker.finished.connect(lambda: finished.append(True))
+            worker.run()
+            self.assertTrue(worker.succeeded)
+            self.assertIsInstance(worker.result, PreprocessingOperationResult)
+            self.assertEqual(worker.result.status, PreprocessingStatus.SUCCEEDED)
+            self.assertEqual(worker.failed_frames, [])
+            self.assertEqual(worker.report_path, str(output / "clean_outlier_report.csv"))
+            self.assertEqual(progress, [100])
+            self.assertEqual(finished, [True])
+            self.assertEqual(sum(m.startswith("[SUCCESS]") for m in messages), 1)
+
+    def test_adapter_frame_failure_and_cancel_are_not_relabelled_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            worker = OutlierFilteringWorker(
+                [{"folder_path": tmp, "images": {
+                    "first": np.ones((2, 2)), "bad": np.ones((2, 2)),
+                    "last": np.ones((2, 2)),
+                }}], str(output), "clean"
+            )
+            messages, progress, finished = [], [], []
+            worker.message.connect(messages.append)
+            worker.progress_updated.connect(progress.append)
+            worker.finished.connect(lambda: finished.append(True))
+            from NEAT.services.image_io import write_fits_image_file
+
+            def write(path, data, overwrite=True):
+                if str(path).endswith("clean_bad.fits"):
+                    raise OSError("denied")
+                return write_fits_image_file(path, data, overwrite=overwrite)
+
+            with patch("NEAT.services.preprocessing_clean.write_fits_image_file", side_effect=write):
+                worker.run()
+            self.assertFalse(worker.succeeded)
+            self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
+            self.assertEqual(worker.failed_frames, ["bad"])
+            self.assertEqual((worker.result.processed_count, worker.result.expected_count), (2, 3))
+            self.assertEqual(progress, [33, 66])
+            self.assertEqual(sum(m.startswith("[ERROR] Frame bad:") for m in messages), 1)
+            self.assertFalse(any(m.startswith("[FATAL]") for m in messages))
+            self.assertEqual(finished, [True])
+
+            cancelling = OutlierFilteringWorker(
+                [{"folder_path": tmp, "images": {
+                    "first": np.ones((2, 2)), "last": np.ones((2, 2)),
+                }}], str(Path(tmp) / "cancelled"), "clean"
+            )
+            completed = []
+            cancelling.progress_updated.connect(lambda value: cancelling.stop() if value == 50 else None)
+            cancelling.finished.connect(lambda: completed.append(True))
+            cancelling.run()
+            self.assertFalse(cancelling.succeeded)
+            self.assertEqual(cancelling.result.status, PreprocessingStatus.CANCELLED)
+            self.assertEqual((cancelling.result.processed_count, cancelling.result.expected_count), (1, 2))
+            self.assertEqual(completed, [True])
+
     def test_replaces_nonpositive_pixel_with_positive_neighbour_mean(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"
