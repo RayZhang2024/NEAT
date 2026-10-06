@@ -91,6 +91,7 @@ try {
     if ($neatUserData -ine $expectedUserDataRoot) {
         throw "MSI preservation test must use the current user's real NEAT data root: $expectedUserDataRoot"
     }
+    Write-Output "Real per-user NEAT data root under preservation test: $neatUserData"
     $settingsPath = Join-Path $neatUserData "assistant_settings.json"
     $cachePath = Join-Path $neatUserData "assistant_cache\chroma\preserve-sentinel.txt"
     New-Item -ItemType Directory -Path (Split-Path $settingsPath), (Split-Path $cachePath) -Force | Out-Null
@@ -147,6 +148,7 @@ try {
         if (-not $smokeText.Contains($marker)) { throw "Installed smoke result is missing required marker: $marker" }
     }
 
+    Write-Output "Requested MSI uninstall properties: ALLUSERS=2; MSIINSTALLPERUSER=1"
     Invoke-Msi @("/x", $msi, "/qn", "/norestart", "/l*v", $uninstallLog, "ALLUSERS=2", "MSIINSTALLPERUSER=1") "MSI uninstall"
     $uninstalled = $true
     if (Test-Path -LiteralPath $installedExe) { throw "Uninstall left the application executable behind: $installedExe" }
@@ -197,5 +199,6 @@ try {
         }
     } finally {
         Restore-NeatUserDataTestScope -Scope $userDataScope
+        Write-Output "Restored original per-user NEAT data state after the MSI preservation test."
     }
 }
