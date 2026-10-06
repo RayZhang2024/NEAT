@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from NEAT.domain import PreprocessingOperationResult, PreprocessingStatus
 from NEAT.workers.batch import load_image_file
 from NEAT.workers.preprocessing import (
     FilteringWorker,
@@ -100,6 +101,101 @@ class TestSummationWorker(unittest.TestCase):
 
             self.assertFalse(worker.succeeded)
             self.assertEqual(list(output.glob("*")), [])
+
+    def test_precombined_logical_run_is_not_summed_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            physical_a = root / "physical_a"
+            physical_b = root / "physical_b"
+            physical_a.mkdir()
+            physical_b.mkdir()
+            output = root / "output"
+            _write_shutter_count(physical_a, [2])
+            _write_shutter_count(physical_b, [3])
+            (physical_a / "a_Spectra.txt").write_text("first spectrum\n", encoding="utf-8")
+            (physical_b / "b_Spectra.txt").write_text("second spectrum\n", encoding="utf-8")
+            progress = []
+            finished = []
+            messages = []
+            worker = SummationWorker(
+                [
+                    {
+                        "folder_path": str(root / "logical_sample"),
+                        "images": {"00001": np.array([[7]], dtype=np.float32)},
+                        "run_folders": [str(physical_a), str(physical_b)],
+                    }
+                ],
+                "sample",
+                str(output),
+            )
+            worker.progress_updated.connect(progress.append)
+            worker.finished.connect(lambda: finished.append(True))
+            worker.message.connect(messages.append)
+
+            worker.run()
+
+            np.testing.assert_array_equal(
+                load_image_file(output / "sample_Summed_00001.fits"), [[7]]
+            )
+            self.assertEqual(np.loadtxt(output / "sample_summed_ShutterCount.txt")[1], 5)
+            self.assertEqual(
+                (output / "sample_1_Spectra.txt").read_text(encoding="utf-8"),
+                "first spectrum\n",
+            )
+            self.assertTrue(worker.succeeded)
+            self.assertEqual(worker.result.processed_count, 1)
+            self.assertEqual(worker.result.expected_count, 1)
+            self.assertEqual(progress[0], 0)
+            self.assertEqual(progress[-1], 100)
+            self.assertEqual(finished, [True])
+            self.assertTrue(any("Summation complete" in message for message in messages))
+
+    def test_stop_cancels_service_and_retains_completed_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            output = root / "output"
+            _write_shutter_count(source, [1])
+            worker = SummationWorker(
+                [
+                    {
+                        "folder_path": str(source),
+                        "images": {
+                            "10": np.ones((2, 2), dtype=np.float32),
+                            "2": np.ones((2, 2), dtype=np.float32),
+                        },
+                    }
+                ],
+                "sample",
+                str(output),
+            )
+            finished = []
+
+            def stop_after_first_frame(progress):
+                if progress == 50:
+                    worker.stop()
+
+            worker.progress_updated.connect(stop_after_first_frame)
+            worker.finished.connect(lambda: finished.append(True))
+            worker.run()
+
+            self.assertIsInstance(worker.result, PreprocessingOperationResult)
+            self.assertEqual(worker.result.status, PreprocessingStatus.CANCELLED)
+            self.assertFalse(worker.succeeded)
+            self.assertEqual((worker.result.processed_count, worker.result.expected_count), (1, 2))
+            self.assertEqual(
+                [item.role for item in worker.result.outputs], ["summed_image"]
+            )
+            self.assertEqual(
+                [Path(item.path).name for item in worker.result.outputs],
+                ["sample_Summed_10.fits"],
+            )
+            self.assertTrue((output / "sample_Summed_10.fits").exists())
+            self.assertFalse((output / "sample_Summed_2.fits").exists())
+            self.assertFalse((output / "sample_summed_ShutterCount.txt").exists())
+            self.assertEqual(list(output.glob("*_Spectra.txt")), [])
+            self.assertEqual(finished, [True])
 
 
 class TestOutlierFilteringWorker(unittest.TestCase):

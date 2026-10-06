@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 from astropy.io import fits
 
+from ..services.image_io import _flip_vertical_image_axis, write_fits_image_file
+
 try:
     import imageio.v2 as imageio
 except ImportError:  # pragma: no cover
@@ -29,14 +31,6 @@ if imageio is None and Image is None:  # pragma: no cover
         from PIL import Image
     except ImportError:
         Image = None
-
-
-def _flip_vertical_image_axis(data):
-    """Flip the image row axis while preserving leading stack dimensions."""
-    arr = np.asarray(data)
-    if arr.ndim < 2:
-        return arr
-    return np.flip(arr, axis=-2)
 
 
 def load_image_file(file_path):
@@ -61,14 +55,6 @@ def load_image_file(file_path):
     raise ImportError("Neither imageio nor Pillow is available to read TIFF files.")
 
 
-def write_fits_image_file(file_path, data, header=None, overwrite=True):
-    """Write a NEAT display-oriented image so ImageJ renders it the same way."""
-    fits.writeto(
-        file_path,
-        _flip_vertical_image_axis(data),
-        header=header,
-        overwrite=overwrite,
-    )
 from PyQt5.QtCore import QThread, pyqtSignal
 from scipy.interpolate import griddata
 from scipy.optimize import curve_fit, least_squares

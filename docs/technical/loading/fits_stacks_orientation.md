@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: loading
 audience: [user, developer]
 neat_version: 4.8.0
-verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
+verified_commit: f48bc0b6d887a865603ddb6dfc8583512d33bbd7
 status: code-verified
 instrument_applicability: [classic image folders]
 scientific_review: pending
-source_paths: [NEAT/workers/batch.py, NEAT/ui/mixins/fitting.py]
+source_paths: [NEAT/workers/batch.py, NEAT/services/image_io.py, NEAT/ui/mixins/fitting.py]
 source_symbols: [load_image_file, write_fits_image_file, ImageLoadWorker, FittingMixin.handle_fits_run_loaded]
-test_paths: [tests/test_image_io_orientation.py]
+test_paths: [tests/test_image_io_orientation.py, tests/test_preprocessing_summation.py]
 ---
 
 # Classic FITS/TIFF image-folder loading
@@ -30,8 +30,10 @@ suffix order. Filename suffixes therefore define spectral/frame order.
 
 FITS and TIFF arrays are flipped vertically at load so the in-memory row order
 matches the ImageJ-style display convention used by NEAT. `write_fits_image_file`
-flips the row axis again when saving. Tests verify FITS display orientation and
-round-trip behavior.
+flips the row axis again when saving. Its implementation is now in the headless
+`NEAT.services.image_io` module; the established import from
+`NEAT.workers.batch` remains an alias for compatibility. Tests verify FITS
+display orientation and round-trip behavior, including Summation output.
 
 ## Spectra association
 
