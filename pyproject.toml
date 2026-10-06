@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,7 +10,8 @@ authors = [
     { name = "Ruiyao Zhang", email = "ruiyao.zhang@stfc.ac.uk" }
 ]
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "PyQt5>=5.15",
@@ -40,6 +41,20 @@ assistant-server = [
 test = [
     "tomli>=2; python_version < '3.11'"
 ]
+
+[tool.briefcase]
+project_name = "NEAT"
+bundle = "io.github.rayzhang2024"
+
+[tool.briefcase.app.neat]
+formal_name = "NEAT"
+
+[tool.briefcase.app.neat.windows]
+external_package_path = "dist/NEAT"
+external_package_executable_path = "NEAT.exe"
+system_installer = false
+use_full_install_path = false
+install_launcher = true
 
 [project.scripts]
 neat = "NEAT.app:main"

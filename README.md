@@ -36,8 +36,14 @@ All required packages (PyQt5, matplotlib, numpy, scipy, astropy, pandas, psutil,
 ## 🚀 Run the GUI
 
 ### Standalone executable
-You can download the Windows standalone executable from the [latest NEAT release](https://github.com/RayZhang2024/NEAT/releases/latest).
-No installation is needed; extract the ZIP and double-click `NEAT.exe`.
+The [latest NEAT release](https://github.com/RayZhang2024/NEAT/releases/latest)
+provides two Windows downloads with the same application functionality:
+
+- **Installer — recommended for most Windows users:** download the MSI for a
+  normal per-user installation with a Start Menu entry and uninstall support.
+- **Portable — no installation required:** download the portable ZIP, extract
+  its `NEAT` folder, and run `NEAT.exe`. Python and administrator privileges
+  are not required just to extract and run it.
 
 ### 🚀 Example data
 An example dataset is available for Bragg edge fitting tutorial, click to download [Example_dataset](https://github.com/RayZhang2024/NEAT/releases/download/v4.6/5_Ubend_normalised.zip). The dataset has been pre-processed and is ready for Bragg edge fitting, go and have a try!
