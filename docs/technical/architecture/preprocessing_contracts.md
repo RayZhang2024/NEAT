@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer]
 neat_version: 4.8.0
-verified_commit: ad321dede50acbc9ce21393281c6495778ed5a45
+verified_commit: c63137362dbf26ee1c40481afacea57fb40e47e5
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/preprocessing_inputs.py, NEAT/domain/__init__.py, NEAT/services/preprocessing_summation.py, NEAT/workers/preprocessing.py]
-source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult, LoadedImageRun, sum_loaded_image_runs, SummationWorker]
-test_paths: [tests/test_preprocessing_domain.py, tests/test_preprocessing_inputs.py, tests/test_preprocessing_summation.py, tests/test_preprocessing_workers.py]
+source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/preprocessing_inputs.py, NEAT/domain/__init__.py, NEAT/services/preprocessing_summation.py, NEAT/services/preprocessing_clean.py, NEAT/workers/preprocessing.py]
+source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult, LoadedImageRun, sum_loaded_image_runs, SummationWorker, clean_loaded_image_runs, OutlierFilteringWorker]
+test_paths: [tests/test_preprocessing_domain.py, tests/test_preprocessing_inputs.py, tests/test_preprocessing_summation.py, tests/test_preprocessing_clean.py, tests/test_preprocessing_workers.py]
 ---
 
 # Preprocessing input and result contracts
@@ -30,11 +30,11 @@ define their own input, configuration, logical work unit, and detailed result
 semantics. This module contains no loaded-run models, operation configs,
 cancellation tokens, metadata bags, or scientific payload fields.
 
-The headless Summation service now consumes `LoadedImageRun` inputs and returns
-`PreprocessingOperationResult`; its Qt `SummationWorker` adapter converts the
-existing dictionaries at the worker boundary. This is the first operation
-adoption only. Other Qt preprocessing workers/loaders remain on their current
-input dictionaries and do not yet use the shared result contract.
+The headless Summation and Clean services consume `LoadedImageRun` inputs and
+return `PreprocessingOperationResult`. Their Qt worker adapters convert the
+existing dictionaries at the worker boundary. Summation was the first adopter;
+Clean is the second (#29). Other preprocessing workers/loaders remain on their
+current dictionaries and do not yet use the shared result contract.
 
 ## Public types
 
@@ -105,8 +105,8 @@ that source in isolation, without running package initializers. This distinction
 matters because a normal dotted import first executes the existing `NEAT` and
 `NEAT.domain` initializers, which retain their established optional ONNX and
 eager fitting/individual-edge imports. Those parent-package initialization
-behaviors are unchanged by this contract. Existing Qt preprocessing workers
-are still not migrated.
+behaviors are unchanged by this contract. Summation and Clean have migrated;
+other Qt preprocessing workers have not.
 
 ## Loaded classic image-run input
 
@@ -145,21 +145,26 @@ The dedicated input module may depend on NumPy, but has no Qt, UI, worker,
 construction does not inspect or access the filesystem and requires no
 `QApplication`.
 
-The input type began as contract-level coverage. Issue #27 adopts it only for
-Summation: the headless service receives the loaded frames and physical-folder
-provenance directly, while the compatibility adapter converts the worker's
-legacy dictionary form. Existing loaders and other workers continue to use
-their current dictionaries. Loader-specific suffix parsing, duplicate
-handling, and ordering remain unchanged. Spectra, shutter counts, masks, RADEN
-metadata and operation configuration remain operation-specific; cancellation
-and progress are passed to the Summation service as simple callbacks rather
-than being added to the common input model.
+The input type began as contract-level coverage. Issue #27 adopted it for
+Summation; Issue #29 adopts it for Clean. Their headless services receive loaded
+frames directly, while their compatibility adapters convert legacy worker
+dictionaries. Clean uses `primary_source` alone for sidecars and does not reject
+nonempty `load_errors`; Summation's validation and `source_folders` rules differ.
+Existing loaders and other workers continue to use their current dictionaries.
+Loader-specific suffix parsing, duplicate handling, and ordering remain
+unchanged. Spectra, shutter counts, masks, RADEN metadata and operation
+configuration remain operation-specific; cancellation and progress are passed
+to these services as simple callbacks rather than being added to the common
+input model.
 
 ## Adoption boundary
 
 Summation is the first operation to use `LoadedImageRun` and
-`PreprocessingOperationResult`. `SummationWorker` converts legacy dictionaries
-at its compatibility boundary, delegates to the headless service, and retains
-the structured result alongside its Qt signals and `succeeded` flag. Other
-preprocessing workers and loaders remain unmigrated. Their future migrations
-are separate Epic #21 work and must define each operation's logical work unit.
+`PreprocessingOperationResult`; Clean is the second. `SummationWorker` and
+`OutlierFilteringWorker` convert legacy dictionaries at their compatibility
+boundaries, delegate to their headless services, and retain the structured
+result alongside Qt signals and `succeeded`. For Clean, the logical work unit
+is a successfully written frame; the report and sidecar outputs do not count.
+Other preprocessing workers and loaders remain unmigrated. Their future
+migrations are separate Epic #21 work and must define each operation's logical
+work unit.
