@@ -14,7 +14,13 @@ from scipy import ndimage
 from PyQt5.QtCore import Qt, QEventLoop, QThread, pyqtSignal
 
 from .batch import get_raden_tiff_stack_info, load_image_file, write_fits_image_file
+from ..domain import (
+    LoadedImageRun,
+    PreprocessingOperationResult,
+    PreprocessingStatus,
+)
 from ..services.preprocessing_layout import discover_full_process_summation
+from ..services.preprocessing_summation import sum_loaded_image_runs
 
 NORMALISATION_WINDOW_HALF_RANGE = (0, 100)
 NORMALISATION_ADJACENT_RANGE = (0, 10)
@@ -303,7 +309,7 @@ class SummationWorker(QThread):
         self.output_folder        = output_folder
         self._is_running          = True     # Cooperative‑cancel flag
         self.succeeded            = False
-        self._validated_shutter_lists = None
+        self.result: PreprocessingOperationResult | None = None
 
     # ───────────────────────────────────────────────────────────────
     # Public API
@@ -317,291 +323,46 @@ class SummationWorker(QThread):
     # ───────────────────────────────────────────────────────────────
     def run(self):
         try:
-            self._validated_shutter_lists = self._validate_inputs()
-            self._prepare_output()
-            self._sum_images()
-            if self._is_running:
-                self._sum_and_save_shuttercounts()
-            if self._is_running:
-                self._copy_spectra_files()
-            self.succeeded = self._is_running
+            runs = tuple(
+                _loaded_image_run_from_legacy(run)
+                for run in self.summation_image_runs
+            )
+            self.result = sum_loaded_image_runs(
+                runs,
+                self.base_name,
+                self.output_folder,
+                progress_callback=self.progress_updated.emit,
+                message_callback=self.message.emit,
+                cancellation_check=lambda: not self._is_running,
+            )
+            self.succeeded = self.result.status is PreprocessingStatus.SUCCEEDED
+            for error in self.result.errors:
+                self.message.emit(f"[FATAL] Summation aborted: {error}")
         except Exception as exc:
             self.succeeded = False
+            self.result = PreprocessingOperationResult(
+                PreprocessingStatus.FAILED, 0, errors=(str(exc),)
+            )
             self.message.emit(f"[FATAL] Summation aborted: {exc}")
         finally:
             gc.collect()
             self.finished.emit()
 
-    # ───────────────────────────────────────────────────────────────
-    # Phase 0  –  Ensure output folder & log shortcut
-    # ───────────────────────────────────────────────────────────────
-    def _prepare_output(self):
-        try:
-            os.makedirs(self.output_folder, exist_ok=True)
-        except OSError as exc:
-            raise RuntimeError(f"Cannot create output folder '{self.output_folder}': {exc}") from exc
 
-        parts = os.path.normpath(self.output_folder).split(os.sep)
-        self._short_path = os.path.join(*parts[-2:]) if len(parts) >= 2 else self.output_folder
-
-    def _validate_inputs(self):
-        """Validate every image and shutter table before writing output."""
-        if not self.summation_image_runs:
-            raise ValueError("No summation runs were supplied.")
-
-        first_images = self.summation_image_runs[0].get("images", {})
-        first_keys = set(first_images)
-        if not first_keys:
-            raise ValueError("The first summation run contains no images.")
-        reference_shapes = {
-            suffix: np.asarray(image).shape
-            for suffix, image in first_images.items()
-        }
-
-        for run_idx, run in enumerate(self.summation_image_runs, start=1):
-            load_errors = run.get("load_errors") or []
-            if load_errors:
-                raise ValueError(
-                    f"Run {run_idx} contains load errors: {load_errors[0]}"
-                )
-            images = run.get("images", {})
-            keys = set(images)
-            if keys != first_keys:
-                raise ValueError(
-                    f"Run {run_idx} image suffix mismatch; "
-                    f"missing={sorted(first_keys - keys)[:3]}, "
-                    f"extra={sorted(keys - first_keys)[:3]}."
-                )
-            for suffix, image in images.items():
-                shape = np.asarray(image).shape
-                if len(shape) != 2:
-                    raise ValueError(
-                        f"Run {run_idx} frame {suffix} is not a 2D image."
-                    )
-                if shape != reference_shapes[suffix]:
-                    raise ValueError(
-                        f"Run {run_idx} frame {suffix} has shape {shape}; "
-                        f"expected {reference_shapes[suffix]}."
-                    )
-
-        shutter_lists = []
-        for run_idx, run in enumerate(self.summation_image_runs, start=1):
-            combined = None
-            folders = run.get("run_folders", [run.get("folder_path")])
-            if not folders or any(not folder for folder in folders):
-                raise ValueError(f"Run {run_idx} has no valid source folder.")
-            for folder in folders:
-                sc_file = self._find_file(folder, "_ShutterCount.txt")
-                if not sc_file:
-                    raise ValueError(
-                        f"Run {run_idx} has no ShutterCount file in '{folder}'."
-                    )
-                try:
-                    data = np.loadtxt(sc_file, dtype=np.float32)
-                except Exception as exc:
-                    raise ValueError(
-                        f"Run {run_idx} cannot read '{sc_file}': {exc}"
-                    ) from exc
-                if data.ndim == 1 and data.size == 2:
-                    data = data.reshape(1, 2)
-                if data.ndim != 2 or data.shape[1] != 2:
-                    raise ValueError(
-                        f"Run {run_idx} has malformed ShutterCount data in "
-                        f"'{sc_file}'; exactly two columns are required."
-                    )
-                counts = data[:, 1]
-                if combined is None:
-                    combined = counts.copy()
-                elif len(combined) != len(counts):
-                    raise ValueError(
-                        f"Run {run_idx} has unequal ShutterCount lengths."
-                    )
-                else:
-                    combined += counts
-            shutter_lists.append(combined)
-
-        base_len = len(shutter_lists[0])
-        if any(len(values) != base_len for values in shutter_lists):
-            raise ValueError(
-                "ShutterCount lengths differ between summation runs."
-            )
-        return shutter_lists
-
-    # ───────────────────────────────────────────────────────────────
-    # Phase 1  –  Image summation
-    # ───────────────────────────────────────────────────────────────
-    def _sum_images(self):
-        if not self.summation_image_runs:
-            self.message.emit("No summation runs supplied – nothing to do.")
-            return
-        
-        first_keys  = set(self.summation_image_runs[0]["images"].keys())
-        first_count = len(first_keys)
-        bad_runs    = []
-    
-        for idx, run in enumerate(self.summation_image_runs[1:], start=2):
-            keys = set(run["images"].keys())
-            if len(keys) != first_count:
-                bad_runs.append(
-                    f"run {idx} has {len(keys)} image(s) vs {first_count}"
-                )
-            elif keys != first_keys:
-                extra   = keys - first_keys
-                missing = first_keys - keys
-                detail  = []
-                if extra:   detail.append(f"extra: {sorted(extra)[:3]}…")
-                if missing: detail.append(f"missing: {sorted(missing)[:3]}…")
-                bad_runs.append(f"run {idx} suffix mismatch ({'; '.join(detail)})")
-    
-        if bad_runs:
-            self.message.emit(
-                "❌  Image‑count / suffix mismatch detected – "
-                "aborting summation:\n    " + "\n    ".join(bad_runs)
-            )
-            return  # hard abort – do not touch FITS files
-        
-        suffixes = sorted(first_keys)
-        total    = len(suffixes)
-
-        # Find common suffixes
-        common_suffixes = set(self.summation_image_runs[0]["images"])
-        for run in self.summation_image_runs[1:]:
-            common_suffixes.intersection_update(run["images"].keys())
-
-        if not common_suffixes:
-            self.message.emit("No common suffixes across runs – skipping image summation.")
-            return
-
-        suffixes = sorted(common_suffixes)
-        total    = len(suffixes)
-
-        self.message.emit("--- Starting image summation ---")
-        self.progress_updated.emit(0)
-
-        for idx, suffix in enumerate(suffixes, start=1):
-            if not self._is_running:
-                self.message.emit("Image summation cancelled by user.")
-                break
-
-            summed   = None
-            for run in self.summation_image_runs:
-                if not self._is_running:
-                    break
-                try:
-                    img = run["images"][suffix]
-                    img = img.astype(np.float32, copy=False)
-
-                    if summed is None:
-                        summed = img.copy()
-                    else:
-                        if summed.shape != img.shape:
-                            self.message.emit(
-                                f"[WARNING] Shape mismatch for suffix '{suffix}' in "
-                                f"run '{run['folder_path']}'. Skipping this suffix."
-                            )
-                            summed = None
-                            break
-                        summed += img
-                except KeyError:
-                    self.message.emit(
-                        f"[WARNING] Run '{run['folder_path']}' missing suffix '{suffix}' – skipped."
-                    )
-                    summed = None
-                    break
-                except Exception as exc:
-                    self.message.emit(
-                        f"[ERROR] Problem reading suffix '{suffix}' in run "
-                        f"'{run['folder_path']}': {exc}"
-                    )
-                    summed = None
-                    break
-
-            # Write FITS
-            if self._is_running and summed is not None:
-                out_name = f"{self.base_name}_Summed_{suffix}.fits"
-                out_path = os.path.join(self.output_folder, out_name)
-                try:
-                    write_fits_image_file(out_path, summed, overwrite=True)
-                    # self.message.emit(f"Saved summed image '{out_name}'.")
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Could not save '{out_name}': {exc}"
-                    ) from exc
-
-            self.progress_updated.emit(int((idx / total) * 100))
-
-    # ───────────────────────────────────────────────────────────────
-    # Phase 2  –  ShutterCount summation
-    # ───────────────────────────────────────────────────────────────
-    def _sum_and_save_shuttercounts(self):
-        if not self._is_running:
-            return
-
-        shutter_lists = self._validated_shutter_lists
-        if not shutter_lists:
-            raise RuntimeError("Validated ShutterCount data are unavailable.")
-
-        base_len = len(shutter_lists[0])
-        summed   = np.sum(shutter_lists, axis=0)
-        out_data = np.column_stack((np.arange(base_len), summed))
-        out_name = f"{self.base_name}_summed_ShutterCount.txt"
-        out_path = os.path.join(self.output_folder, out_name)
-
-        if not self._is_running:
-            return
-        try:
-            np.savetxt(out_path, out_data, fmt="%d\t%d")
-            self.message.emit(f"Saved summed ShutterCount '{out_name}'.")
-        except OSError as exc:
-            raise RuntimeError(f"Could not write '{out_name}': {exc}") from exc
-
-    # ───────────────────────────────────────────────────────────────
-    # Phase 3  –  Copy Spectra files
-    # ───────────────────────────────────────────────────────────────
-    def _copy_spectra_files(self):
-        if not self._is_running:
-            return
-
-        for run_idx, run in enumerate(self.summation_image_runs, start=1):
-            if not self._is_running:
-                break
-
-            copied = False
-            for folder in run.get("run_folders", [run["folder_path"]]):
-                spectra = self._find_file(folder, "_Spectra.txt")
-                if spectra:
-                    dest_name = f"{self.base_name}_{run_idx}_Spectra.txt"
-                    dest_path = os.path.join(self.output_folder, dest_name)
-                    try:
-                        shutil.copyfile(spectra, dest_path)
-                        self.message.emit(f"Copied Spectra → '{dest_name}'.")
-                        copied = True
-                    except OSError as exc:
-                        self.message.emit(
-                            f"[WARNING] Could not copy Spectra from '{folder}': {exc}"
-                        )
-                    break           # only first spectra per run
-            if not copied:
-                self.message.emit(f"Run {run_idx}: No Spectra file found.")
-
-        self.message.emit(
-            f"Summation complete – files written to <b>'\\{self._short_path}\\'</b> "
-            f"with base name '{self.base_name}'."
-        )
-        self.progress_updated.emit(100)
-
-    # ───────────────────────────────────────────────────────────────
-    # Utility helpers
-    # ───────────────────────────────────────────────────────────────
-    @staticmethod
-    def _find_file(folder: str, suffix: str) -> str | None:
-        try:
-            for f in os.listdir(folder):
-                if f.endswith(suffix):
-                    return os.path.join(folder, f)
-        except OSError:
-            return None
-        return None
+def _loaded_image_run_from_legacy(run: dict) -> LoadedImageRun:
+    """Translate a historical GUI-worker dictionary at the adapter boundary."""
+    primary_source = run.get("folder_path")
+    if not isinstance(primary_source, str) or not primary_source:
+        raise ValueError("Summation run has no valid source folder.")
+    if "run_folders" in run and run["run_folders"] is None:
+        raise ValueError("Summation run_folders must contain valid source folders.")
+    source_folders = run.get("run_folders", [primary_source])
+    return LoadedImageRun(
+        primary_source=primary_source,
+        frames=run.get("images", {}),
+        source_folders=source_folders,
+        load_errors=run.get("load_errors") or (),
+    )
 
 class OverlapCorrectionWorker(QThread):
     progress_updated = pyqtSignal(int)  # Emits progress percentage
