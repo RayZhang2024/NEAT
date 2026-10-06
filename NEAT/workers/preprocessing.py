@@ -1,7 +1,6 @@
 """Worker threads for preprocessing and filtering tasks."""
 
 import gc
-import heapq
 import os
 import re
 import shutil
@@ -10,7 +9,6 @@ import numpy as np
 import pandas as pd
 import psutil
 from PIL import Image, TiffImagePlugin
-from scipy import ndimage
 from PyQt5.QtCore import Qt, QEventLoop, QThread, pyqtSignal
 
 from .batch import get_raden_tiff_stack_info, load_image_file, write_fits_image_file
@@ -19,6 +17,7 @@ from ..domain import (
     PreprocessingOperationResult,
     PreprocessingStatus,
 )
+from ..services.preprocessing_clean import clean_loaded_image_runs, positive_neighbor_mean
 from ..services.preprocessing_layout import discover_full_process_summation
 from ..services.preprocessing_summation import sum_loaded_image_runs
 
@@ -61,239 +60,40 @@ class OutlierFilteringWorker(QThread):
         self.succeeded = False
         self.failed_frames = []
         self.report_path = os.path.join(output_folder, f"{base_name}_outlier_report.csv")
+        self.result: PreprocessingOperationResult | None = None
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # Main thread entry
-    # ────────────────────────────────────────────────────────────────────────────
     def run(self):
         try:
-            self._prepare_output()
-
-            total_images   = sum(len(run["images"]) for run in self.image_runs)
-            processed      = 0
-            total_cleaned  = 0
-
-            for run_idx, data_run in enumerate(self.image_runs, start=1):
-                if not self._is_running:
-                    self.message.emit("Process stopped by user")
-                    break
-
-                self._copy_related_files(run_idx, data_run)
-
-                for suffix, img_data in data_run["images"].items():
-                    if not self._is_running:
-                        break
-
-                    try:
-                        cleaned_pixels = self._clean_one_frame(suffix, img_data)
-                        total_cleaned += cleaned_pixels
-                        processed     += 1
-                        self._update_progress(processed, total_images)
-
-                    except Exception as exc:
-                        self.failed_frames.append(str(suffix))
-                        self.message.emit(f"[ERROR] Frame {suffix}: {exc}")
-
-            self.succeeded = (
-                self._is_running
-                and not self.failed_frames
-                and processed == total_images
+            runs = tuple(
+                LoadedImageRun(
+                    primary_source=run["folder_path"],
+                    frames=run["images"],
+                    source_folders=run.get("run_folders") or None,
+                    load_errors=run.get("load_errors") or (),
+                )
+                for run in self.image_runs
             )
-            self.message.emit(
-                f"[SUCCESS] Processed {processed} frame(s) • "
-                f"Total cleaned pixels: {total_cleaned} • "
-                f"Report: {os.path.basename(self.report_path)}"
+            self.result = clean_loaded_image_runs(
+                runs,
+                self.output_folder,
+                self.base_name,
+                progress_callback=self.progress_updated.emit,
+                message_callback=self.message.emit,
+                cancellation_check=lambda: not self._is_running,
+                frame_failure_callback=lambda suffix: self.failed_frames.append(suffix),
             )
+            self.succeeded = self.result.status is PreprocessingStatus.SUCCEEDED
         except Exception as exc:
             self.succeeded = False
+            self.result = PreprocessingOperationResult(
+                PreprocessingStatus.FAILED, 0, errors=(str(exc),)
+            )
             self.message.emit(f"[FATAL] {exc}")
         finally:
             self.finished.emit()
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # Helper methods
-    # ────────────────────────────────────────────────────────────────────────────
-    def _prepare_output(self):
-        """Ensure output folder exists and create a fresh report file."""
-        os.makedirs(self.output_folder, exist_ok=True)
-        try:
-            with open(self.report_path, "w", encoding="utf-8") as fh:
-                fh.write("frame_idx,pixel_x,pixel_y,outlier_value,replace_value\n")
-        except OSError as exc:
-            raise RuntimeError(f"Cannot create report file: {exc}") from exc
+    _positive_neighbor_mean = staticmethod(positive_neighbor_mean)
 
-    def _clean_one_frame(self, suffix: str, img_data: np.ndarray) -> int:
-        """Return number of pixels cleaned for this frame."""
-        img = img_data.astype(np.float32, copy=True)
-        invalid_mask = (img <= 0) | np.isnan(img) | np.isinf(img)
-        bad_pixels   = np.argwhere(invalid_mask)
-
-        records = []
-        cleaned = 0
-
-        # Replace invalid pixels first. Search the confirmed 5x5 neighborhood,
-        # then expand to 7x7 only when no positive finite neighbor exists.
-        for y, x in bad_pixels:
-            original = img[y, x]
-            replacement = self._positive_neighbor_mean(img, y, x, radius=2)
-            if replacement is None:
-                replacement = self._positive_neighbor_mean(
-                    img, y, x, radius=3
-                )
-
-            if replacement is not None:
-                img[y, x]   = replacement
-            else:
-                replacement = np.nan       # Do not inject a hard zero
-                # Leave img[y, x] unchanged to flag it downstream
-
-            records.append(
-                f"{suffix},{x},{y},{original:.4f},{replacement:.4f}"
-            )
-            cleaned += 1
-
-        # Cache clipped 5x5 sums and valid-pixel counts. The raster scan below
-        # updates these caches when it replaces a spike, preserving the old
-        # scan-order behavior without allocating a neighborhood/mask for every
-        # pixel.
-        valid = np.isfinite(img) & (img > 0)
-        positive_values = np.where(valid, img, 0.0).astype(np.float64)
-        neighbourhood_sum = ndimage.uniform_filter(
-            positive_values, size=5, mode="constant", cval=0.0
-        ) * 25.0
-        neighbourhood_count = ndimage.uniform_filter(
-            valid.astype(np.float64), size=5, mode="constant", cval=0.0
-        ) * 25.0
-
-        neighbor_count = neighbourhood_count - valid
-        with np.errstate(divide="ignore", invalid="ignore"):
-            neighbor_mean = (neighbourhood_sum - positive_values) / neighbor_count
-        tolerance = np.finfo(np.float64).eps * 32.0 * np.maximum(
-            1.0, np.abs(img)
-        )
-        candidate_mask = (
-            valid
-            & (neighbor_count > 0.0)
-            & (img >= 10.0 * neighbor_mean - tolerance)
-        )
-        candidates = [tuple(position) for position in np.argwhere(candidate_mask)]
-        heapq.heapify(candidates)
-        queued = candidate_mask.copy()
-        height, width = img.shape
-
-        while candidates:
-            y, x = heapq.heappop(candidates)
-            queued[y, x] = False
-            original = float(img[y, x])
-            replacement = self._positive_neighbor_mean(img, y, x, radius=2)
-            if replacement is None or original < 10.0 * replacement:
-                continue
-
-            img[y, x] = replacement
-            records.append(
-                f"{suffix},{x},{y},{original:.4f},{replacement:.4f}"
-            )
-            cleaned += 1
-
-            # Every cached 5x5 window containing this pixel changes by the
-            # same delta. Later raster positions then see exactly the values
-            # the original sequential scan would have seen.
-            y0, y1 = max(0, y - 2), min(height, y + 3)
-            x0, x1 = max(0, x - 2), min(width, x + 3)
-            neighbourhood_sum[y0:y1, x0:x1] += replacement - original
-
-            # Replacements lower a spike to its neighbor mean. Only candidate
-            # positions in these nearby windows can newly cross the threshold.
-            local_y, local_x = np.mgrid[y0:y1, x0:x1]
-            later = (local_y > y) | ((local_y == y) & (local_x > x))
-            local_counts = neighbor_count[y0:y1, x0:x1]
-            local_values = img[y0:y1, x0:x1]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                local_means = (
-                    neighbourhood_sum[y0:y1, x0:x1] - local_values
-                ) / local_counts
-            local_tolerance = np.finfo(np.float64).eps * 32.0 * np.maximum(
-                1.0, np.abs(local_values)
-            )
-            newly_eligible = (
-                later
-                & valid[y0:y1, x0:x1]
-                & ~queued[y0:y1, x0:x1]
-                & (local_counts > 0.0)
-                & (
-                    local_values
-                    >= 10.0 * local_means - local_tolerance
-                )
-            )
-            for local_row, local_col in np.argwhere(newly_eligible):
-                candidate_y = y0 + int(local_row)
-                candidate_x = x0 + int(local_col)
-                queued[candidate_y, candidate_x] = True
-                heapq.heappush(candidates, (candidate_y, candidate_x))
-
-        if cleaned == 0:
-            self.message.emit(f"Frame {suffix}: no outliers detected")
-
-        # Append to CSV
-        try:
-            with open(self.report_path, "a", encoding="utf-8") as fh:
-                fh.write("\n".join(records) + "\n")
-        except OSError as exc:
-            self.message.emit(f"[WARNING] Could not append to report: {exc}")
-
-        # Write FITS
-        out_fits = os.path.join(self.output_folder, f"{self.base_name}_{suffix}.fits")
-        try:
-            write_fits_image_file(out_fits, img, overwrite=True)
-        except Exception as exc:  # astropy throws its own subclass of OSError
-            raise RuntimeError(f"Cannot write FITS {out_fits}: {exc}") from exc
-
-        return cleaned
-
-    @staticmethod
-    def _positive_neighbor_mean(
-        img: np.ndarray,
-        y: int,
-        x: int,
-        *,
-        radius: int,
-    ):
-        """Return the positive finite neighbor mean, excluding the center."""
-        y0, y1 = max(0, y - radius), min(img.shape[0], y + radius + 1)
-        x0, x1 = max(0, x - radius), min(img.shape[1], x + radius + 1)
-        neighborhood = img[y0:y1, x0:x1]
-        valid = (neighborhood > 0) & np.isfinite(neighborhood)
-        valid[y - y0, x - x0] = False
-        values = neighborhood[valid]
-        if values.size == 0:
-            return None
-        return float(np.mean(values))
-
-    def _update_progress(self, processed: int, total: int) -> None:
-        progress = int((processed / total) * 100) if total else 0
-        self.progress_updated.emit(progress)
-
-    def _copy_related_files(self, run_idx: int, data_run: dict) -> None:
-        """Copy *_Spectra.txt and *_ShutterCount.txt (if present)"""
-        spectra_suffix      = "_Spectra.txt"
-        shuttercount_suffix = "_ShutterCount.txt"
-
-        def _copy_if_exists(suffix: str):
-            for f in os.listdir(data_run["folder_path"]):
-                if f.endswith(suffix):
-                    src = os.path.join(data_run["folder_path"], f)
-                    dst = os.path.join(self.output_folder, f"Run{run_idx}_{f}")
-                    try:
-                        shutil.copy2(src, dst)
-                        self.message.emit(f"Copied {f} → {os.path.basename(dst)}")
-                    except OSError as exc:
-                        self.message.emit(f"[WARNING] Could not copy {f}: {exc}")
-                    break          # only the first match
-
-        _copy_if_exists(spectra_suffix)
-        _copy_if_exists(shuttercount_suffix)
-
-    # --------------------------------------------------------------------
     def stop(self):
         self._is_running = False
 
