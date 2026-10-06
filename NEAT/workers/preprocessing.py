@@ -14,6 +14,7 @@ from scipy import ndimage
 from PyQt5.QtCore import Qt, QEventLoop, QThread, pyqtSignal
 
 from .batch import get_raden_tiff_stack_info, load_image_file, write_fits_image_file
+from ..services.preprocessing_layout import discover_full_process_summation
 
 NORMALISATION_WINDOW_HALF_RANGE = (0, 100)
 NORMALISATION_ADJACENT_RANGE = (0, 10)
@@ -1318,15 +1319,12 @@ class FullProcessWorker(QThread):
             return folder
     
         # Check for subfolders
-        subfolders = [
-            os.path.join(folder, d)
-            for d in os.listdir(folder)
-            if os.path.isdir(os.path.join(folder, d))
-        ]
+        discovery = discover_full_process_summation(folder)
+        subfolders = discovery.folders
         
         short_path = self.get_short_path(folder, levels=2)
     
-        if not subfolders:
+        if not discovery.should_sum:
             self.message.emit(f"0_sumation_{label}: No subfolders found in '\\{short_path}'. Skipping Summation.")
             return folder
     

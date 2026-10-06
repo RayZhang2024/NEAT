@@ -50,6 +50,10 @@ from ...workers.preprocessing import (
     SummationWorker,
     validate_normalisation_windows,
 )
+from ...services.preprocessing_layout import (
+    classify_standalone_summation,
+    discover_classic_batch,
+)
 from ..dialogs import MaskGeneratorDialog, OpenBeamPlotDialog
 
 
@@ -773,22 +777,17 @@ class PreprocessingMixin:
             self, "Select Folder Containing FITS Images for Outlier Removal", ""
         )
         if folder_path:
-            # Check if the selected folder has child folders.
-            child_folders = [
-                os.path.join(folder_path, item)
-                for item in os.listdir(folder_path)
-                if os.path.isdir(os.path.join(folder_path, item))
-            ]
-            if child_folders:
+            discovery = discover_classic_batch(folder_path)
+            if discovery.has_child_folders:
                 self.preproc_message_box.append(
-                    f"Detected {len(child_folders)} sub-folders. They will be processed sequentially for outlier removal."
+                    f"Detected {len(discovery.folders)} sub-folders. They will be processed sequentially for outlier removal."
                 )
-                self._outlier_batch_paths = child_folders
+                self._outlier_batch_paths = discovery.folders
             else:
                 self.preproc_message_box.append(
                     "No sub-folders detected; the selected folder will be treated as a single dataset."
                 )
-                self._outlier_batch_paths = [folder_path]
+                self._outlier_batch_paths = discovery.folders
 
     def remove_outliers(self):
         """
@@ -965,22 +964,17 @@ class PreprocessingMixin:
             self, "Select Folder Containing FITS Images for Overlap Correction", ""
         )
         if folder_path:
-            # Check for child folders inside the selected folder
-            child_folders = [
-                os.path.join(folder_path, item)
-                for item in os.listdir(folder_path)
-                if os.path.isdir(os.path.join(folder_path, item))
-            ]
-            if child_folders:
+            discovery = discover_classic_batch(folder_path)
+            if discovery.has_child_folders:
                 self.preproc_message_box.append(
-                    f"Detected {len(child_folders)} sub-folders. They will be processed sequentially for overlap correction."
+                    f"Detected {len(discovery.folders)} sub-folders. They will be processed sequentially for overlap correction."
                 )
-                self._overlap_batch_paths = child_folders
+                self._overlap_batch_paths = discovery.folders
             else:
                 self.preproc_message_box.append(
                     "No sub-folders detected; the selected folder will be treated as a single dataset."
                 )
-                self._overlap_batch_paths = [folder_path]
+                self._overlap_batch_paths = discovery.folders
 
     def remove_overlap_correction_images(self):
         if hasattr(self, 'overlap_correction_image_runs') and self.overlap_correction_image_runs:
@@ -1289,16 +1283,13 @@ class PreprocessingMixin:
         if not folder_path:
             return
 
-        sample_folders = [
-            os.path.join(folder_path, d)
-            for d in os.listdir(folder_path)
-            if os.path.isdir(os.path.join(folder_path, d))
-        ]
+        layout = classify_standalone_summation(folder_path)
+        sample_folders = layout.sample_folders
 
         # -------------------------------------------------------------
         # Guard #1 – at least two children at the next level
         # -------------------------------------------------------------
-        if len(sample_folders) < 2:                           # <-- NEW
+        if layout.kind == "too_few":                          # <-- NEW
             self.preproc_message_box.append(
                 "❌  The selected folder contains only ONE sub‑folder – "
                 "need at least two datasets for a summation.")
@@ -1307,15 +1298,9 @@ class PreprocessingMixin:
         # -------------------------------------------------------------
         # Decide whether it is 2‑ or 3‑level … and detect mixing
         # -------------------------------------------------------------
-        has_subfolders = [                                     # <-- NEW
-            any(os.path.isdir(os.path.join(s, sub))
-                for sub in os.listdir(s))
-            for s in sample_folders
-        ]
-
-        if all(has_subfolders):            # ✔ pure 3‑level
+        if layout.kind == "three_level":  # ✔ pure 3‑level
             structure = "3"
-        elif not any(has_subfolders):      # ✔ pure 2‑level
+        elif layout.kind == "two_level":  # ✔ pure 2‑level
             structure = "2"
         else:                              # ❌ mixture
             self.preproc_message_box.append(
@@ -1330,11 +1315,7 @@ class PreprocessingMixin:
         if structure == "3":
             self.preproc_message_box.append(
                 "Detected three‑level structure (folder → sample → run).")
-            self._summation_samples_3level = {
-                sf: [os.path.join(sf, sub) for sub in os.listdir(sf)
-                     if os.path.isdir(os.path.join(sf, sub))]
-                for sf in sample_folders
-            }
+            self._summation_samples_3level = layout.run_folders_by_sample
             self._summation_samples_2level = None
             self.summation_image_runs = []
         else:  # structure == "2"
@@ -1697,17 +1678,13 @@ class PreprocessingMixin:
                 return
 
             # Check if the selected folder has child folders.
-            child_folders = [
-                os.path.join(folder_path, item)
-                for item in os.listdir(folder_path)
-                if os.path.isdir(os.path.join(folder_path, item))
-            ]
-            if child_folders:
+            discovery = discover_classic_batch(folder_path)
+            if discovery.has_child_folders:
                 self.preproc_message_box.append(
-                    f"Detected {len(child_folders)} sub-folders. They will be processed sequentially when normalisation starts."
+                    f"Detected {len(discovery.folders)} sub-folders. They will be processed sequentially when normalisation starts."
                 )
                 self._normalisation_batch_paths = [
-                    self._classify_normalisation_folder(child_folder) for child_folder in child_folders
+                    self._classify_normalisation_folder(child_folder) for child_folder in discovery.folders
                 ]
             else:
                 self.preproc_message_box.append(

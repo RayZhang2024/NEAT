@@ -6,7 +6,7 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
 | Batch | Area | Planned document | Primary implementation | Current test evidence | Domain review | Priority | Status |
 |---:|---|---|---|---|---|---:|---|
 | 1 | Data | [Supported images and sidecars](data/supported_images_and_sidecars.md) | `workers/batch.py`, preprocessing workers | Image orientation and TIFF-loading tests | Instrument applicability | P0 | code-verified |
-| 1 | Data | [Folder-layout detection](data/folder_layouts.md) | `ui/mixins/preprocessing.py` | No focused folder-classification test identified | No | P0 | code-verified |
+| 1 | Data | [Folder-layout detection](data/folder_layouts.md) | `services/preprocessing_layout.py`, preprocessing UI/worker call sites | Headless layout/order and call-site wiring regressions (`tests/test_preprocessing_layout.py`) | No | P0 | code-verified |
 | 1 | Preprocessing | [Summation](preprocessing/summation.md) | `SummationWorker`, summation UI orchestration | Focused image/sidecar/pre-write validation tests | Complete | P0 | domain-reviewed |
 | 1 | Preprocessing | [Outlier removal/Clean](preprocessing/clean.md) | `OutlierFilteringWorker` | Focused 5x5/7x7 replacement, spike and report tests | Complete | P1 | domain-reviewed |
 | 1 | Preprocessing | [Overlap/pile-up correction](preprocessing/overlap_correction.md) | `OverlapCorrectionWorker` | Focused equation and shape-rejection tests | Required | P0 | code-verified |
@@ -47,9 +47,10 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
 ## Initial test-risk observations
 
 - Batch 1 now has focused worker tests for Summation, Clean, overlap
-  correction, standard FITS normalisation and Filtering. Folder
-  classification, complete Full Process orchestration and interactive mask
-  editing still lack focused coverage.
+  correction, standard FITS normalisation and Filtering, plus headless
+  directory-layout classification and call-site wiring tests. Complete
+  Full Process orchestration and interactive mask editing still lack focused
+  coverage.
 - Fitting and input loading have materially better headless coverage, but the
   full GUI-to-worker-to-output path is not comprehensively tested.
 - Documents for untested behavior can still reach `code-verified`, but the
