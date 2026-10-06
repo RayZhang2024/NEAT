@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer]
 neat_version: 4.8.0
-verified_commit: 7d0e0002ab94621eac732dd0f9b3d41462752d13
+verified_commit: ee1aed5947d7c1c107cc60ecf9a887abeddf336a
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/__init__.py, NEAT/__init__.py]
-source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult, NEAT.domain.__getattr__]
-test_paths: [tests/test_preprocessing_domain.py, tests/test_assistant_semantic_retrieval.py]
+source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/__init__.py]
+source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult]
+test_paths: [tests/test_preprocessing_domain.py]
 ---
 
 # Structured preprocessing operation results
@@ -47,8 +47,11 @@ was migrated as part of introducing these types.
   `processed_count`. It also carries ordered outputs, an optional
   `expected_count`, ordered errors, and ordered warnings.
 
-The types are re-exported from `NEAT.domain`, so existing-style imports such as
-`from NEAT.domain import PreprocessingOperationResult` remain supported.
+The types are added to the existing eager exports from `NEAT.domain`, so
+existing-style imports such as
+`from NEAT.domain import PreprocessingOperationResult` remain supported. The
+established parent-package initialization and fitting/individual-edge import
+behavior are unchanged.
 
 ## Counts
 
@@ -92,16 +95,15 @@ the public result boundary deeply immutable.
 
 ## Dependency isolation
 
-The dedicated `NEAT.domain.preprocessing` module uses only standard-library
-types and does not import Qt, UI modules, workers, NumPy, or perform filesystem
-I/O. A fresh-process import regression covers this direct module boundary.
-
-To preserve that boundary, domain re-exports are resolved lazily; requesting a
-fitting type still loads its existing fitting module as before. The optional
-ONNX Runtime import at the top-level package is also deferred until `FitsViewer`
-is requested. The application entry point continues to load ONNX Runtime before
-Qt, and the assistant worker-thread test explicitly invokes the existing
-`prepare_local_embedding_runtime()` preloader before importing Qt.
+The dedicated `NEAT.domain.preprocessing` module is dependency-light: its own
+implementation uses only standard-library types, has no NumPy/Qt/UI/worker
+dependency, and performs no filesystem I/O. Its boundary test loads and checks
+that source in isolation, without running package initializers. This distinction
+matters because a normal dotted import first executes the existing `NEAT` and
+`NEAT.domain` initializers, which retain their established optional ONNX and
+eager fitting/individual-edge imports. Those parent-package initialization
+behaviors are unchanged by this contract. Existing Qt preprocessing workers
+are still not migrated.
 
 ## Adoption boundary
 
