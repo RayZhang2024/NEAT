@@ -19,6 +19,7 @@ from .preprocessing import (
     PreprocessingStatus,
     ProducedOutput,
 )
+from .preprocessing_inputs import LoadedImageRun
 
 __all__ = [
     "FittingParameterBounds",
@@ -34,4 +35,5 @@ __all__ = [
     "PreprocessingOperationResult",
     "PreprocessingStatus",
     "ProducedOutput",
+    "LoadedImageRun",
 ]

@@ -1,20 +1,20 @@
 ---
-title: Structured preprocessing operation results
+title: Preprocessing input and result contracts
 doc_id: neat-tech-architecture-preprocessing-contracts
 doc_type: technical_reference
 functional_area: architecture
 audience: [developer]
 neat_version: 4.8.0
-verified_commit: ee1aed5947d7c1c107cc60ecf9a887abeddf336a
+verified_commit: 6251c6184291f3a8544eec92f1ab776e2fb73980
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/__init__.py]
-source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult]
-test_paths: [tests/test_preprocessing_domain.py]
+source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/preprocessing_inputs.py, NEAT/domain/__init__.py]
+source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult, LoadedImageRun]
+test_paths: [tests/test_preprocessing_domain.py, tests/test_preprocessing_inputs.py]
 ---
 
-# Structured preprocessing operation results
+# Preprocessing input and result contracts
 
 ## Purpose and scope
 
@@ -104,6 +104,50 @@ matters because a normal dotted import first executes the existing `NEAT` and
 eager fitting/individual-edge imports. Those parent-package initialization
 behaviors are unchanged by this contract. Existing Qt preprocessing workers
 are still not migrated.
+
+## Loaded classic image-run input
+
+`NEAT.domain.preprocessing_inputs.LoadedImageRun` is the common in-memory input
+vocabulary introduced by Issue #25. It is separate from
+`PreprocessingOperationResult`: the latter describes a final outcome, while
+`LoadedImageRun` describes a primary source identity, loaded frames, physical
+source-folder provenance, and loader errors.
+
+- `primary_source` is a non-empty identity string. It is retained as supplied;
+  it is not normalized, resolved, or checked against the filesystem.
+- `frames` accepts a mapping of string keys to NumPy arrays. Its iteration
+  order is preserved exactly, keys need not be numeric, and empty mappings are
+  valid. The common contract does not validate image shape, dimensions, dtype,
+  orientation, or scientific suitability. NumPy array subclasses are accepted.
+- The mapping is shallowly copied and exposed through a read-only mapping
+  proxy. Replacing or adding entries in the caller's original mapping does not
+  change the captured mapping. The arrays themselves are not copied or frozen:
+  each stored value is the exact array object supplied by the caller, and
+  later changes to that array's contents remain visible through the run.
+- `source_folders` is an ordered, immutable snapshot of physical folders. If
+  omitted, it defaults to `(primary_source,)`. Explicit provenance must be a
+  non-empty ordered sequence of non-empty strings; its order and duplicates
+  are retained without path normalization or existence checks. The primary
+  source is not required to appear in this sequence, because a logical sample
+  identity can correspond to separate physical run folders.
+- `load_errors` is an ordered immutable snapshot of strings. Empty errors are
+  allowed; the contract describes loader state and does not decide whether a
+  particular operation should reject a run containing errors.
+- Run equality is object identity; it does not compare NumPy payloads. The
+  concise representation reports frame/error counts rather than dumping image
+  contents.
+
+The dedicated input module may depend on NumPy, but has no Qt, UI, worker,
+`FitsViewer`, `QApplication`, or filesystem/path-inspection dependency. Its
+construction does not inspect or access the filesystem and requires no
+`QApplication`.
+
+This remains contract-level coverage only. Existing loaders and workers
+continue to use their current dictionaries and are not migrated. In
+particular, loader-specific suffix parsing, duplicate handling, and ordering
+remain unchanged. Spectra, shutter counts, masks, RADEN metadata, operation
+configuration, and cancellation/progress remain future operation-specific
+contracts.
 
 ## Adoption boundary
 
