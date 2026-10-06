@@ -23,6 +23,7 @@ from ..services.preprocessing_filtering import (
     filter_loaded_image_runs,
 )
 from ..services.preprocessing_layout import discover_full_process_summation
+from ..services.preprocessing_overlap import correct_loaded_image_run
 from ..services.preprocessing_summation import sum_loaded_image_runs
 
 NORMALISATION_WINDOW_HALF_RANGE = (0, 100)
@@ -169,19 +170,13 @@ def _loaded_image_run_from_legacy(run: dict) -> LoadedImageRun:
     )
 
 class OverlapCorrectionWorker(QThread):
-    progress_updated = pyqtSignal(int)  # Emits progress percentage
-    finished = pyqtSignal()             # Emits when processing is finished
-    message = pyqtSignal(str)           # Emits messages for user feedback
+    """Qt compatibility adapter for headless overlap correction."""
+
+    progress_updated = pyqtSignal(int)
+    finished = pyqtSignal()
+    message = pyqtSignal(str)
 
     def __init__(self, run, base_name, output_folder):
-        """
-        Initialize the OverlapCorrectionWorker.
-
-        Args:
-            run (dict): Dictionary containing 'folder_path', 'images', 'spectra', 'shutter_count'.
-            base_name (str): Base name for the output files.
-            output_folder (str): Folder where corrected images will be saved.
-        """
         super().__init__()
         self.run_data = run
         self.base_name = base_name
@@ -189,297 +184,44 @@ class OverlapCorrectionWorker(QThread):
         self._is_running = True
         self.succeeded = False
         self.failed_frames = []
+        self.result: PreprocessingOperationResult | None = None
 
     def run(self):
-        """
-        Execute the Overlap Correction process.
-        """
         try:
-            folder_path = self.run_data['folder_path']
-            images_dict = self.run_data['images']
-            spectra_data = self.run_data['spectra']
-            shutter_count_data = self.run_data['shutter_count']
-            
-            normalized_path = os.path.normpath(folder_path)
-            path_parts = normalized_path.split(os.sep)
-            if len(path_parts) >= 2:
-                short_path = os.path.join(path_parts[-2], path_parts[-1])
-            else:
-                short_path = normalized_path
-
-            # 1) Extract the first column (ToF values) from spectra
-            try:
-                # Only cast to float32 if needed
-                if spectra_data.dtype != np.float32:
-                    spectra_data = spectra_data.astype(np.float32)
-
-                tof_values = spectra_data[:, 0]  # Now guaranteed float32 if it wasn't
-                self.message.emit("Extracted ToF values from Spectra data.")
-            except Exception as e:
-                self.message.emit(f"Error extracting ToF values: {e}. Aborting run.")
-                self.finished.emit()
-                return
-
-            # 2) Calculate intervals and identify segmentation points
-            try:
-                tof_intervals = np.diff(tof_values)
-                segmentation_indices = np.where(tof_intervals > 0.0001)[0] + 1
-                segments = np.split(np.arange(len(tof_values)), segmentation_indices)
-                n_segments = len(segments)
-                self.message.emit(f"Identified {n_segments} segments based on ToF intervals.")
-            except Exception as e:
-                self.message.emit(f"Error during ToF segmentation: {e}. Aborting run.")
-                self.finished.emit()
-                return
-
-            # 3) Extract shutter counts for these segments
-            try:
-                if len(shutter_count_data) < n_segments:
-                    self.message.emit(f"Insufficient shutter counts for {n_segments} segments. Aborting run.")
-                    self.finished.emit()
-                    return
-
-                # Filter only counts > 1000
-                filtered_shutter_counts = shutter_count_data[shutter_count_data > 1000]
-                if len(filtered_shutter_counts) < n_segments:
-                    self.message.emit(
-                        f"Only {len(filtered_shutter_counts)} shutter counts > 1000 found, "
-                        f"but {n_segments} segments identified. Aborting run."
-                    )
-                    self.finished.emit()
-                    return
-
-                # Take the first n_segments shutter counts from the filtered list
-                selected_shutter_counts = filtered_shutter_counts[:n_segments]
-                self.message.emit(f"Selected {n_segments} shutter counts for {n_segments} segments.")
-            except Exception as e:
-                self.message.emit(f"Error processing shutter counts: {e}. Aborting run.")
-                self.finished.emit()
-                return
-
-            # 3.1) Compute each segment’s mean ToF interval
-            segment_intervals = []
-            for idx, seg in enumerate(segments):
-                if len(seg) <= 1:
-                    # No interval or only 1 point
-                    mean_interval = 0.0 if len(seg) < 1 else 1e-5
-                else:
-                    seg_tofs = tof_values[seg]
-                    seg_diffs = np.diff(seg_tofs)
-                    mean_interval = float(np.mean(seg_diffs))
-                segment_intervals.append(mean_interval)
-
-            # Reference interval is that of the first segment
-            ref_interval = segment_intervals[0]
-            if ref_interval == 0:
-                self.message.emit("First segment's interval is 0. Cannot normalize to T1=0.")
-                self.finished.emit()
-                return
-
-            # Debug messages
-            self.message.emit(f"Segment intervals: {segment_intervals}")
-            self.message.emit(f"Reference interval (segment 1) = {ref_interval:.7f}")
-
-            # 4) Initialize cumulative intensity arrays for each segment.
-            #    We'll base the shape/dtype on the first image in images_dict.
-            #    If no images, this could raise KeyError.
-            try:
-                first_img_key = next(iter(images_dict.keys()))
-                first_img_data = images_dict[first_img_key]
-                if first_img_data.dtype != np.float32:
-                    first_img_data = first_img_data.astype(np.float32)
-                shape_512 = first_img_data.shape
-
-                # Quick check the shape is what's expected (512, 512)
-                if shape_512 != (512, 512):
-                    self.message.emit(f"Image dimensions {shape_512} do not match expected (512, 512). Aborting run.")
-                    self.finished.emit()
-                    return
-
-                # Create a zero array for each segment
-                cumulative_intensities = [
-                    np.zeros(shape_512, dtype=np.float32) for _ in segments
-                ]
-            except StopIteration:
-                self.message.emit("No images found in the run. Aborting.")
-                self.finished.emit()
-                return
-            except Exception as e:
-                self.message.emit(f"Error initializing cumulative arrays: {e}. Aborting.")
-                self.finished.emit()
-                return
-
-            # 5) Sort images by ToF order based on numeric suffix
-            try:
-                def extract_numeric_suffix(suf):
-                    # safer approach: filter digits out of the string
-                    digits = ''.join(filter(str.isdigit, suf))
-                    return int(digits) if digits else -1
-
-                sorted_suffixes = sorted(images_dict.keys(), key=extract_numeric_suffix)
-                sorted_images = [images_dict[suf] for suf in sorted_suffixes]
-            except Exception as e:
-                self.message.emit(f"Error sorting images: {e}. Aborting run.")
-                self.finished.emit()
-                return
-
-            self.message.emit("--- Starting Overlap Correction ---")
-
-            # 6) Process each image individually
-            total_imgs = len(sorted_suffixes)
-            processed_images = 0
-            for img_idx, suf in enumerate(sorted_suffixes):
-                if not self._is_running:
-                    self.message.emit("Overlap Correction process has been stopped by the user.")
-                    break
-
-                try:
-                    image_data = sorted_images[img_idx]
-                    # Only cast if needed
-                    if image_data.dtype != np.float32:
-                        image_data = image_data.astype(np.float32)
-
-                    # Identify the segment this image belongs to
-                    # (img_idx is the index in sorted order, not necessarily the real "ToF" index,
-                    #  so you might want a different logic if needed. We'll keep your approach.)
-                    segment_number = None
-                    for seg_num, seg_indices in enumerate(segments):
-                        if img_idx in seg_indices:
-                            segment_number = seg_num
-                            break
-
-                    if segment_number is None:
-                        self.message.emit(f"Image {img_idx+1}: No matching segment. Skipping.")
-                        self.failed_frames.append(str(suf))
-                        continue
-
-                    # If it's the first image in that segment, overwrite
-                    seg_idx_within = np.where(segments[segment_number] == img_idx)[0][0]
-                    if seg_idx_within == 0:
-                        cumulative_intensities[segment_number] = image_data.copy()
-                    else:
-                        cumulative_intensities[segment_number] += image_data
-
-                    shutter_count = np.float32(selected_shutter_counts[segment_number])
-                    if shutter_count == 0:
-                        self.message.emit(
-                            f"Image {img_idx+1}: Shutter count = 0 for segment {segment_number+1}. Skipping normalisation."
-                        )
-                        self.failed_frames.append(str(suf))
-                        continue
-
-                    # Step 7) Calculate p value
-                    #   p = (cumulative_intensity in that segment) / shutter_count
-                    p = cumulative_intensities[segment_number] / shutter_count
-
-                    # Step 8) Correct intensities = original intensity / (1 - p)
-                    #   and scale by (ref_interval / this_interval)
-                    # denom = 1.0 - p
-                    denom  = np.where(1.0 - p <= 0, np.float32(1e-10), 1.0 - p)
-                    epsilon = 1e-10
-                    denom = np.where(denom <= 0, epsilon, denom)  # avoid div-by-zero
-                    corrected_intensity = image_data / denom
-
-                    # Scale factor for time intervals
-                    this_interval = np.float32(segment_intervals[segment_number])
-                    ref_interval  = np.float32(segment_intervals[0])
-                    scale_factor  = ref_interval / this_interval if this_interval > 0 else np.float32(1.0)
-
-                    # this_interval = segment_intervals[segment_number]
-                    # scale_factor = ref_interval / this_interval if this_interval > 0 else 1.0
-                    corrected_intensity *= scale_factor
-
-                    # Check NaN/Inf
-                    if np.isnan(corrected_intensity).any() or np.isinf(corrected_intensity).any():
-                        self.message.emit(f"Image {img_idx+1}: NaN or Inf after correction. Skipping.")
-                        self.failed_frames.append(str(suf))
-                        continue
-
-                    # Construct output path
-                    try:
-                        numeric_suffix = ''.join(filter(str.isdigit, suf))
-                        original_filename = f"{self.base_name}_{numeric_suffix}.fits"
-                        corrected_filename = f"Corrected_{original_filename}"
-                        output_path = os.path.join(self.output_folder, corrected_filename)
-                    except Exception as e:
-                        self.message.emit(f"Error constructing filename: {e}. Skipping.")
-                        self.failed_frames.append(str(suf))
-                        continue
-
-                    # Save corrected image
-                    write_fits_image_file(output_path, corrected_intensity, overwrite=True)
-                    processed_images += 1
-
-                    # Update progress
-                    overall_progress = int(((img_idx + 1) / total_imgs) * 100)
-                    self.progress_updated.emit(overall_progress)
-
-                except Exception as e:
-                    self.message.emit(f"Error processing image '{suf}': {e}. Skipping.")
-                    self.failed_frames.append(str(suf))
-                    continue
-
-            # Final messages
-            self.succeeded = (
-                self._is_running
-                and not self.failed_frames
-                and processed_images == total_imgs
+            run = LoadedImageRun(
+                primary_source=self.run_data["folder_path"],
+                frames=self.run_data["images"],
+                load_errors=self.run_data.get("load_errors") or (),
             )
-            if self.succeeded:
-                self.message.emit("Overlap Correction process completed successfully.")
-            else:
-                self.message.emit(
-                    "Overlap Correction failed or stopped before all frames "
-                    "were written."
-                )
-
-            # 9) Copy spectra and shuttercount files to output folder
-            try:
-                spectra_suffix = '_Spectra.txt'
-                shuttercount_suffix = '_ShutterCount.txt'
-
-                # Copy spectra files
-                spectra_files = [f for f in os.listdir(folder_path) if f.endswith(spectra_suffix)]
-                if not spectra_files:
-                    self.message.emit(f"No files ending with '{spectra_suffix}' found in \\{short_path}.")
-                else:
-                    for spectra_file in spectra_files:
-                        source_path = os.path.join(folder_path, spectra_file)
-                        dest_path = os.path.join(self.output_folder, spectra_file)
-                        shutil.copyfile(source_path, dest_path)
-                        self.message.emit(f"'{spectra_file}' copied to output folder.")
-
-                # Copy shuttercount files
-                shuttercount_files = [f for f in os.listdir(folder_path) if f.endswith(shuttercount_suffix)]
-                if not shuttercount_files:
-                    self.message.emit(f"No files ending with '{shuttercount_suffix}' found in \\{short_path}.")
-                else:
-                    for shuttercount_file in shuttercount_files:
-                        source_path = os.path.join(folder_path, shuttercount_file)
-                        dest_path = os.path.join(self.output_folder, shuttercount_file)
-                        shutil.copyfile(source_path, dest_path)
-                        self.message.emit(f"'{shuttercount_file}' copied to output folder.")
-
-            except Exception as e:
-                self.message.emit(f"Error copying spectra or shuttercount files: {e}")
-
-        except Exception as e:
-            # If a top-level error happened, log and skip gracefully
+            self.result = correct_loaded_image_run(
+                run,
+                self.run_data["spectra"],
+                self.run_data["shutter_count"],
+                self.base_name,
+                self.output_folder,
+                progress_callback=self.progress_updated.emit,
+                message_callback=self.message.emit,
+                cancellation_check=lambda: not self._is_running,
+                frame_failure_callback=lambda suffix: self.failed_frames.append(suffix),
+                fatal_error_callback=lambda exc: self.message.emit(
+                    f"Error in OverlapCorrectionWorker: {exc}"
+                ),
+            )
+            self.succeeded = self.result.status is PreprocessingStatus.SUCCEEDED
+        except Exception as exc:
             self.succeeded = False
-            self.message.emit(f"Error in OverlapCorrectionWorker: {e}")
-
-        # Optional: if memory usage is extremely high, you could call gc.collect() once here
-        # gc.collect()
-
-        # Emit finished signal
-        if not self.succeeded:
+            self.result = PreprocessingOperationResult(
+                PreprocessingStatus.FAILED,
+                0,
+                expected_count=len(self.run_data.get("images", {})),
+                errors=(str(exc),),
+            )
+            self.message.emit(f"Error in OverlapCorrectionWorker: {exc}")
             self.message.emit("Overlap Correction did not complete successfully.")
-        self.finished.emit()
+        finally:
+            self.finished.emit()
 
     def stop(self):
-        """
-        Stop the Overlap Correction process.
-        """
         self._is_running = False
         self.message.emit("Stop signal received. Terminating Overlap Correction process.")
 
