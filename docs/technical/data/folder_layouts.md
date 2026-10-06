@@ -5,12 +5,12 @@ doc_type: technical_reference
 functional_area: data
 audience: [user, developer]
 neat_version: 4.8.0
-verified_commit: aa5961fd7fee965bf7826af263b5e6ea70755ebf
+verified_commit: aae7ff0fef4d7b4350ebbef84cc15a2f36e7c9fc
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
 source_paths: [NEAT/services/preprocessing_layout.py, NEAT/ui/mixins/preprocessing.py, NEAT/workers/preprocessing.py]
-source_symbols: [immediate_child_directories, discover_classic_batch, classify_standalone_summation, PreprocessingMixin.add_outlier_images, PreprocessingMixin.add_overlap_correction_images, PreprocessingMixin.add_normalisation_data_images, PreprocessingMixin.add_summation_images, PreprocessingMixin._classify_normalisation_folder, FullProcessWorker.maybe_do_summation]
+source_symbols: [immediate_child_directories, discover_classic_batch, classify_standalone_summation, discover_full_process_summation, PreprocessingMixin.add_outlier_images, PreprocessingMixin.add_overlap_correction_images, PreprocessingMixin.add_normalisation_data_images, PreprocessingMixin.add_summation_images, PreprocessingMixin._classify_normalisation_folder, FullProcessWorker.maybe_do_summation]
 test_paths: [tests/test_preprocessing_layout.py]
 ---
 
@@ -81,6 +81,11 @@ child is still passed through the existing load-and-sum path; Full Process
 does not require two children and does not support the extra
 `parent -> sample -> runs` grouping layer. Grandchildren are not promoted to
 top-level runs.
+
+`discover_full_process_summation()` exposes the immediate folders and this
+`should_sum` decision to the worker. Its decision depends only on whether the
+immediate-folder list is empty; it does not impose the standalone Summation
+minimum of two folders.
 
 Empty or unrelated children still affect the discovered child count and the
 existing Full Process classification. Full Process subsequently tries to load
