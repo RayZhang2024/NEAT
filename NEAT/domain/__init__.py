@@ -14,6 +14,11 @@ from .individual_edge import (
     IndividualEdgeFitResult,
     RegionFitCurve,
 )
+from .preprocessing import (
+    PreprocessingOperationResult,
+    PreprocessingStatus,
+    ProducedOutput,
+)
 
 __all__ = [
     "FittingParameterBounds",
@@ -26,4 +31,7 @@ __all__ = [
     "IndividualEdgeFitConfig",
     "IndividualEdgeFitResult",
     "RegionFitCurve",
+    "PreprocessingOperationResult",
+    "PreprocessingStatus",
+    "ProducedOutput",
 ]
