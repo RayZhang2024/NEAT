@@ -238,6 +238,8 @@ if ($instance.Context -ne 'USERMANAGED') { throw "Unexpected context: $($instanc
         self.run_msi_context_script(script)
 
     def test_msi_product_discovery_queries_all_contexts_with_windows_installer_api(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows Installer product enumeration is Windows-only")
         script = r'''
 $ErrorActionPreference = "Stop"
 Import-Module $env:ISSUE18_CONTEXT_MODULE -Force
