@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer]
 neat_version: 4.8.0
-verified_commit: f48bc0b6d887a865603ddb6dfc8583512d33bbd7
+verified_commit: ad321dede50acbc9ce21393281c6495778ed5a45
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
@@ -157,8 +157,9 @@ than being added to the common input model.
 
 ## Adoption boundary
 
-This increment establishes contract-level coverage only. Existing workers,
-their Qt signals and `succeeded` attributes, GUI completion behavior,
-cancellation implementation, processing order, scientific calculations, and
-output generation remain unchanged. Worker/service adoption belongs to later
-Epic #21 issues and must define each operation's logical work unit explicitly.
+Summation is the first operation to use `LoadedImageRun` and
+`PreprocessingOperationResult`. `SummationWorker` converts legacy dictionaries
+at its compatibility boundary, delegates to the headless service, and retains
+the structured result alongside its Qt signals and `succeeded` flag. Other
+preprocessing workers and loaders remain unmigrated. Their future migrations
+are separate Epic #21 work and must define each operation's logical work unit.
