@@ -14,6 +14,7 @@ from scipy import ndimage
 from PyQt5.QtCore import Qt, QEventLoop, QThread, pyqtSignal
 
 from .batch import get_raden_tiff_stack_info, load_image_file, write_fits_image_file
+from ..services.preprocessing_layout import immediate_child_directories
 
 NORMALISATION_WINDOW_HALF_RANGE = (0, 100)
 NORMALISATION_ADJACENT_RANGE = (0, 10)
@@ -1318,11 +1319,7 @@ class FullProcessWorker(QThread):
             return folder
     
         # Check for subfolders
-        subfolders = [
-            os.path.join(folder, d)
-            for d in os.listdir(folder)
-            if os.path.isdir(os.path.join(folder, d))
-        ]
+        subfolders = immediate_child_directories(folder)
         
         short_path = self.get_short_path(folder, levels=2)
     
