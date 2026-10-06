@@ -8,6 +8,13 @@ __author__ = " Ruiyao Zhang "
 # bundles that metadata for the standalone application.
 __version__ = version("NEAT")
 
+# Keep the historical ONNX-before-Qt initialization order for assistant users,
+# without importing the GUI for callers that only use numerical services.
+try:  # pragma: no cover - depends on optional runtime and operating system
+    import onnxruntime as _onnxruntime  # noqa: F401
+except (ImportError, OSError):
+    _onnxruntime = None
+
 __all__ = ["FitsViewer", "__version__"]
 
 
@@ -15,14 +22,6 @@ def __getattr__(name):
     """Load the GUI lazily so numerical services can be imported headlessly."""
     if name != "FitsViewer":
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-    # Preserve ONNX-before-Qt ordering for application users while keeping
-    # headless package imports independent of the optional native runtime.
-    try:  # pragma: no cover - depends on optional runtime and operating system
-        import onnxruntime as _onnxruntime  # noqa: F401
-    except (ImportError, OSError):
-        _onnxruntime = None
-    globals()["_onnxruntime"] = _onnxruntime
 
     from .ui import FitsViewer
 

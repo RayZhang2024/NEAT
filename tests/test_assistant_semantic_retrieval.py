@@ -36,8 +36,6 @@ class AssistantSemanticConfigurationTests(unittest.TestCase):
             """
             from pathlib import Path
             import NEAT
-            from tools.assistant_semantic_retrieval import prepare_local_embedding_runtime
-            prepare_local_embedding_runtime()
             from PyQt5.QtCore import QThread
             from NEAT.package_resources import assistant_knowledge_root
             from tools.assistant_retrieval import load_knowledge_base

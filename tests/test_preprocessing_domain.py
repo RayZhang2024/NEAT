@@ -244,13 +244,57 @@ class PreprocessingOperationResultTests(unittest.TestCase):
 
 
 class PreprocessingDomainImportTests(unittest.TestCase):
-    def test_contract_module_imports_without_qt_ui_workers_or_numpy(self):
-        code = (
-            "import sys; import NEAT.domain.preprocessing; "
-            "forbidden = ('PyQt5', 'NEAT.ui', 'NEAT.workers', 'numpy'); "
-            "assert not [name for name in sys.modules if any(name == prefix or "
-            "name.startswith(prefix + '.') for prefix in forbidden)]"
-        )
+    def test_contract_module_has_an_isolated_standard_library_boundary(self):
+        source_path = REPOSITORY_ROOT / "NEAT" / "domain" / "preprocessing.py"
+        code = f'''\
+import ast
+import __future__
+import dataclasses
+import enum
+import sys
+import types
+import typing
+from pathlib import Path
+
+source_path = Path({str(source_path)!r})
+source = source_path.read_text(encoding="utf-8")
+tree = ast.parse(source, filename=str(source_path))
+allowed_imports = {{"__future__", "dataclasses", "enum", "typing"}}
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        imports = [alias.name for alias in node.names]
+    elif isinstance(node, ast.ImportFrom):
+        imports = [node.module or ""]
+    else:
+        imports = []
+    assert all(name in allowed_imports for name in imports), imports
+    if isinstance(node, ast.Name):
+        assert node.id not in {{"FitsViewer", "QApplication"}}, node.id
+    if isinstance(node, ast.Call):
+        called_name = node.func.id if isinstance(node.func, ast.Name) else None
+        called_attr = node.func.attr if isinstance(node.func, ast.Attribute) else None
+        assert called_name != "open", ast.unparse(node)
+        assert called_attr not in {{"open", "exists", "is_file", "is_dir", "stat", "listdir", "scandir"}}, ast.unparse(node)
+
+# Execute the dedicated source in isolation, without running NEAT package
+# initializers. Imports it needs are preloaded; an audit hook rejects I/O from
+# the module body itself.
+module_name = "_neat_preprocessing_contract_isolated"
+module = types.ModuleType(module_name)
+module.__file__ = str(source_path)
+sys.modules[module_name] = module
+def reject_io(event, args):
+    if event in {{"open", "os.listdir", "os.scandir", "os.stat"}}:
+        raise AssertionError(("contract module performed filesystem I/O", event, args))
+sys.addaudithook(reject_io)
+exec(compile(source, str(source_path), "exec"), module.__dict__)
+assert module.PreprocessingStatus.SUCCEEDED.value == "succeeded"
+assert not any(
+    name == prefix or name.startswith(prefix + ".")
+    for name in sys.modules
+    for prefix in ("numpy", "PyQt5", "NEAT.ui", "NEAT.workers")
+)
+'''
         result = subprocess.run(
             [sys.executable, "-c", code],
             cwd=REPOSITORY_ROOT,
