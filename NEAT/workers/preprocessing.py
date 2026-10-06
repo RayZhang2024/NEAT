@@ -18,6 +18,10 @@ from ..domain import (
     PreprocessingStatus,
 )
 from ..services.preprocessing_clean import clean_loaded_image_runs, positive_neighbor_mean
+from ..services.preprocessing_filtering import (
+    copy_filtering_related_files,
+    filter_loaded_image_runs,
+)
 from ..services.preprocessing_layout import discover_full_process_summation
 from ..services.preprocessing_summation import sum_loaded_image_runs
 
@@ -1219,146 +1223,65 @@ class FullProcessWorker(QThread):
         return run
 
 class FilteringWorker(QThread):
-    progress_updated = pyqtSignal(int)  # Emits progress percentage
-    finished = pyqtSignal()             # Emits when processing is finished
-    message = pyqtSignal(str)           # Emits messages for user feedback
+    progress_updated = pyqtSignal(int)
+    finished = pyqtSignal()
+    message = pyqtSignal(str)
 
     def __init__(self, filtering_image_runs, filtering_mask, output_folder, base_name):
         super().__init__()
-        self.filtering_image_runs = filtering_image_runs  # List of data run dictionaries
-        self.filtering_mask = filtering_mask              # Single mask image array
+        self.filtering_image_runs = filtering_image_runs
+        self.filtering_mask = filtering_mask
         self.output_folder = output_folder
         self.base_name = base_name
         self._is_running = True
         self.succeeded = False
         self.failed_frames = []
+        self.result: PreprocessingOperationResult | None = None
 
     def run(self):
-        """
-        Main filtering process.
-        """
         try:
-            # 1) Basic validations
-            if not self.filtering_image_runs:
-                self.message.emit("No filtering data runs to process.")
-                self.finished.emit()
-                return
-
-            if self.filtering_mask is None:
-                self.message.emit("No mask image provided.")
-                self.finished.emit()
-                return
-
-            # A filtering mask is explicitly binary: 1 keeps and 0 discards.
-            mask_values = np.asarray(self.filtering_mask)
-            if not np.isfinite(mask_values).all():
-                raise ValueError("Filtering mask contains NaN or infinite values.")
-            unique_values = np.unique(mask_values)
-            if not np.isin(unique_values, (0, 1)).all():
-                raise ValueError(
-                    "Filtering mask must be binary and contain only 0 and 1."
+            runs = tuple(
+                LoadedImageRun(
+                    primary_source=run["folder_path"],
+                    frames=run["images"],
+                    load_errors=run.get("load_errors") or (),
                 )
-            self.filtering_mask = mask_values.astype(np.float32, copy=False)
-
-            mask_shape = self.filtering_mask.shape
-
-            # 3) Counters for progress
-            total_runs = len(self.filtering_image_runs)
-            total_images = sum(len(run['images']) for run in self.filtering_image_runs)
-            processed_images = 0
-
-            self.message.emit("Filtering started...")
-
-            # 4) Process each run
-            for run_idx, data_run in enumerate(self.filtering_image_runs, start=1):
-                if not self._is_running:
-                    self.message.emit("Filtering process has been stopped by the user.")
-                    break
-
-                data_folder = data_run.get('folder_path', None)
-                data_images = data_run.get('images', {})
-
-                # Copy .txt files for this run (if desired)
-                self.copy_related_files(run_idx, data_run)
-
-                # Sort image keys for a consistent order
-                suffixes = sorted(data_images.keys())
-
-                # 5) Process each image in the run
-                for suffix in suffixes:
-                    if not self._is_running:
-                        self.message.emit("Filtering process has been stopped by the user.")
-                        break
-
-                    try:
-                        image_data = data_images[suffix]
-                        # Convert to float32 if needed
-                        if image_data.dtype != np.float32:
-                            image_data = image_data.astype(np.float32)
-
-                        if image_data.shape != mask_shape:
-                            self.message.emit(
-                                f"Image {suffix}: Mask shape {mask_shape} "
-                                f"does not match image shape {image_data.shape}. Skipping."
-                            )
-                            self.failed_frames.append(str(suffix))
-                            continue
-
-                        # Apply the validated binary mask: 1 keeps, 0 discards.
-                        filtered_image = np.where(
-                            self.filtering_mask == 1, image_data, 0
-                        )
-
-                        # Save the filtered image
-                        filtered_filename = f"{self.base_name}_{suffix}.fits"
-                        filtered_path = os.path.join(self.output_folder, filtered_filename)
-                        try:
-                            write_fits_image_file(filtered_path, filtered_image, overwrite=True)
-                        except Exception as e:
-                            self.failed_frames.append(str(suffix))
-                            self.message.emit(f"Image {suffix}: Failed to save '{filtered_filename}': {e}. Skipping.")
-                            continue
-
-                        # Update progress
-                        processed_images += 1
-                        overall_progress = int((processed_images / total_images) * 100)
-                        self.progress_updated.emit(overall_progress)
-
-                    except Exception as e:
-                        self.failed_frames.append(str(suffix))
-                        self.message.emit(f"Error filtering image {suffix}: {e}")
-                        continue
-
-                # Optional: update overall run progress
-                run_progress = int((run_idx / total_runs) * 100)
-                self.progress_updated.emit(run_progress)
-                
-            self.output_folder_short = self.get_short_path(self.output_folder, levels=2)
-
-            self.succeeded = (
-                self._is_running
-                and not self.failed_frames
-                and processed_images == total_images
+                for run in self.filtering_image_runs
             )
-            status = "completed" if self.succeeded else "failed or incomplete"
-            self.message.emit(
-                f"Filtering {status}. {processed_images} of {total_images} "
-                f"images saved to {self.output_folder_short}."
+            self.result = filter_loaded_image_runs(
+                runs,
+                self.filtering_mask,
+                self.output_folder,
+                self.base_name,
+                progress_callback=self.progress_updated.emit,
+                message_callback=self.message.emit,
+                cancellation_check=lambda: not self._is_running,
+                frame_failure_callback=lambda suffix: self.failed_frames.append(suffix),
+                validated_mask_callback=self._set_validated_mask,
+                summary_path_callback=self._set_summary_path,
             )
-
-        except Exception as e:
+            self.succeeded = self.result.status is PreprocessingStatus.SUCCEEDED
+            if not self.filtering_image_runs or self.filtering_mask is None:
+                self.finished.emit()  # Preserve the legacy early-return signal.
+                return
+        except Exception as exc:
             self.succeeded = False
-            self.message.emit(f"Error during filtering: {e}")
-
+            self.result = PreprocessingOperationResult(
+                PreprocessingStatus.FAILED, 0, errors=(str(exc),)
+            )
+            self.message.emit(f"Error during filtering: {exc}")
         finally:
-            # Call gc.collect() once at the end if you need to enforce cleanup
             gc.collect()
             self.finished.emit()
 
+    def _set_validated_mask(self, mask: np.ndarray) -> None:
+        self.filtering_mask = mask
+
+    def _set_summary_path(self) -> str:
+        self.output_folder_short = self.get_short_path(self.output_folder, levels=2)
+        return self.output_folder_short
+
     def stop(self):
-        """
-        Stop the Filtering process.
-        """
         self._is_running = False
         self.message.emit("Stop signal received. Terminating Filtering process.")
 
@@ -1372,49 +1295,13 @@ class FilteringWorker(QThread):
         return normalized_path
 
     def copy_related_files(self, run_idx, data_run):
-        """
-        Copies related files (e.g., *_Spectra.txt and *_ShutterCount.txt) from the data run's folder
-        to the output folder, renaming them with the run_idx to avoid collisions.
-        """
-        try:
-            folder_path = data_run.get('folder_path', None)
-            if not folder_path or not os.path.isdir(folder_path):
-                self.message.emit(f"Data run folder not found or invalid: {folder_path}")
-                return
-
-            data_files = os.listdir(folder_path)
-            spectra_suffix = '_Spectra.txt'
-            shuttercount_suffix = '_ShutterCount.txt'
-
-            def create_unique_filename(run_number, original_filename):
-                return f"Run{run_number}_{original_filename}"
-
-            # Copy one spectra file if it exists
-            spectra_files = [f for f in data_files if f.endswith(spectra_suffix)]
-            if spectra_files:
-                file = spectra_files[0]
-                src = os.path.join(folder_path, file)
-                dest_filename = create_unique_filename(run_idx, file)
-                dst = os.path.join(self.output_folder, dest_filename)
-                shutil.copyfile(src, dst)
-                self.message.emit(f"Copied '{file}' to '{dest_filename}'.")
-            else:
-                self.message.emit(f"No spectra file (*{spectra_suffix}) found in {folder_path}.")
-
-            # Copy one shuttercount file if it exists
-            shuttercount_files = [f for f in data_files if f.endswith(shuttercount_suffix)]
-            if shuttercount_files:
-                file = shuttercount_files[0]
-                src = os.path.join(folder_path, file)
-                dest_filename = create_unique_filename(run_idx, file)
-                dst = os.path.join(self.output_folder, dest_filename)
-                shutil.copyfile(src, dst)
-                self.message.emit(f"Copied '{file}' to '{dest_filename}'.")
-            else:
-                self.message.emit(f"No shuttercount file (*{shuttercount_suffix}) found in {folder_path}.")
-
-        except Exception as e:
-            self.message.emit(f"Error copying related files: {e}")
+        """Keep the public sidecar-copy entry point as a service delegate."""
+        copy_filtering_related_files(
+            run_idx,
+            data_run.get("folder_path", None),
+            self.output_folder,
+            message_callback=self.message.emit,
+        )
 
 class RadenNormalisationWorker(QThread):
     progress_updated = pyqtSignal(int)

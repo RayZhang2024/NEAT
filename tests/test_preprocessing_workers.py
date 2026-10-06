@@ -397,6 +397,159 @@ class TestNormalisationWorker(unittest.TestCase):
 
 
 class TestFilteringWorker(unittest.TestCase):
+    def test_adapter_success_mask_state_signals_and_public_methods(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "output"
+            output.mkdir()
+            (root / "a_Spectra.txt").write_text("s")
+            mask = np.array([[True, False]], dtype=bool)
+            run = {"folder_path": tmp, "images": {
+                "z": np.array([[2, 3]], dtype=np.int16),
+                "a": np.array([[4, 5]], dtype=np.float64),
+            }, "load_errors": ["ignored"]}
+            worker = FilteringWorker([run], mask, str(output), "filtered")
+            self.assertIs(worker.filtering_mask, mask)
+            self.assertFalse(hasattr(worker, "output_folder_short"))
+            progress, messages, finished = [], [], []
+            worker.progress_updated.connect(progress.append)
+            worker.message.connect(messages.append)
+            worker.finished.connect(lambda: finished.append(True))
+            worker.run()
+            self.assertTrue(worker.succeeded)
+            self.assertIsInstance(worker.result, PreprocessingOperationResult)
+            self.assertEqual(worker.result.status, PreprocessingStatus.SUCCEEDED)
+            self.assertEqual(worker.filtering_mask.dtype, np.float32)
+            self.assertEqual(worker.failed_frames, [])
+            self.assertEqual(progress, [50, 100, 100])
+            self.assertEqual(finished, [True])
+            self.assertEqual(worker.output_folder_short,
+                             worker.get_short_path(str(output), levels=2))
+            self.assertTrue(messages[-1].startswith("Filtering completed. 2 of 2"))
+            self.assertEqual(sum(m.startswith("Filtering completed.") for m in messages), 1)
+            self.assertEqual([Path(item.path).name for item in worker.result.outputs],
+                             ["Run1_a_Spectra.txt", "filtered_a.fits", "filtered_z.fits"])
+
+            separate = root / "separate"
+            separate.mkdir()
+            direct = FilteringWorker([run], mask, str(separate), "direct")
+            copied_messages = []
+            direct.message.connect(copied_messages.append)
+            direct.copy_related_files(1, run)
+            self.assertTrue((separate / "Run1_a_Spectra.txt").exists())
+            self.assertIn("Copied 'a_Spectra.txt' to 'Run1_a_Spectra.txt'.", copied_messages)
+
+    def test_invalid_inputs_preserve_mask_and_duplicate_early_finished(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = {"folder_path": tmp, "images": {"x": np.ones((1, 1))}}
+            cases = (
+                ([], np.array([[1]]), "No filtering data runs to process.", 2),
+                ([run], None, "No mask image provided.", 2),
+                ([run], np.array([[2]]), "Error during filtering: Filtering mask must be binary and contain only 0 and 1.", 1),
+                ([run], np.array([[np.nan]]), "Error during filtering: Filtering mask contains NaN or infinite values.", 1),
+            )
+            for runs, mask, expected_message, finished_count in cases:
+                with self.subTest(message=expected_message):
+                    worker = FilteringWorker(runs, mask, tmp, "filtered")
+                    messages, finished = [], []
+                    worker.message.connect(messages.append)
+                    worker.finished.connect(lambda: finished.append(True))
+                    worker.run()
+                    self.assertFalse(worker.succeeded)
+                    self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
+                    self.assertIs(worker.filtering_mask, mask)
+                    self.assertEqual(messages, [expected_message])
+                    self.assertEqual(len(finished), finished_count)
+                    self.assertFalse(hasattr(worker, "output_folder_short"))
+
+            original_mask = np.array([[1]], dtype=np.int16)
+            worker = FilteringWorker([run], original_mask, tmp, "filtered")
+            messages = []
+            worker.message.connect(messages.append)
+            with patch(
+                "NEAT.services.preprocessing_filtering.np.unique",
+                side_effect=RuntimeError("preparation broke"),
+            ):
+                worker.run()
+            self.assertIs(worker.filtering_mask, original_mask)
+            self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
+            self.assertEqual(messages, ["Error during filtering: preparation broke"])
+            self.assertFalse(hasattr(worker, "output_folder_short"))
+
+    def test_frame_failure_order_and_dual_progress_not_reclassified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "out"
+            output.mkdir()
+            run = {"folder_path": tmp, "images": {
+                "z": np.ones((1, 1)),
+                "m": np.ones((2, 2)),
+                "a": np.ones((2, 2)),
+            }}
+            worker = FilteringWorker([run], np.ones((1, 1)), str(output), "filtered")
+            progress, messages, finished = [], [], []
+            worker.progress_updated.connect(progress.append)
+            worker.message.connect(messages.append)
+            worker.finished.connect(lambda: finished.append(True))
+            worker.run()
+            self.assertFalse(worker.succeeded)
+            self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
+            self.assertEqual(worker.failed_frames, ["a", "m"])
+            self.assertEqual(progress, [33, 100])
+            self.assertEqual(len(finished), 1)
+            self.assertEqual(sum(m.startswith("Image a:") for m in messages), 1)
+            self.assertEqual(sum(m.startswith("Image m:") for m in messages), 1)
+            self.assertFalse(any(m.startswith("Error during filtering:") for m in messages))
+
+            write_worker = FilteringWorker(
+                [{"folder_path": tmp, "images": {
+                    "a": np.ones((1, 1)), "b": np.ones((1, 1)),
+                }}],
+                np.ones((1, 1)),
+                str(output),
+                "write",
+            )
+            from NEAT.services.image_io import write_fits_image_file
+
+            def write(path, data, overwrite=True):
+                if str(path).endswith("write_a.fits"):
+                    raise OSError("write denied")
+                return write_fits_image_file(path, data, overwrite=overwrite)
+
+            with patch(
+                "NEAT.services.preprocessing_filtering.write_fits_image_file",
+                side_effect=write,
+            ):
+                write_worker.run()
+            self.assertFalse(write_worker.succeeded)
+            self.assertEqual(write_worker.failed_frames, ["a"])
+            self.assertEqual(write_worker.result.processed_count, 1)
+            self.assertTrue((output / "write_b.fits").exists())
+
+    def test_pre_stopped_message_order_result_and_summary_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "out"
+            output.mkdir()
+            worker = FilteringWorker(
+                [{"folder_path": tmp, "images": {"x": np.ones((1, 1))}}],
+                np.array([[1]], dtype=np.int16), str(output), "filtered"
+            )
+            messages, finished = [], []
+            worker.message.connect(messages.append)
+            worker.finished.connect(lambda: finished.append(True))
+            worker.stop()
+            worker.run()
+            self.assertEqual(worker.result.status, PreprocessingStatus.CANCELLED)
+            self.assertFalse(worker.succeeded)
+            self.assertEqual(worker.filtering_mask.dtype, np.float32)
+            self.assertEqual(messages[:3], [
+                "Stop signal received. Terminating Filtering process.",
+                "Filtering started...",
+                "Filtering process has been stopped by the user.",
+            ])
+            self.assertTrue(messages[-1].startswith("Filtering failed or incomplete. 0 of 1"))
+            self.assertEqual(finished, [True])
+            self.assertEqual(worker.output_folder_short, worker.get_short_path(str(output)))
+
     def test_binary_mask_one_keeps_and_zero_discards(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"
