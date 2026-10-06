@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: data
 audience: [user, scientist, developer]
 neat_version: 4.8.0
-verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
+verified_commit: f48bc0b6d887a865603ddb6dfc8583512d33bbd7
 status: code-verified
 instrument_applicability: [general, IMAT-style image folders, RADEN]
 scientific_review: pending
-source_paths: [NEAT/workers/batch.py, NEAT/workers/preprocessing.py]
+source_paths: [NEAT/workers/batch.py, NEAT/workers/preprocessing.py, NEAT/services/image_io.py, NEAT/services/preprocessing_summation.py]
 source_symbols: [load_image_file, write_fits_image_file, ImageLoadWorker, FullProcessWorker.load_run_dict]
-test_paths: [tests/test_image_io_orientation.py, tests/test_preprocessing_tiff.py]
+test_paths: [tests/test_image_io_orientation.py, tests/test_preprocessing_tiff.py, tests/test_preprocessing_summation.py]
 ---
 
 # Supported preprocessing images and sidecars
@@ -49,7 +49,9 @@ errors instead of silently replacing an earlier image.
 FITS and TIFF images are flipped along the row axis on loading so NEAT's
 in-memory orientation matches the ImageJ-style display convention. FITS output
 is flipped on writing. Consequently, reading and writing through the NEAT
-helpers preserves the displayed orientation.
+helpers preserves the displayed orientation. The shared writer is implemented
+in the headless `NEAT.services.image_io` module and remains re-exported from
+`NEAT.workers.batch` for existing callers.
 
 Most classic preprocessing operations write FITS even when the source is TIFF.
 The original FITS header is not carried into these generated files. Arrays are
