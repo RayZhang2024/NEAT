@@ -170,7 +170,7 @@ def sum_loaded_image_runs(
                         emit_message(f"[WARNING] {warning}")
                     break
             if not copied:
-                warning = f"Run {run_idx}: No Spectra file found."
+                warning = f"Run {run_idx}: No Spectra file found."
                 warnings.append(warning)
                 emit_message(warning)
 

@@ -177,6 +177,45 @@ class TestPreprocessingSummationService(unittest.TestCase):
                 self.assertIsNone(result.expected_count)
                 self.assertFalse(output.exists())
 
+    def test_additional_prewrite_validation_cases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            valid = root / "valid"
+            malformed = root / "malformed"
+            valid.mkdir()
+            malformed.mkdir()
+            _write_shutter(valid, [1])
+            np.savetxt(
+                malformed / "fixture_ShutterCount.txt", [[0, 1, 2]], fmt="%d"
+            )
+            cases = (
+                ("no runs", []),
+                ("empty first run", [LoadedImageRun("empty", {}, (str(valid),))]),
+                (
+                    "non-2-D frame",
+                    [LoadedImageRun("one-dimensional", {"1": np.ones(2)}, (str(valid),))],
+                ),
+                (
+                    "three-column ShutterCount",
+                    [
+                        LoadedImageRun(
+                            "bad-sidecar",
+                            {"1": np.ones((2, 2), dtype=np.float32)},
+                            (str(malformed),),
+                        )
+                    ],
+                ),
+            )
+            for index, (description, runs) in enumerate(cases):
+                with self.subTest(description):
+                    output = root / f"output-{index}"
+                    result = summation.sum_loaded_image_runs(runs, "sample", str(output))
+                    self.assertEqual(result.status, PreprocessingStatus.FAILED)
+                    self.assertEqual(result.processed_count, 0)
+                    self.assertIsNone(result.expected_count)
+                    self.assertEqual(result.outputs, ())
+                    self.assertFalse(output.exists())
+
     def test_failed_later_image_write_keeps_partial_results_and_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -200,6 +239,29 @@ class TestPreprocessingSummationService(unittest.TestCase):
             self.assertEqual([item.role for item in result.outputs], ["summed_image"])
             self.assertTrue((output / "gold_Summed_10.fits").exists())
             self.assertFalse((output / "gold_summed_ShutterCount.txt").exists())
+
+    def test_shutter_write_failure_keeps_all_completed_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = _golden_fixture(root)
+            output = root / "output"
+            with patch.object(summation.np, "savetxt", side_effect=OSError("denied")):
+                result = summation.sum_loaded_image_runs(runs, "gold", str(output))
+
+            self.assertEqual(result.status, PreprocessingStatus.FAILED)
+            self.assertEqual((result.processed_count, result.expected_count), (2, 2))
+            self.assertEqual(
+                [item.role for item in result.outputs],
+                ["summed_image", "summed_image"],
+            )
+            self.assertEqual(
+                [Path(item.path).name for item in result.outputs],
+                ["gold_Summed_10.fits", "gold_Summed_2.fits"],
+            )
+            self.assertTrue((output / "gold_Summed_10.fits").exists())
+            self.assertTrue((output / "gold_Summed_2.fits").exists())
+            self.assertFalse((output / "gold_summed_ShutterCount.txt").exists())
+            self.assertEqual(list(output.glob("*_Spectra.txt")), [])
 
     def test_cancellation_after_image_keeps_only_completed_image(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,17 +294,47 @@ class TestPreprocessingSummationService(unittest.TestCase):
             root = Path(tmp)
             runs = _golden_fixture(root)
             output = root / "output"
+            messages = []
             with patch.object(summation.shutil, "copyfile", side_effect=OSError("denied")):
-                result = summation.sum_loaded_image_runs(runs, "gold", str(output))
+                result = summation.sum_loaded_image_runs(
+                    runs, "gold", str(output), message_callback=messages.append
+                )
 
             self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
             self.assertEqual(result.processed_count, 2)
             # Each copy warning retains the legacy follow-up "No Spectra" message.
             self.assertEqual(len(result.warnings), 6)
             self.assertEqual(
+                result.warnings[1::2],
+                tuple(f"Run {index}: No Spectra file found." for index in (1, 2, 3)),
+            )
+            self.assertEqual(
+                [message for message in messages if "No Spectra file found." in message],
+                [f"Run {index}: No Spectra file found." for index in (1, 2, 3)],
+            )
+            self.assertEqual(
                 [item.role for item in result.outputs],
                 ["summed_image", "summed_image", "summed_shutter_count"],
             )
+
+    def test_missing_spectra_uses_exact_legacy_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_folder = root / "run"
+            run_folder.mkdir()
+            _write_shutter(run_folder, [1])
+            run = LoadedImageRun(
+                "run", {"1": np.ones((2, 2), dtype=np.float32)}, (str(run_folder),)
+            )
+            messages = []
+
+            result = summation.sum_loaded_image_runs(
+                [run], "sample", str(root / "output"), message_callback=messages.append
+            )
+
+            self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
+            self.assertEqual(result.warnings, ("Run 1: No Spectra file found.",))
+            self.assertIn("Run 1: No Spectra file found.", messages)
 
     def test_service_import_does_not_load_qt_or_gui_modules(self):
         code = (
