@@ -9,7 +9,7 @@ verified_commit: 78ac485cf28044051639306d2f59bcff2728adf6
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [pyproject.toml, NEAT.spec, NEAT/package_resources.py, .github/workflows/tests.yml, .github/workflows/distribution.yml, .github/workflows/release.yml, NEAT/app.py, NEAT/ui/main_window.py, tools/windows_distribution.py, tools/clean_briefcase_state.py, tools/windows_msi_smoke.ps1, tools/assistant_openai.py]
+source_paths: [pyproject.toml, NEAT.spec, NEAT/package_resources.py, .github/workflows/tests.yml, .github/workflows/distribution.yml, .github/workflows/release.yml, NEAT/app.py, NEAT/ui/main_window.py, tools/windows_distribution.py, tools/clean_briefcase_state.py, tools/windows_msi_smoke.ps1, tools/windows_msi_context.psm1, tools/assistant_openai.py]
 source_symbols: [UpdateCheckWorker, FitsViewer.start_update_check, FitsViewer._on_update_check_finished, describe_openai_error]
 test_paths: [tests/test_assistant_openai.py, tests/test_package_resources.py, tests/test_release_packaging.py, tests/test_windows_distribution.py]
 ---

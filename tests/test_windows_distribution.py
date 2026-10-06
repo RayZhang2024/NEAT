@@ -68,6 +68,30 @@ class WindowsDistributionTests(unittest.TestCase):
             msg=f"PowerShell failed. stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
         )
 
+    def run_msi_context_script(self, script: str, *, expected_success: bool = True) -> subprocess.CompletedProcess[str]:
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if not powershell:
+            self.skipTest("PowerShell is required for the Windows Installer context tests")
+        environment = os.environ.copy()
+        environment["ISSUE18_CONTEXT_MODULE"] = str(PROJECT_ROOT / "tools/windows_msi_context.psm1")
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if expected_success:
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=f"PowerShell failed. stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+        else:
+            self.assertNotEqual(completed.returncode, 0, msg=completed.stdout)
+        return completed
+
     def test_user_data_test_scope_restores_preexisting_tree_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             local_app_data = Path(directory)
@@ -158,7 +182,84 @@ try {
         self.assertIn("Restore-NeatUserDataTestScope -Scope $userDataScope", smoke)
         self.assertIn('"ALLUSERS=2"', smoke)
         self.assertIn('"MSIINSTALLPERUSER=1"', smoke)
-        self.assertIn("Hive -ne \"HKCU\"", smoke)
+        self.assertIn("Resolve-NeatMsiProductContext", smoke)
+        self.assertIn("Get-NeatMsiProductInstances -ProductCode $identity.ProductCode", smoke)
+        self.assertIn("Requested MSI properties: ALLUSERS=2; MSIINSTALLPERUSER=1", smoke)
+        self.assertIn("ARP registrations (diagnostic only)", smoke)
+        self.assertNotIn("Hive -ne \"HKCU\"", smoke)
+        self.assertNotIn("$registryEntries.Count -ne 1", smoke)
+        self.assertIn("$env:ProgramData", smoke)
+        self.assertIn("$allUsersShortcuts", smoke)
+        self.assertIn("Post-uninstall MSI ProductCode context: not registered", smoke)
+        self.assertIn("ProductCode", (PROJECT_ROOT / "tools/windows_msi_context.psm1").read_text(encoding="utf-8"))
+        self.assertIn("MsiEnumProductsEx", (PROJECT_ROOT / "tools/windows_msi_context.psm1").read_text(encoding="utf-8"))
+        context_module = (PROJECT_ROOT / "tools/windows_msi_context.psm1").read_text(encoding="utf-8")
+        self.assertIn('OpenView("SELECT `Value` FROM `Property`', context_module)
+        self.assertIn('foreach ($property in @("ProductCode", "UpgradeCode"))', context_module)
+
+    def test_start_menu_checks_require_current_user_and_reject_equivalent_all_users(self) -> None:
+        script = r'''
+$ErrorActionPreference = "Stop"
+Import-Module $env:ISSUE18_CONTEXT_MODULE -Force
+$exe = 'C:\Program Files\NEAT\NEAT.exe'
+$user = @([pscustomobject]@{ Target = $exe; Name = 'NEAT'; Path = 'C:\Users\test\Programs\NEAT.lnk' })
+if (-not (Test-NeatInstalledUserShortcut -Shortcuts $user -InstalledExe $exe)) { throw 'Expected per-user link was not accepted.' }
+$wrongUser = @([pscustomobject]@{ Target = 'C:\Other\NEAT.exe'; Name = 'NEAT'; Path = 'C:\Users\test\Programs\NEAT.lnk' })
+if (Test-NeatInstalledUserShortcut -Shortcuts $wrongUser -InstalledExe $exe) { throw 'Wrong target was accepted for per-user link.' }
+$allUsersSameTarget = [pscustomobject]@{ Target = $exe; Name = 'Application'; Path = 'C:\ProgramData\Programs\Application.lnk' }
+if (-not (Test-NeatEquivalentStartMenuShortcut -Shortcut $allUsersSameTarget -InstalledExe $exe)) { throw 'All-users link to installed executable was missed.' }
+$allUsersNamedNeat = [pscustomobject]@{ Target = 'C:\Other\app.exe'; Name = 'NEAT'; Path = 'C:\ProgramData\Programs\NEAT.lnk' }
+if (-not (Test-NeatEquivalentStartMenuShortcut -Shortcut $allUsersNamedNeat -InstalledExe $exe)) { throw 'Named all-users NEAT link was missed.' }
+$unrelated = [pscustomobject]@{ Target = 'C:\Other\app.exe'; Name = 'Another app'; Path = 'C:\ProgramData\Programs\Another app.lnk' }
+if (Test-NeatEquivalentStartMenuShortcut -Shortcut $unrelated -InstalledExe $exe) { throw 'Unrelated all-users link was classified as NEAT.' }
+'''
+        self.run_msi_context_script(script)
+
+    def test_msi_context_accepts_user_unmanaged_product(self) -> None:
+        script = r'''
+$ErrorActionPreference = "Stop"
+Import-Module $env:ISSUE18_CONTEXT_MODULE -Force
+$instance = Resolve-NeatMsiProductContext -ProductCode '{01234567-89AB-CDEF-0123-456789ABCDEF}' -Instances @(
+    [pscustomobject]@{ ProductCode = '{01234567-89AB-CDEF-0123-456789ABCDEF}'; Context = 'USERUNMANAGED'; Sid = 'S-1-5-21-test' }
+)
+if ($instance.Context -ne 'USERUNMANAGED') { throw "Unexpected context: $($instance.Context)" }
+'''
+        self.run_msi_context_script(script)
+
+    def test_msi_context_accepts_user_managed_product(self) -> None:
+        script = r'''
+$ErrorActionPreference = "Stop"
+Import-Module $env:ISSUE18_CONTEXT_MODULE -Force
+$instance = Resolve-NeatMsiProductContext -ProductCode '01234567-89ab-cdef-0123-456789abcdef' -Instances @(
+    [pscustomobject]@{ ProductCode = '{01234567-89AB-CDEF-0123-456789ABCDEF}'; Context = 'USERMANAGED'; Sid = 'S-1-5-21-test' }
+)
+if ($instance.Context -ne 'USERMANAGED') { throw "Unexpected context: $($instance.Context)" }
+'''
+        self.run_msi_context_script(script)
+
+    def test_msi_product_discovery_queries_all_contexts_with_windows_installer_api(self) -> None:
+        script = r'''
+$ErrorActionPreference = "Stop"
+Import-Module $env:ISSUE18_CONTEXT_MODULE -Force
+$instances = @(Get-NeatMsiProductInstances -ProductCode '{01234567-89AB-CDEF-0123-456789ABCDEF}')
+if ($instances.Count -ne 0) { throw "Unexpected test ProductCode registration: $($instances.Count)" }
+'''
+        self.run_msi_context_script(script)
+
+    def test_msi_context_rejects_machine_missing_and_ambiguous_products(self) -> None:
+        cases = [
+            "@([pscustomobject]@{ ProductCode = '{01234567-89AB-CDEF-0123-456789ABCDEF}'; Context = 'MACHINE'; Sid = '' })",
+            "@()",
+            "@([pscustomobject]@{ ProductCode = '{01234567-89AB-CDEF-0123-456789ABCDEF}'; Context = 'USERUNMANAGED'; Sid = 'S-1' }, [pscustomobject]@{ ProductCode = '{01234567-89AB-CDEF-0123-456789ABCDEF}'; Context = 'USERMANAGED'; Sid = 'S-1' })",
+        ]
+        for instances in cases:
+            with self.subTest(instances=instances):
+                script = f'''\
+$ErrorActionPreference = "Stop"
+Import-Module $env:ISSUE18_CONTEXT_MODULE -Force
+Resolve-NeatMsiProductContext -ProductCode '{{01234567-89AB-CDEF-0123-456789ABCDEF}}' -Instances {instances}
+'''
+                self.run_msi_context_script(script, expected_success=False)
 
     def test_manifest_is_sorted_normalized_hashed_and_repeatable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

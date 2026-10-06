@@ -8,6 +8,8 @@ param(
 $ErrorActionPreference = "Stop"
 $safetyModule = Join-Path $PSScriptRoot "windows_user_data_safety.psm1"
 Import-Module -Name $safetyModule -Force -ErrorAction Stop
+$contextModule = Join-Path $PSScriptRoot "windows_msi_context.psm1"
+Import-Module -Name $contextModule -Force -ErrorAction Stop
 $msi = (Resolve-Path -LiteralPath $MsiPath).Path
 $manifest = (Resolve-Path -LiteralPath $ManifestPath).Path
 $logs = [System.IO.Path]::GetFullPath($LogDirectory)
@@ -54,17 +56,29 @@ function Get-NeatUninstallEntries {
     }
 }
 
-function Get-NeatShortcutTargets {
-    $programs = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+function Get-NeatShortcutTargets([string]$ProgramsPath) {
+    $programs = $ProgramsPath
     if (-not (Test-Path $programs)) { return @() }
     $shell = New-Object -ComObject WScript.Shell
     Get-ChildItem -LiteralPath $programs -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue |
-        ForEach-Object { $shell.CreateShortcut($_.FullName).TargetPath }
+        ForEach-Object {
+            $shortcut = $shell.CreateShortcut($_.FullName)
+            [pscustomobject]@{ Path = $_.FullName; Name = $_.BaseName; Target = $shortcut.TargetPath }
+        }
 }
 
-if (Get-NeatUninstallEntries) {
-    throw "A NEAT install is already registered; the MSI lifecycle test requires a clean runner."
+$identity = Get-NeatMsiIdentity -MsiPath $msi
+Write-Output "MSI ProductCode: $($identity.ProductCode)"
+Write-Output "MSI UpgradeCode: $($identity.UpgradeCode)"
+$initialInstances = @(Get-NeatMsiProductInstances -ProductCode $identity.ProductCode)
+if ($initialInstances.Count -ne 0) {
+    $existing = ($initialInstances | ForEach-Object { "$($_.Context):$($_.Sid)" }) -join "; "
+    throw "The MSI ProductCode is already registered before installation: $existing"
 }
+Write-Output "Initial MSI ProductCode context: not registered"
+$initialArpEntries = @(Get-NeatUninstallEntries)
+Write-Output "Initial ARP registrations (diagnostic only): $($initialArpEntries.Count)"
+foreach ($entry in $initialArpEntries) { Write-Output "ARP diagnostic: $($entry.Hive):$($entry.Key)" }
 if (Test-Path $installRoot) {
     throw "The deterministic test install location already exists: $installRoot"
 }
@@ -85,6 +99,7 @@ try {
     $settingsHash = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
     $cacheHash = (Get-FileHash -LiteralPath $cachePath -Algorithm SHA256).Hash
 
+    Write-Output "Requested MSI properties: ALLUSERS=2; MSIINSTALLPERUSER=1; INSTALLFOLDER=$installRoot"
     Invoke-Msi @("/i", $msi, "/qn", "/norestart", "/l*v", $installLog, "ALLUSERS=2", "MSIINSTALLPERUSER=1", "INSTALLFOLDER=$installRoot") "MSI install"
     $installed = $true
     if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
@@ -94,14 +109,28 @@ try {
     python -m tools.windows_distribution verify-installed --payload $installRoot --manifest $manifest
     if ($LASTEXITCODE -ne 0) { throw "Installed payload does not match its manifest." }
 
+    $instances = @(Get-NeatMsiProductInstances -ProductCode $identity.ProductCode)
+    $installedInstance = Resolve-NeatMsiProductContext -ProductCode $identity.ProductCode -Instances $instances
+    Write-Output "Installed MSI context: $($installedInstance.Context); SID=$($installedInstance.Sid)"
     $registryEntries = @(Get-NeatUninstallEntries)
-    if ($registryEntries.Count -ne 1 -or $registryEntries[0].Hive -ne "HKCU") {
-        $registrations = ($registryEntries | ForEach-Object { "$($_.Hive):$($_.Key)" }) -join "; "
-        throw "Expected exactly one per-user NEAT uninstall registration; found $($registryEntries.Count): $registrations"
-    }
-    if (-not ((Get-NeatShortcutTargets) -contains $installedExe)) {
+    Write-Output "Installed ARP registrations (diagnostic only): $($registryEntries.Count)"
+    foreach ($entry in $registryEntries) { Write-Output "ARP diagnostic: $($entry.Hive):$($entry.Key)" }
+
+    $userPrograms = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+    $allUsersPrograms = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs"
+    $userShortcuts = @(Get-NeatShortcutTargets -ProgramsPath $userPrograms)
+    $allUsersShortcuts = @(Get-NeatShortcutTargets -ProgramsPath $allUsersPrograms)
+    if (-not (Test-NeatInstalledUserShortcut -Shortcuts $userShortcuts -InstalledExe $installedExe)) {
         throw "The NEAT Start Menu launcher does not target $installedExe"
     }
+    $equivalentAllUsers = @($allUsersShortcuts | Where-Object {
+        Test-NeatEquivalentStartMenuShortcut -Shortcut $_ -InstalledExe $installedExe
+    })
+    if ($equivalentAllUsers.Count -gt 0) {
+        $paths = ($equivalentAllUsers | ForEach-Object { $_.Path }) -join "; "
+        throw "An equivalent all-users NEAT Start Menu launcher exists: $paths"
+    }
+    Write-Output "Start Menu verification: per-user launcher resolves to installed NEAT.exe; no all-users NEAT launcher."
 
     $previousSmokeResult = $env:NEAT_RELEASE_SMOKE_RESULT
     $env:NEAT_RELEASE_SMOKE_RESULT = $smokeResult
@@ -121,10 +150,24 @@ try {
     Invoke-Msi @("/x", $msi, "/qn", "/norestart", "/l*v", $uninstallLog, "ALLUSERS=2", "MSIINSTALLPERUSER=1") "MSI uninstall"
     $uninstalled = $true
     if (Test-Path -LiteralPath $installedExe) { throw "Uninstall left the application executable behind: $installedExe" }
-    if (Get-NeatShortcutTargets | Where-Object { $_ -eq $installedExe }) {
+    if (Test-NeatInstalledUserShortcut -Shortcuts @(Get-NeatShortcutTargets -ProgramsPath $userPrograms) -InstalledExe $installedExe) {
         throw "Uninstall left the NEAT Start Menu launcher behind."
     }
-    if (Get-NeatUninstallEntries) { throw "Uninstall left the NEAT installed-app registration behind." }
+    $remainingAllUsersShortcuts = @(Get-NeatShortcutTargets -ProgramsPath $allUsersPrograms |
+        Where-Object { Test-NeatEquivalentStartMenuShortcut -Shortcut $_ -InstalledExe $installedExe })
+    if ($remainingAllUsersShortcuts.Count -gt 0) {
+        $paths = ($remainingAllUsersShortcuts | ForEach-Object { $_.Path }) -join "; "
+        throw "An all-users NEAT Start Menu launcher remains after uninstall: $paths"
+    }
+    $remainingInstances = @(Get-NeatMsiProductInstances -ProductCode $identity.ProductCode)
+    if ($remainingInstances.Count -ne 0) {
+        $remaining = ($remainingInstances | ForEach-Object { "$($_.Context):$($_.Sid)" }) -join "; "
+        throw "Uninstall left ProductCode $($identity.ProductCode) registered: $remaining"
+    }
+    Write-Output "Post-uninstall MSI ProductCode context: not registered"
+    $remainingArp = @(Get-NeatUninstallEntries)
+    Write-Output "Post-uninstall ARP registrations (diagnostic only): $($remainingArp.Count)"
+    foreach ($entry in $remainingArp) { Write-Output "ARP diagnostic: $($entry.Hive):$($entry.Key)" }
     if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf) -or
         (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash -ne $settingsHash) {
         throw "Uninstall removed or changed the per-user assistant settings sentinel."
