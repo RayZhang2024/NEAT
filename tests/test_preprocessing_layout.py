@@ -13,6 +13,7 @@ from NEAT.services import preprocessing_layout
 from NEAT.services.preprocessing_layout import (
     classify_standalone_summation,
     discover_classic_batch,
+    discover_full_process_summation,
     immediate_child_directories,
 )
 
@@ -156,15 +157,53 @@ class PreprocessingLayoutTests(unittest.TestCase):
         )
         self.assertLess(batch_init_source.index("output_folder"), batch_init_source.index("bad_samples"))
 
-    def test_full_process_uses_only_immediate_children_and_keeps_empty_result(self):
-        self.assertEqual(immediate_child_directories(str(self.root)), [])
-        child, = self.make_dirs("one-child/grandchild")
-        self.assertEqual(immediate_child_directories(str(self.root)), [str(self.root / "one-child")])
-        self.assertEqual(len(immediate_child_directories(str(self.root))), 1)
-        self.assertEqual(immediate_child_directories(str(self.root / "one-child")), [child])
-        self.make_dirs("second-empty-child")
-        children = immediate_child_directories(str(self.root))
-        self.assertEqual(len(children), 2)
+    def test_full_process_zero_children_skips_summation(self):
+        discovery = discover_full_process_summation(str(self.root))
+        self.assertEqual(discovery.folders, [])
+        self.assertFalse(discovery.should_sum)
+
+    def test_full_process_exactly_one_child_still_requires_summation(self):
+        child, = self.make_dirs("one-child")
+        discovery = discover_full_process_summation(str(self.root))
+        self.assertEqual(discovery.folders, [child])
+        self.assertTrue(discovery.should_sum)
+        self.assertEqual(len(discovery.folders), 1)
+
+    def test_full_process_two_or_more_children_require_summation(self):
+        children = self.make_dirs("first", "second", "third")
+        discovery = discover_full_process_summation(str(self.root))
+        self.assertCountEqual(discovery.folders, children)
+        self.assertTrue(discovery.should_sum)
+
+    def test_full_process_empty_and_unrelated_children_still_require_summation(self):
+        empty, unrelated = self.make_dirs("empty", "unrelated")
+        (Path(unrelated) / "notes.txt").write_text("not inspected", encoding="utf-8")
+        discovery = discover_full_process_summation(str(self.root))
+        self.assertCountEqual(discovery.folders, [empty, unrelated])
+        self.assertTrue(discovery.should_sum)
+
+    def test_full_process_does_not_promote_grandchildren(self):
+        grandchild, = self.make_dirs("one-child/grandchild")
+        discovery = discover_full_process_summation(str(self.root))
+        self.assertEqual(discovery.folders, [str(self.root / "one-child")])
+        self.assertNotIn(grandchild, discovery.folders)
+        self.assertTrue(discovery.should_sum)
+
+    def test_full_process_preserves_filesystem_order_without_sorting(self):
+        alpha, zeta = self.make_dirs("alpha", "zeta")
+        original_listdir = os.listdir
+
+        def ordered_listdir(path):
+            if os.fspath(path) == str(self.root):
+                return ["zeta", "alpha"]
+            return original_listdir(path)
+
+        with patch.object(preprocessing_layout.os, "listdir", side_effect=ordered_listdir):
+            discovery = discover_full_process_summation(str(self.root))
+        self.assertEqual(discovery.folders, [zeta, alpha])
+        self.assertTrue(discovery.should_sum)
+
+    def test_full_process_worker_uses_its_explicit_layout_decision(self):
         worker_source = (REPOSITORY_ROOT / "NEAT/workers/preprocessing.py").read_text(
             encoding="utf-8"
         )
@@ -175,8 +214,8 @@ class PreprocessingLayoutTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
         }
         maybe_sum = ast.unparse(methods["maybe_do_summation"])
-        self.assertIn("immediate_child_directories", maybe_sum)
-        self.assertIn("if not subfolders", maybe_sum)
+        self.assertIn("discover_full_process_summation", maybe_sum)
+        self.assertIn("discovery.should_sum", maybe_sum)
         self.assertIn("for sf in subfolders", maybe_sum)
         self.assertIn("SummationWorker", maybe_sum)
 

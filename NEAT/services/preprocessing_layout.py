@@ -23,6 +23,13 @@ class StandaloneSummationLayout(NamedTuple):
     run_folders_by_sample: dict[str, list[str]]
 
 
+class FullProcessSummationDiscovery(NamedTuple):
+    """Immediate Full Process runs and whether their presence triggers summation."""
+
+    folders: list[str]
+    should_sum: bool
+
+
 def immediate_child_directories(folder: str) -> list[str]:
     """Return immediate child directories in the order supplied by os.listdir."""
     return [
@@ -30,6 +37,12 @@ def immediate_child_directories(folder: str) -> list[str]:
         for name in os.listdir(folder)
         if os.path.isdir(os.path.join(folder, name))
     ]
+
+
+def discover_full_process_summation(folder: str) -> FullProcessSummationDiscovery:
+    """Discover Full Process runs; any immediate child means summation is attempted."""
+    folders = immediate_child_directories(folder)
+    return FullProcessSummationDiscovery(folders, bool(folders))
 
 
 def discover_classic_batch(folder: str) -> ClassicBatchDiscovery:
