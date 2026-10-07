@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer]
 neat_version: 4.8.0
-verified_commit: 2bd2c3a7fbe2de5eaa3aff55a06d1129f11de18f
+verified_commit: 20b6bfa97589a9964988efffe634ccd17ecfa86b
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/preprocessing_inputs.py, NEAT/domain/__init__.py, NEAT/services/preprocessing_summation.py, NEAT/services/preprocessing_clean.py, NEAT/services/preprocessing_filtering.py, NEAT/services/preprocessing_overlap.py, NEAT/services/preprocessing_normalisation.py, NEAT/services/preprocessing_normalisation_kernel.py, NEAT/services/preprocessing_normalisation_raden.py, NEAT/workers/preprocessing.py]
-source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult, LoadedImageRun, sum_loaded_image_runs, SummationWorker, clean_loaded_image_runs, OutlierFilteringWorker, filter_loaded_image_runs, FilteringWorker, correct_loaded_image_run, OverlapCorrectionWorker, normalise_loaded_image_runs, NormalisationWorker, normalise_raden_tiff_stack, normalise_local_open_beam_frame, RadenNormalisationWorker]
-test_paths: [tests/test_preprocessing_domain.py, tests/test_preprocessing_inputs.py, tests/test_preprocessing_summation.py, tests/test_preprocessing_clean.py, tests/test_preprocessing_filtering.py, tests/test_preprocessing_overlap.py, tests/test_preprocessing_normalisation.py, tests/test_preprocessing_normalisation_raden.py, tests/test_preprocessing_workers.py]
+source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/preprocessing_inputs.py, NEAT/domain/__init__.py, NEAT/services/preprocessing_summation.py, NEAT/services/preprocessing_clean.py, NEAT/services/preprocessing_filtering.py, NEAT/services/preprocessing_overlap.py, NEAT/services/preprocessing_normalisation.py, NEAT/services/preprocessing_normalisation_kernel.py, NEAT/services/preprocessing_normalisation_raden.py, NEAT/services/preprocessing_full_process.py, NEAT/workers/preprocessing.py]
+source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult, LoadedImageRun, sum_loaded_image_runs, SummationWorker, clean_loaded_image_runs, OutlierFilteringWorker, filter_loaded_image_runs, FilteringWorker, correct_loaded_image_run, OverlapCorrectionWorker, normalise_loaded_image_runs, NormalisationWorker, normalise_raden_tiff_stack, normalise_local_open_beam_frame, RadenNormalisationWorker, FullProcessPipeline, FullProcessPipelineResult, FullProcessStageResult, FullProcessWorker]
+test_paths: [tests/test_preprocessing_domain.py, tests/test_preprocessing_inputs.py, tests/test_preprocessing_summation.py, tests/test_preprocessing_clean.py, tests/test_preprocessing_filtering.py, tests/test_preprocessing_overlap.py, tests/test_preprocessing_normalisation.py, tests/test_preprocessing_normalisation_raden.py, tests/test_preprocessing_full_process.py, tests/test_preprocessing_workers.py]
 ---
 
 # Preprocessing input and result contracts
@@ -33,13 +33,20 @@ cancellation tokens, metadata bags, or scientific payload fields.
 The headless Summation, Clean, Filtering, Overlap Correction and classic
 Normalisation services consume `LoadedImageRun` inputs and return
 `PreprocessingOperationResult`. Their Qt worker adapters convert existing
-dictionaries at the worker boundary. RADEN normalisation also returns
-`PreprocessingOperationResult`, but consumes resolved RADEN stack-info
-mappings through its own service boundary rather than `LoadedImageRun`.
+dictionaries at the worker boundary. Full Process now has a separate headless
+orchestration service: its loader creates `LoadedImageRun` values, the
+existing operation services perform each stage, and a Full Process-specific
+result records stage status and aggregates operation outputs. RADEN
+normalisation also returns `PreprocessingOperationResult`, but consumes
+resolved RADEN stack-info mappings through its own service boundary rather
+than `LoadedImageRun`.
 Summation was the first adopter, Clean the second (#29), Filtering the third
 (#31), Overlap Correction the fourth (#33), classic Normalisation the fifth
-(#35), and RADEN normalisation the sixth (#37). Other preprocessing
-workers/loaders retain their existing contracts until separately migrated.
+(#35), and RADEN normalisation the sixth (#37). Issue #39 adds a Full Process
+loader and composes those services through `FullProcessPipeline`; it does not
+change the individual operations' input or result contracts. Other
+preprocessing workers/loaders retain their existing contracts until
+separately migrated.
 
 ## Public types
 
@@ -172,18 +179,24 @@ continues to resolve missing stack info through `get_raden_tiff_stack_info`,
 then passes those resolved mappings to the headless RADEN service. It does not
 use `LoadedImageRun` or change RADEN metadata discovery.
 
-Existing loaders and other workers continue to use
-their current dictionaries. Loader-specific suffix parsing, duplicate handling
-and ordering remain unchanged. Spectra, shutter counts, masks, RADEN metadata
-and operation configuration remain operation-specific; cancellation and
-progress are passed to these services as plain callbacks rather than being
-added to the common input model.
+Other existing loaders and workers continue to use their current dictionaries.
+Loader-specific suffix parsing, duplicate handling and ordering remain
+unchanged. Spectra, shutter counts, masks, RADEN metadata and operation
+configuration remain operation-specific; cancellation and progress are passed
+as plain callbacks rather than being added to the common input model.
 
 ## Adoption boundary
 
 The five classic operation services use `LoadedImageRun` and
 `PreprocessingOperationResult`; RADEN normalisation uses resolved RADEN
-stack-info mappings and `PreprocessingOperationResult`. `SummationWorker`,
+stack-info mappings and `PreprocessingOperationResult`. Full Process is the
+first orchestration pipeline to adopt loaded-run inputs end-to-end: its
+headless loader returns `LoadedImageRun`, its stages call the existing
+operation services, and `FullProcessPipelineResult` retains ordered stage
+records and aggregates their operation outputs/errors/warnings. Its
+`FullProcessWorker` is a compatibility adapter for existing Qt signals and
+the UI. It runs as one QThread and no longer creates preprocessing child
+workers or nested event loops. `SummationWorker`,
 `OutlierFilteringWorker`, `FilteringWorker`, `OverlapCorrectionWorker`,
 `NormalisationWorker` and `RadenNormalisationWorker` adapt their existing
 worker-facing inputs, delegate to headless services, and retain structured
@@ -210,6 +223,8 @@ are fatal, and the worker preserves its per-page cancellation and final-GC
 behavior.
 
 Filtering's two progress streams and early duplicate `finished` signals remain
-legacy adapter behavior, not a general result-contract rule. Remaining
-preprocessing workers and loaders are unmigrated; their future migrations are
-separate Epic #21 work and must define each operation's logical work unit.
+legacy adapter behavior, not a general result-contract rule. Apart from the
+Full Process loader/pipeline, other preprocessing loaders and orchestration
+remain unmigrated; their future migrations are later Epic #21 work and must
+define each operation's logical work unit. Full Process does not change
+scientific equations or promote its pipeline result to scientific review.

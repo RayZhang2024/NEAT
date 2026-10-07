@@ -5,20 +5,23 @@ doc_type: technical_reference
 functional_area: preprocessing
 audience: [user, scientist, developer]
 neat_version: 4.8.0
-verified_commit: 628c767ef44186e4301454f24a54fbc05ad71233
+verified_commit: 20b6bfa97589a9964988efffe634ccd17ecfa86b
 status: code-verified
 instrument_applicability: [classic image folders]
 scientific_review: pending
-source_paths: [NEAT/ui/mixins/preprocessing.py, NEAT/workers/preprocessing.py]
-source_symbols: [PreprocessingMixin.run_full_process, FullProcessWorker]
-test_paths: [tests/test_preprocessing_tiff.py]
+source_paths: [NEAT/ui/mixins/preprocessing.py, NEAT/workers/preprocessing.py, NEAT/services/preprocessing_full_process.py, NEAT/services/image_io.py]
+source_symbols: [PreprocessingMixin.run_full_process, FullProcessWorker, FullProcessPipeline, load_full_process_run, run_full_process]
+test_paths: [tests/test_preprocessing_full_process.py, tests/test_preprocessing_tiff.py, tests/test_preprocessing_layout.py, tests/test_image_io_orientation.py]
 ---
 
 # Full Process preprocessing pipeline
 
 ## Scope
 
-Full Process chains existing classic-folder workers. It is not the RADEN
+Full Process orchestrates the existing classic-folder preprocessing services.
+`FullProcessWorker` is a single Qt-thread/signal adapter around the headless
+`FullProcessPipeline`; the pipeline does not import Qt, UI, or worker modules,
+create threads/event loops, or require a `QApplication`. It is not the RADEN
 multi-page TIFF workflow and does not include Filtering.
 
 ## UI inputs
@@ -45,16 +48,23 @@ sample:    optional Sum -> Clean -> required Overlap --\
 open beam: optional Sum -> Clean -> required Overlap --/
 ```
 
-1. **Summation:** performed separately if the selected root contains any
-   immediate child folders; otherwise skipped.
-2. **Clean:** always attempted for sample and open beam.
-3. **Overlap:** required for both. Missing images, spectra, shutter counts or
-   incomplete correction aborts Full Process.
-4. **Normalisation:** applies the selected `n` and `m`.
+The exact stage order is sample Summation, open-beam Summation, sample Clean,
+open-beam Clean, sample Overlap, open-beam Overlap, then Normalisation. Each
+Summation is skipped only when its selected root has no immediate child
+directories. One child still invokes Summation. Clean always runs for sample
+and open beam; Overlap is required for both; then classic Normalisation uses
+the selected `n` and `m`.
 
-Full Process accepts FITS/TIFF names whose final underscore-delimited component
-is a nonempty frame suffix. The suffix no longer has to contain five digits.
-Duplicate suffixes and unreadable frames are recorded as load failures.
+The headless Full Process loader uses raw `os.listdir()` order and selects
+case-insensitive `.fits`, `.fit`, `.tiff`, and `.tif` files. It excludes `.fts`
+even though the generic image reader continues to support that extension. The
+final underscore-delimited filename component is stripped and used as a
+nonempty frame suffix; it need not be numeric. Duplicate suffixes and
+unreadable frames are recorded as load failures. Loaded arrays are converted
+to `float32`; the shared generic reader preserves the existing FITS/TIFF
+vertical-orientation behavior, tries imageio before Pillow for TIFF, and does
+not coerce dtype itself. Loading is deliberately not cancellable: once a
+loader starts, it processes all eligible files.
 
 ## Output layout
 
@@ -71,30 +81,73 @@ As names include the previous stage's folder name, repeated prefixes can
 accumulate. The final frames are named `normalised_<suffix>.fits`; the overall
 base-name field does not control them.
 
-Summation alone is skipped when an input root has no immediate run subfolders.
-Processing then begins with Clean on that root.
+Directories are created with `exist_ok=True` and are not cleared. Stale
+eligible images may therefore be loaded by later stages, but stale files are
+not included in the current result unless an operation service reports them.
+Accumulated prefixes such as `0_summed_`, `1_cleaned_0_summed_`, and
+`2_corrected_1_cleaned_0_summed_` are intentional. The overall base name
+remains unused.
+
+The pipeline result is immutable and Full Process-specific. It contains the
+overall `PreprocessingStatus`, ordered stage records, the failed/cancelled
+stage, operation-produced outputs in chronological order, and stage-attributed
+errors/warnings. Each stage record contains its identity, sample/open-beam
+branch, `SKIPPED`/`SUCCEEDED`/`FAILED`/`CANCELLED` outcome, input/artifact/
+propagation folders, and the operation result when a service started. Folder
+paths are not represented as `ProducedOutput`; output aggregation never scans
+the reused stage directories and preserves duplicate paths reported by a
+service.
+
+Skipped Summation has no artifact folder and propagates its input. A setup
+failure before a stage directory is created has no artifact folder; a failure
+after creation records the directory. On success, artifact and propagation
+folders are normally equal. If an operation succeeds after Stop was pressed
+during setup/loading, its artifact folder is retained but the helper's
+propagation folder falls back to the original input; the next boundary stops
+before that fallback is consumed.
 
 ## Threading, progress and stop behavior
 
-Full Process is itself a worker thread. Each stage creates another worker and
-waits through a nested Qt event loop. Stage progress is forwarded directly and
-reset to zero between stages; it is not a single monotonic whole-pipeline
-percentage.
+`FullProcessWorker` owns one QThread. It does not create preprocessing child
+workers or use nested `QEventLoop`s. Operation services receive plain progress,
+message, and cancellation callbacks. Service progress is forwarded directly;
+the worker emits a zero reset after each accepted stage boundary. Progress is
+not transformed into a global monotonic percentage. Load progress remains an
+independent per-loader stream.
 
-The parent stop flag is checked between stages and is forwarded to the active
-child worker. Cancellation remains cooperative, so the child stops at its next
-safe check rather than being forcibly terminated.
+Cancellation has separate parent-boundary and active-operation states. Stop
+always clears the parent-running flag. If an operation is active, Stop also
+sets that operation's fresh cancellation token and emits the legacy child Stop
+diagnostic before the Full Process Stop message (Clean has no child Stop
+diagnostic). If Stop occurs during discovery/loading/setup before a service
+starts, setup and the loader continue; a service reached afterward receives a
+fresh, non-cancelled token and may complete. The next parent boundary then
+stops the pipeline. No forceful thread termination is used. Pre-stopped runs
+still reach the first historical stage boundary and report its stop message.
 
 ## Known implementation risks
 
-- One child folder triggers summation even though standalone Summation requires
-  at least two.
+- One child folder triggers Full Process Summation even though standalone
+  Summation requires at least two.
 - Partial output from a prior run is not cleared before `exist_ok=True` folders
-  are reused.
-- Worker success is an in-memory flag, not a persistent manifest of expected
-  and produced files.
-- Tests cover relaxed suffix loading, required-overlap sidecars and forwarding
-  Stop to the active child. The complete end-to-end sequence remains untested.
+  are reused; stale eligible files may affect later loaders.
+- Worker success remains an in-memory result, not a persistent manifest of
+  expected and produced files.
+- The workflow has exact-array regression evidence, but its overlap-correction
+  scientific assumptions remain pending domain review.
+
+## Regression evidence
+
+The current-main no-Summation and one-child paths were characterized against
+Issue #39 baseline `f583a5a12110132decf4b2989fdd79e8e2920c4b` (recorded in
+the regression tests). The full Summation → Clean → Overlap → Normalisation
+fixture was run with the original worker at Epic baseline
+`37a952a926f86244596bf9fdae73d3d147289205`, then compared against the extracted
+pipeline. It uses two immediate runs per branch, four matching 512×512 frames,
+two ToF segments, and valid Spectra/ShutterCount files. Selected persisted
+image arrays match exactly by SHA-256, including summed, cleaned, overlap-
+corrected, and all four final normalised frames. This is implementation
+equivalence evidence, not scientific validation.
 
 ## Required review before use as assistant guidance
 
