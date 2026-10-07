@@ -121,12 +121,13 @@ class TestFullProcessLoader(FullProcessFixture):
         self.assertEqual(list(run.frames), ["nonnumeric", "00001", "dup"])
         self.assertTrue(all(array.dtype == np.float32 for array in run.frames.values()))
         self.assertEqual(progress, [16, 33, 50, 66, 83, 100])
+        short_sample_path = os.path.join("input", "sample_data")
         self.assertEqual(
             run.load_errors,
             (
                 "File 'empty_.tiff' has an empty frame suffix.",
                 "File 'second_dup.tif' duplicates frame suffix 'dup'. Frame names must be unique.",
-                "Error loading file broken_bad.tif in \\input\\sample_data: bad image",
+                f"Error loading file broken_bad.tif in \\{short_sample_path}: bad image",
             ),
         )
         self.assertEqual(messages, list(run.load_errors))
@@ -165,7 +166,11 @@ class TestFullProcessLoader(FullProcessFixture):
                 progress_callback=progress.append,
                 message_callback=messages.append,
             )
-        self.assertEqual(run.load_errors, ("Error reading folder \\input\\sample_data: denied",))
+        short_sample_path = os.path.join("input", "sample_data")
+        self.assertEqual(
+            run.load_errors,
+            (f"Error reading folder \\{short_sample_path}: denied",),
+        )
         self.assertEqual(messages, list(run.load_errors))
         self.assertEqual(progress, [])
 
@@ -213,6 +218,10 @@ class TestFullProcessPipeline(FullProcessFixture):
             **self._pipeline_callbacks,
         )
         return result, messages, progress, load_progress
+
+    def run_pipeline_with_patch(self, target, **patch_kwargs):
+        with patch.object(full_process, target, **patch_kwargs):
+            return self.run_pipeline()
 
     _pipeline_callbacks = {}
 
@@ -291,8 +300,9 @@ class TestFullProcessPipeline(FullProcessFixture):
         self.assertEqual(worker.result.status, PreprocessingStatus.SUCCEEDED)
         self.assertEqual(finished, [True])
         self.assertEqual(sleep_calls, [5])
+        short_sample_path = os.path.join("input", "sample_data")
         self.assertIn(
-            "0_sumation_Sample: No subfolders found in '\\input\\sample_data'. Skipping Summation.",
+            f"0_sumation_Sample: No subfolders found in '\\{short_sample_path}'. Skipping Summation.",
             messages,
         )
         self.assertEqual(
@@ -345,6 +355,9 @@ class TestFullProcessPipeline(FullProcessFixture):
         self.assertEqual(result.failed_stage, full_process.FullProcessStage.SAMPLE_OVERLAP)
         self.assertNotIn("normalisation", [stage.stage.value for stage in result.stages])
         self.assertTrue(messages[-1].startswith("[ERROR] 2_correction_Sample:"))
+        self.assertFalse(
+            any("Error in OverlapCorrectionWorker:" in message for message in messages)
+        )
 
     def test_clean_setup_failure_has_no_artifact_folder(self):
         self.sample.mkdir(parents=True)
@@ -356,6 +369,7 @@ class TestFullProcessPipeline(FullProcessFixture):
         self.assertIsNone(stage.operation_result)
         self.assertIsNone(stage.artifact_folder)
         self.assertFalse((self.output / "1_cleaned_sample_data").exists())
+        self.assertFalse(any(message.startswith("[FATAL]") for message in _messages))
         self.assertFalse(any(message.startswith("<b>Final memory usage:</b>") for message in _messages))
 
     def test_all_empty_summation_children_fail_after_reusing_created_folder(self):
@@ -363,7 +377,7 @@ class TestFullProcessPipeline(FullProcessFixture):
         (self.sample / "empty-one").mkdir()
         (self.sample / "unrelated-empty").mkdir()
         self.beam.mkdir(parents=True)
-        result, _messages, _progress, _load = self.run_pipeline()
+        result, messages, _progress, _load = self.run_pipeline()
         self.assertEqual(result.status, PreprocessingStatus.FAILED)
         self.assertEqual(result.failed_stage, full_process.FullProcessStage.SAMPLE_SUMMATION)
         stage = result.stages[0]
@@ -371,6 +385,7 @@ class TestFullProcessPipeline(FullProcessFixture):
         self.assertIsNone(stage.operation_result)
         self.assertEqual(stage.artifact_folder, str(self.output / "0_summed_sample_data"))
         self.assertTrue(Path(stage.artifact_folder).is_dir())
+        self.assertFalse(any(message.startswith("[FATAL] Summation aborted:") for message in messages))
 
     def test_summation_passes_loaded_frames_with_errors_to_service(self):
         child = self.sample / "run-one"
@@ -457,9 +472,206 @@ class TestFullProcessPipeline(FullProcessFixture):
         self.assertEqual(result.outputs, (partial,))
         self.assertEqual(
             result.errors,
-            (full_process.FullProcessDiagnostic(full_process.FullProcessStage.SAMPLE_SUMMATION, "synthetic operation failure"),),
+            (
+                full_process.FullProcessDiagnostic(
+                    full_process.FullProcessStage.SAMPLE_SUMMATION,
+                    "synthetic operation failure",
+                ),
+                full_process.FullProcessDiagnostic(
+                    full_process.FullProcessStage.SAMPLE_SUMMATION,
+                    "0_summation_Sample failed.",
+                ),
+            ),
         )
         self.assertTrue(messages[-1].startswith("[ERROR] 0_summation_Sample failed."))
+
+    def test_unexpected_summation_exception_preserves_child_and_parent_diagnostics(self):
+        self.make_input(child_count=1)
+        result, messages, _progress, _load_progress = self.run_pipeline_with_patch(
+            "sum_loaded_image_runs", side_effect=RuntimeError("boom")
+        )
+        stage = full_process.FullProcessStage.SAMPLE_SUMMATION
+        self.assertEqual(result.status, PreprocessingStatus.FAILED)
+        self.assertEqual(result.failed_stage, stage)
+        self.assertEqual(
+            messages[-2:],
+            ["[FATAL] Summation aborted: boom", "[ERROR] 0_summation_Sample failed."],
+        )
+        self.assertEqual(
+            result.errors,
+            (
+                full_process.FullProcessDiagnostic(stage, "boom"),
+                full_process.FullProcessDiagnostic(stage, "0_summation_Sample failed."),
+            ),
+        )
+        self.assertNotIn("[FATAL] Summation aborted: boom", [e.message for e in result.errors])
+
+    def test_unexpected_summation_exception_with_parent_stop_is_cancelled(self):
+        self.make_input(child_count=1)
+        worker = self.worker()
+        messages = []
+        worker.message.connect(messages.append)
+
+        def stop_then_raise(*_args, **_kwargs):
+            worker.stop()
+            raise RuntimeError("boom")
+
+        with patch.object(
+            full_process, "sum_loaded_image_runs", side_effect=stop_then_raise
+        ):
+            worker.run()
+        stage = full_process.FullProcessStage.SAMPLE_SUMMATION
+        self.assertEqual(worker.result.status, PreprocessingStatus.CANCELLED)
+        self.assertEqual(worker.result.cancelled_stage, stage)
+        self.assertEqual(
+            worker.result.errors,
+            (
+                full_process.FullProcessDiagnostic(stage, "boom"),
+                full_process.FullProcessDiagnostic(stage, "0_summation_Sample failed."),
+            ),
+        )
+        self.assertEqual(
+            messages[-2:],
+            ["[FATAL] Summation aborted: boom", "[ERROR] 0_summation_Sample failed."],
+        )
+
+    def test_unexpected_clean_exception_uses_parent_wrapper_without_child_fatal(self):
+        self.make_input()
+        result, messages, _progress, _load_progress = self.run_pipeline_with_patch(
+            "clean_loaded_image_runs", side_effect=RuntimeError("boom")
+        )
+        stage = full_process.FullProcessStage.SAMPLE_CLEAN
+        self.assertEqual(result.status, PreprocessingStatus.FAILED)
+        self.assertEqual(result.failed_stage, stage)
+        self.assertEqual(messages[-1], "[ERROR] 1_clean_Sample failed or skipped frames.")
+        self.assertFalse(any(message.startswith("[FATAL]") for message in messages))
+        self.assertEqual(
+            result.errors,
+            (
+                full_process.FullProcessDiagnostic(stage, "boom"),
+                full_process.FullProcessDiagnostic(stage, "1_clean_Sample failed or skipped frames."),
+            ),
+        )
+
+    def test_unexpected_overlap_exception_preserves_child_before_parent_wrapper(self):
+        self.make_input()
+        result, messages, _progress, _load_progress = self.run_pipeline_with_patch(
+            "correct_loaded_image_run", side_effect=RuntimeError("boom")
+        )
+        stage = full_process.FullProcessStage.SAMPLE_OVERLAP
+        child = "Error in OverlapCorrectionWorker: boom"
+        parent = "[ERROR] 2_correction_Sample failed."
+        self.assertEqual(result.status, PreprocessingStatus.FAILED)
+        self.assertEqual(result.failed_stage, stage)
+        self.assertEqual(messages[-3:], [child, "Overlap Correction did not complete successfully.", parent])
+        self.assertEqual(
+            result.errors,
+            (
+                full_process.FullProcessDiagnostic(stage, "boom"),
+                full_process.FullProcessDiagnostic(stage, "2_correction_Sample failed."),
+            ),
+        )
+        self.assertNotIn(child, [error.message for error in result.errors])
+
+    def test_unexpected_normalisation_exception_preserves_child_and_parent_diagnostics(self):
+        self.make_input()
+        result, messages, _progress, _load_progress = self.run_pipeline_with_patch(
+            "normalise_loaded_image_runs", side_effect=RuntimeError("boom")
+        )
+        stage = full_process.FullProcessStage.NORMALISATION
+        self.assertEqual(result.status, PreprocessingStatus.FAILED)
+        self.assertEqual(result.failed_stage, stage)
+        self.assertEqual(
+            messages[-2:],
+            [
+                "Fatal error in normalisation: boom",
+                "[ERROR] 3_normalisation failed or skipped one or more frames.",
+            ],
+        )
+        self.assertEqual(
+            result.errors,
+            (
+                full_process.FullProcessDiagnostic(stage, "boom"),
+                full_process.FullProcessDiagnostic(
+                    stage, "3_normalisation failed or skipped one or more frames."
+                ),
+            ),
+        )
+        self.assertNotIn(
+            "Fatal error in normalisation: boom", [error.message for error in result.errors]
+        )
+
+    def test_unexpected_pipeline_exception_without_builder_is_structured(self):
+        pipeline = full_process.FullProcessPipeline(
+            str(self.sample), str(self.beam), str(self.output), "unused", 0, 0
+        )
+        with patch.object(
+            pipeline, "maybe_do_summation", side_effect=RuntimeError("before stage")
+        ):
+            result = pipeline.run()
+        self.assertEqual(result.status, PreprocessingStatus.FAILED)
+        self.assertEqual(
+            result.errors,
+            (full_process.FullProcessDiagnostic(None, "before stage"),),
+        )
+
+    def test_normalisation_callback_failure_keeps_operation_result_and_worker_state(self):
+        self.make_input()
+        worker = self.worker()
+        finished = []
+        messages = []
+        collections = []
+        worker.finished.connect(lambda: finished.append(True))
+        worker.message.connect(messages.append)
+        produced = ProducedOutput(
+            str(self.output / "normalised_00000.fits"), "normalised_image"
+        )
+        operation_result = PreprocessingOperationResult(
+            PreprocessingStatus.SUCCEEDED,
+            1,
+            outputs=(produced,),
+            expected_count=1,
+        )
+
+        def fail_memory_report():
+            raise RuntimeError("memory reporting failed")
+
+        worker._normalisation_finished = fail_memory_report
+        with (
+            patch.object(
+                full_process,
+                "normalise_loaded_image_runs",
+                return_value=operation_result,
+            ),
+            patch(
+                "NEAT.workers.preprocessing.gc.collect",
+                side_effect=lambda: collections.append(True),
+            ),
+            patch.object(QThread, "sleep", staticmethod(lambda _seconds: None)),
+        ):
+            worker.run()
+        self.assertIsNotNone(worker.result)
+        self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
+        self.assertFalse(worker.succeeded)
+        self.assertEqual(finished, [True])
+        self.assertGreaterEqual(len(collections), 1)
+        normalisation = worker.result.stages[-1]
+        self.assertIs(normalisation.operation_result, operation_result)
+        self.assertEqual(worker.result.outputs[-1], produced)
+        stage = full_process.FullProcessStage.NORMALISATION
+        self.assertEqual(
+            worker.result.errors[-2:],
+            (
+                full_process.FullProcessDiagnostic(stage, "memory reporting failed"),
+                full_process.FullProcessDiagnostic(
+                    stage, "3_normalisation failed or skipped one or more frames."
+                ),
+            ),
+        )
+        self.assertEqual(
+            messages[-1],
+            "[ERROR] 3_normalisation failed or skipped one or more frames.",
+        )
 
     def test_first_malformed_overlap_sidecar_does_not_fall_through(self):
         self.make_input()

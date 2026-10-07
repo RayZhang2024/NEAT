@@ -84,6 +84,13 @@ class _StageAbort(RuntimeError):
         self.stage = stage
 
 
+class _StageOperationFailure(RuntimeError):
+    def __init__(self, error: Exception, wrapper_message: str):
+        super().__init__(str(error))
+        self.error = error
+        self.wrapper_message = wrapper_message
+
+
 @dataclass(slots=True)
 class _StageBuilder:
     stage: FullProcessStage
@@ -250,6 +257,9 @@ class FullProcessPipeline:
             self._message("=== <b>Full Process Completed Successfully</b> ===")
         except _StageAbort:
             return self.result()
+        except _StageOperationFailure as exc:
+            self._fail_current(exc.error, exc.wrapper_message)
+            self._message(f"[ERROR] {exc.wrapper_message}")
         except Exception as exc:
             self._fail_current(exc)
             self._message(f"[ERROR] {exc}")
@@ -328,7 +338,9 @@ class FullProcessPipeline:
             )
         except Exception as exc:
             self._message(f"[FATAL] Summation aborted: {exc}")
-            raise
+            raise _StageOperationFailure(
+                exc, f"0_summation_{label} failed."
+            ) from exc
         finally:
             self._finish_operation(stage, token)
             self._stage_completed()
@@ -392,8 +404,9 @@ class FullProcessPipeline:
                 cancellation_check=token.is_set,
             )
         except Exception as exc:
-            self._message(f"[FATAL] {exc}")
-            raise
+            raise _StageOperationFailure(
+                exc, f"1_clean_{label} failed or skipped frames."
+            ) from exc
         finally:
             self._finish_operation(stage, token)
             self._stage_completed()
@@ -495,7 +508,9 @@ class FullProcessPipeline:
         except Exception as exc:
             self._message(f"Error in OverlapCorrectionWorker: {exc}")
             self._message("Overlap Correction did not complete successfully.")
-            raise
+            raise _StageOperationFailure(
+                exc, f"2_correction_{label} failed."
+            ) from exc
         finally:
             self._finish_operation(stage, token)
             self._stage_completed()
@@ -581,9 +596,16 @@ class FullProcessPipeline:
             if operation_error is None:
                 operation_error = exc
         if operation_error is not None:
-            raise operation_error
+            raise _StageOperationFailure(
+                operation_error,
+                "3_normalisation failed or skipped one or more frames.",
+            ) from operation_error
         if operation_result is None:
-            raise RuntimeError("Normalisation service returned no operation result.")
+            error = RuntimeError("Normalisation service returned no operation result.")
+            raise _StageOperationFailure(
+                error,
+                "3_normalisation failed or skipped one or more frames.",
+            ) from error
         if operation_result.status is not PreprocessingStatus.SUCCEEDED:
             builder.outcome = self._operation_outcome(operation_result)
             builder.propagation_folder = None
@@ -650,10 +672,20 @@ class FullProcessPipeline:
             )
         self._current = None
 
-    def _fail_current(self, exc: Exception) -> None:
+    def _fail_current(
+        self, exc: Exception, wrapper_message: str | None = None
+    ) -> None:
         builder = self._current
         if builder is None or builder.recorded:
             self._overall_status = PreprocessingStatus.FAILED
+            stage = builder.stage if builder is not None else None
+            self._errors.append(FullProcessDiagnostic(stage, str(exc)))
+            if wrapper_message is not None:
+                self._errors.append(FullProcessDiagnostic(stage, wrapper_message))
+            if stage is not None:
+                self._failed_stage = stage
+                if not self._parent_running():
+                    self._cancelled_stage = stage
             return
         builder.outcome = FullProcessStageOutcome.FAILED
         builder.propagation_folder = None
@@ -661,9 +693,10 @@ class FullProcessPipeline:
         self._failed_stage = builder.stage
         if not self._parent_running():
             self._cancelled_stage = builder.stage
-        if builder.operation_result is None:
-            self._errors.append(FullProcessDiagnostic(builder.stage, str(exc)))
         self._record(builder)
+        self._errors.append(FullProcessDiagnostic(builder.stage, str(exc)))
+        if wrapper_message is not None:
+            self._errors.append(FullProcessDiagnostic(builder.stage, wrapper_message))
 
     def _operation_outcome(
         self, result: PreprocessingOperationResult
@@ -686,6 +719,7 @@ class FullProcessPipeline:
             self._overall_status = PreprocessingStatus.FAILED
             if self._cancelled_stage is not None:
                 self._overall_status = PreprocessingStatus.CANCELLED
+        self._errors.append(FullProcessDiagnostic(stage, wrapper_message))
         self._message(f"[ERROR] {wrapper_message}")
         raise _StageAbort(wrapper_message, stage)
 
