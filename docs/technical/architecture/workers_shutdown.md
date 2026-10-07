@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer, support]
 neat_version: 4.8.0
-verified_commit: 74ac16ecc3be77373f5078f4ec983d6caba7c927
+verified_commit: eb605978e4cbc52630ff1138866d6786c2208b0d
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
 source_paths: [NEAT/ui/main_window.py, NEAT/ui/mixins/preprocessing.py, NEAT/ui/mixins/fitting.py, NEAT/ui/assistant_panel.py, NEAT/services/fitting_engine.py, NEAT/workers/preprocessing.py, NEAT/workers/batch.py]
-source_symbols: [FitsViewer.cleanup_resources, AssistantDockWidget.shutdown, SummationWorker.stop, FullProcessWorker.stop, BatchFitEdgesWorker.stop, BatchFitWorker.stop]
-test_paths: [tests/test_preprocessing_workers.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_semantic_retrieval.py, tests/test_pattern_batch_worker.py, tests/test_batch_mapping_outputs.py]
+source_symbols: [_finish_worker, FitsViewer.cleanup_resources, AssistantDockWidget.shutdown, SummationWorker.stop, FullProcessWorker.stop, BatchFitEdgesWorker.stop, BatchFitWorker.stop]
+test_paths: [tests/test_preprocessing_workers.py, tests/test_preprocessing_normalisation.py, tests/test_preprocessing_normalisation_raden.py, tests/test_preprocessing_full_process.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_semantic_retrieval.py, tests/test_pattern_batch_worker.py, tests/test_batch_mapping_outputs.py]
 ---
 
 # Worker ownership, progress, cancellation and shutdown
@@ -28,7 +28,8 @@ The recurring signal pattern is:
 - `progress_updated(int)` for a percentage;
 - `message(str)` for the relevant message box;
 - a payload signal such as `run_loaded`, `stack_loaded` or `answer_ready`; and
-- `finished(...)` for UI reset and reference cleanup.
+- `finished(...)` for UI reset and reference cleanup. The seven preprocessing
+  workers expose a no-argument `finished` signal.
 
 Qt queued connections move worker signals back to the GUI thread where needed.
 Batch fitting also emits `current_box_changed` for the moving map overlay.
@@ -56,10 +57,50 @@ checks Stop between boxes and before saving, and does not add a per-edge
 check. The current box may finish its remaining edge fits after Stop before
 exiting without output files.
 
-The Full Process worker runs child preprocessing workers inside nested
-`QEventLoop` instances. Its own stop flag is checked between stages, but a
-currently executing child operation must reach its own safe point before the
-parent can continue or exit.
+Full Process uses one `FullProcessWorker` QThread around the headless
+`FullProcessPipeline`; it does not create child preprocessing workers or nested
+`QEventLoop` instances. Its parent and active-operation cancellation state
+remain separate, and active services retain their existing cooperative safe
+points.
+
+## Preprocessing worker lifecycle
+
+The Clean, Summation, Overlap, classic Normalisation, Filtering, RADEN
+Normalisation and Full Process adapters follow one completion contract:
+
+```text
+headless operation/pipeline result
+        -> worker.result
+        -> succeeded derived from result.status
+        -> one public finished notification
+```
+
+This applies to direct `run()` calls and to `start()`/thread exit. On the
+pinned PyQt5 baseline, plain `QThread.finished` delivers one callback after a
+real thread exits. A subclass declaration of `finished = pyqtSignal()` shadows
+that native signal: a subclass that declares but never emits it delivers no
+callback, while one manual emit delivers one callback in either execution
+mode. The preprocessing adapters retain the declared public signal and emit it
+once after their run path; tests process queued Qt events after bounded
+`wait()` before checking the public callback count. Filtering's no-runs and
+no-mask paths now use this same one-emission final path; their FAILED results
+and messages are unchanged.
+
+Terminal adapter-only finalisation runs after a service or pipeline has
+returned its structured result. A failure in terminal garbage collection or
+standalone Normalisation's final memory report is best-effort: the original
+result, its outputs/errors/warnings and its derived `succeeded` state remain
+intact, a `[WARN] Worker finalization: <error>` message is attempted, and
+completion is still attempted even if warning delivery fails. These warnings
+are not added to scientific result errors.
+
+This does not make callbacks that execute *inside* a service or pipeline
+nonfatal. Classic Normalisation per-run GC and pacing, RADEN page-boundary GC,
+Full Process stage-completion GC, and Full Process's in-pipeline final
+Normalisation diagnostic retain their existing failure behavior. In
+particular, an Issue #39 in-pipeline memory callback failure keeps the Full
+Process result FAILED with its structural diagnostics and already-returned
+operation outputs.
 
 ## GUI controls
 
@@ -97,11 +138,13 @@ network timeout/retry settings can outlast that close wait.
   shutdown depends on their normal completion handlers.
 - `OpenBeamLoadWorker` has no `stop()` method and does not check Qt interruption
   requests in its load loop.
-- Completion signals do not consistently distinguish success, cancellation and
-  failure. Some workers emit `finished` after logging an error.
+- The common preprocessing completion signal indicates that an adapter run
+  ended; use its structured result and `succeeded` state to distinguish
+  success, cancellation and failure.
 - Wait timeouts are not followed by a second warning or persistent diagnostic.
-- There is no consolidated end-to-end test covering close during every worker
-  type.
+- GUI worker-reference ownership, close-during-processing behavior and
+  consolidated application shutdown remain follow-up work; this worker
+  lifecycle contract does not change the UI stop handlers or window cleanup.
 
 ## Retrieval questions
 

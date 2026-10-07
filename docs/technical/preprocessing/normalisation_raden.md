@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: preprocessing
 audience: [user, scientist, developer]
 neat_version: 4.8.0
-verified_commit: 2bd2c3a7fbe2de5eaa3aff55a06d1129f11de18f
+verified_commit: eb605978e4cbc52630ff1138866d6786c2208b0d
 status: domain-reviewed
 instrument_applicability: [RADEN]
 scientific_review: completed 2026-07-16
@@ -119,12 +119,18 @@ stop arrives during copying; the final status then observes the current
 running state. Cancellation remains cooperative and can leave a readable
 partial TIFF. Progress remains `int(100 * (page_index + 1) / total)` after the
 page is saved, the writer advances, and the processed count increments. The
-worker collects garbage after zero-based page indices 0, 100, 200, and so on,
-then once more in `finally`. Its `succeeded` flag is true only when every
-expected page is written without cancellation or error.
+worker collects garbage after zero-based page indices 0, 100, 200, and so on.
+These page-boundary collections execute inside the service and retain their
+existing operation-failure semantics. A separate terminal collection after
+the service result is established is best-effort: a failure produces a
+`[WARN] Worker finalization: <error>` message when possible, leaves the result
+unchanged and does not prevent the worker's single `finished` notification.
+Its `succeeded` flag is true only when every expected page is written without
+cancellation or error.
 
 The adapter preserves the original message text, constructor, `stop()` method,
-public worker helpers, and `finished` signal. `result` retains structured
+public worker helpers, and no-argument `finished` signal. The signal is
+attempted exactly once after ordinary execution. `result` retains structured
 success, failure, cancellation, counts, outputs and errors. Missing stack info
 is still resolved through `get_raden_tiff_stack_info()` before calling the
 headless service.

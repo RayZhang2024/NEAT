@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: preprocessing
 audience: [user, scientist, developer]
 neat_version: 4.8.0
-verified_commit: 9acc2c94e1927b9e282183b7066c69889430b655
+verified_commit: eb605978e4cbc52630ff1138866d6786c2208b0d
 status: domain-reviewed
 instrument_applicability: [classic image folders]
 scientific_review: completed 2026-07-16
@@ -88,8 +88,13 @@ Stop is cooperative before runs and frames, not within a frame or sidecar
 copy. The service validates the mask and emits `Filtering started...` before
 observing a pre-existing stop. It may emit the stop-observation message at a
 frame boundary and again at the next run boundary; it then emits the legacy
-failed/incomplete summary. Direct no-runs/no-mask worker calls retain their
-legacy duplicate `finished` emission. The worker's public
+failed/incomplete summary. No-runs and no-mask inputs keep their existing
+messages and FAILED service results, but the worker now emits its public
+`finished` signal once on both paths (Issue #41). Like the other preprocessing
+workers, it retains the structured result and derives `succeeded` from that
+result. Terminal adapter-only cleanup failure is reported as a best-effort
+`[WARN] Worker finalization: <error>` without changing the scientific result;
+service failures remain operation errors. The worker's public
 `copy_related_files()` and `get_short_path()` remain callable;
 `output_folder_short` is set only on paths reaching the normal final summary.
 
