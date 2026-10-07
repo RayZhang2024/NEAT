@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer]
 neat_version: 4.8.0
-verified_commit: 9acc2c94e1927b9e282183b7066c69889430b655
+verified_commit: 349e9703ddb5aeb89bf6e6b7ba9806de4543e84c
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/preprocessing_inputs.py, NEAT/domain/__init__.py, NEAT/services/preprocessing_summation.py, NEAT/services/preprocessing_clean.py, NEAT/services/preprocessing_filtering.py, NEAT/workers/preprocessing.py]
-source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult, LoadedImageRun, sum_loaded_image_runs, SummationWorker, clean_loaded_image_runs, OutlierFilteringWorker, filter_loaded_image_runs, FilteringWorker]
-test_paths: [tests/test_preprocessing_domain.py, tests/test_preprocessing_inputs.py, tests/test_preprocessing_summation.py, tests/test_preprocessing_clean.py, tests/test_preprocessing_filtering.py, tests/test_preprocessing_workers.py]
+source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/preprocessing_inputs.py, NEAT/domain/__init__.py, NEAT/services/preprocessing_summation.py, NEAT/services/preprocessing_clean.py, NEAT/services/preprocessing_filtering.py, NEAT/services/preprocessing_overlap.py, NEAT/workers/preprocessing.py]
+source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult, LoadedImageRun, sum_loaded_image_runs, SummationWorker, clean_loaded_image_runs, OutlierFilteringWorker, filter_loaded_image_runs, FilteringWorker, correct_loaded_image_run, OverlapCorrectionWorker]
+test_paths: [tests/test_preprocessing_domain.py, tests/test_preprocessing_inputs.py, tests/test_preprocessing_summation.py, tests/test_preprocessing_clean.py, tests/test_preprocessing_filtering.py, tests/test_preprocessing_overlap.py, tests/test_preprocessing_workers.py]
 ---
 
 # Preprocessing input and result contracts
@@ -30,10 +30,11 @@ define their own input, configuration, logical work unit, and detailed result
 semantics. This module contains no loaded-run models, operation configs,
 cancellation tokens, metadata bags, or scientific payload fields.
 
-The headless Summation, Clean and Filtering services consume `LoadedImageRun`
+The headless Summation, Clean, Filtering and Overlap Correction services consume `LoadedImageRun`
 inputs and return `PreprocessingOperationResult`. Their Qt worker adapters
 convert existing dictionaries at the worker boundary. Summation was the first
-adopter, Clean the second (#29), and Filtering the third (#31). Remaining
+adopter, Clean the second (#29), Filtering the third (#31), and Overlap
+Correction the fourth (#33). Remaining
 preprocessing workers/loaders still use their existing dictionaries and have
 not migrated to the shared result contract.
 
@@ -106,7 +107,7 @@ that source in isolation, without running package initializers. This distinction
 matters because a normal dotted import first executes the existing `NEAT` and
 `NEAT.domain` initializers, which retain their established optional ONNX and
 eager fitting/individual-edge imports. Those parent-package initialization
-behaviors are unchanged by this contract. Summation, Clean and Filtering have
+behaviors are unchanged by this contract. Summation, Clean, Filtering and Overlap Correction have
 migrated; other Qt preprocessing workers have not.
 
 ## Loaded classic image-run input
@@ -147,12 +148,16 @@ construction does not inspect or access the filesystem and requires no
 `QApplication`.
 
 The input type began as contract-level coverage. Issue #27 adopted it for
-Summation, Issue #29 for Clean, and Issue #31 for Filtering. Their headless
+Summation, Issue #29 for Clean, Issue #31 for Filtering, and Issue #33 for
+Overlap Correction. Their headless
 services receive loaded frames directly, while compatibility adapters convert
 legacy worker dictionaries. Clean and Filtering use `primary_source` alone for
-sidecars and do not reject nonempty `load_errors`; Summation's validation and
+sidecars and do not reject nonempty `load_errors`; Overlap Correction also uses
+`primary_source` alone for sidecars and retains `load_errors` as provenance
+without rejecting it. Summation's validation and
 `source_folders` rules differ. Filtering sorts frame suffixes while Clean keeps
-mapping insertion order. Existing loaders and other workers continue to use
+mapping insertion order; Overlap sorts by digits extracted from suffixes.
+Existing loaders and other workers continue to use
 their current dictionaries. Loader-specific suffix parsing, duplicate handling
 and ordering remain unchanged. Spectra, shutter counts, masks, RADEN metadata
 and operation configuration remain operation-specific; cancellation and
@@ -161,12 +166,16 @@ added to the common input model.
 
 ## Adoption boundary
 
-Summation, Clean and Filtering use `LoadedImageRun` and
+Summation, Clean, Filtering and Overlap Correction use `LoadedImageRun` and
 `PreprocessingOperationResult`. `SummationWorker`, `OutlierFilteringWorker` and
-`FilteringWorker` convert legacy dictionaries at their compatibility
+`FilteringWorker`, plus `OverlapCorrectionWorker`, convert legacy dictionaries at their compatibility
 boundaries, delegate to headless services, and retain structured results
 alongside Qt signals and `succeeded`. For Clean and Filtering, the logical work
 unit is a successfully written image; reports and sidecars do not count.
+For Overlap Correction, it is a successfully written corrected FITS image;
+`expected_count` is the number of supplied frames even on setup abort, and
+sidecars do not count. Its post-image-loop completion state is preserved across
+later sidecar warnings and cancellation requests.
 Filtering's two progress streams and early duplicate `finished` signals remain
 legacy adapter behavior, not a general result-contract rule. Remaining
 preprocessing workers and loaders are unmigrated; their future migrations are
