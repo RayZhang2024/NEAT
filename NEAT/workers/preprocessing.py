@@ -8,9 +8,9 @@ from collections.abc import Sequence
 import numpy as np
 import pandas as pd
 import psutil
-from PyQt5.QtCore import Qt, QEventLoop, QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal
 
-from .batch import get_raden_tiff_stack_info, load_image_file, write_fits_image_file
+from .batch import get_raden_tiff_stack_info
 from ..domain import (
     LoadedImageRun,
     PreprocessingOperationResult,
@@ -21,7 +21,13 @@ from ..services.preprocessing_filtering import (
     copy_filtering_related_files,
     filter_loaded_image_runs,
 )
-from ..services.preprocessing_layout import discover_full_process_summation
+from ..services.preprocessing_full_process import (
+    FullProcessDiagnostic,
+    FullProcessPipeline,
+    FullProcessPipelineResult,
+    FullProcessStage,
+    load_full_process_run,
+)
 from ..services.preprocessing_normalisation import (
     NORMALISATION_ADJACENT_RANGE,
     NORMALISATION_WINDOW_HALF_RANGE,
@@ -326,466 +332,166 @@ class NormalisationWorker(QThread):
         )
 
 class FullProcessWorker(QThread):
-    # Signals for messages, progress updates and final completion
+    """Single-thread Qt adapter for the headless Full Process pipeline."""
+
     message = pyqtSignal(str)
     progress_updated = pyqtSignal(int)
-    load_progress_updated = pyqtSignal(int) 
+    load_progress_updated = pyqtSignal(int)
     finished = pyqtSignal()
 
-    def __init__(self, sample_folder: str, open_beam_folder: str, output_folder: str,
-                 base_name: str, window_half: int, adjacent_sum: int):
+    def __init__(
+        self,
+        sample_folder: str,
+        open_beam_folder: str,
+        output_folder: str,
+        base_name: str,
+        window_half: int,
+        adjacent_sum: int,
+    ):
         super().__init__()
-        window_half, adjacent_sum = validate_normalisation_windows(
+        self.window_half, self.adjacent_sum = validate_normalisation_windows(
             window_half, adjacent_sum
         )
         self.sample_folder = sample_folder
         self.open_beam_folder = open_beam_folder
         self.output_folder = output_folder
         self.base_name = base_name
-        self.window_half = window_half
-        self.adjacent_sum = adjacent_sum
-        self._is_running = True  # Flag to track whether the user requested a stop
+        self._is_running = True
         self.succeeded = False
+        self.result: FullProcessPipelineResult | None = None
         self._active_child = None
-        
+        self._active_operation_token = None
+        self._active_operation_stage = None
+        self._pipeline = None
+
     def get_short_path(self, full_path, levels=2):
-        """
-        Returns the last `levels` parts of a path.
-        
-        Args:
-            full_path (str): The full file or folder path.
-            levels (int): How many trailing parts to keep. Default is 2.
-            
-        Returns:
-            str: The shortened path.
-        """
         normalized_path = os.path.normpath(full_path)
         path_parts = normalized_path.split(os.sep)
         if len(path_parts) >= levels:
-            short_path = os.path.join(*path_parts[-levels:])
-        else:
-            short_path = normalized_path
-        return short_path
+            return os.path.join(*path_parts[-levels:])
+        return normalized_path
 
+    def _make_pipeline(self):
+        return FullProcessPipeline(
+            self.sample_folder,
+            self.open_beam_folder,
+            self.output_folder,
+            self.base_name,
+            self.window_half,
+            self.adjacent_sum,
+            message_callback=self.message.emit,
+            progress_callback=self.progress_updated.emit,
+            load_progress_callback=self.load_progress_updated.emit,
+            parent_running=lambda: self._is_running,
+            operation_started=self._operation_started,
+            operation_finished=self._operation_finished,
+            stage_completed=gc.collect,
+            normalisation_finished=self._normalisation_finished,
+            normalisation_pacing=QThread.sleep,
+        )
+
+    def _operation_started(self, stage, token):
+        self._active_operation_stage = stage
+        self._active_operation_token = token
+
+    def _operation_finished(self, stage, token):
+        if self._active_operation_token is token:
+            self._active_operation_stage = None
+            self._active_operation_token = None
+
+    def _normalisation_finished(self):
+        gc.collect()
+        memory_mb = psutil.Process(os.getpid()).memory_info().rss / (1024.0**2)
+        self.message.emit(f"<b>Final memory usage:</b> {memory_mb:.1f} MB")
 
     def run(self):
         try:
-            self.message.emit("=== <b>Full Process Pipeline Started</b> ===")
-
-            # 1) Summation ---------------------------------------------------
-            sample_after_sum = self.maybe_do_summation(self.sample_folder, "Sample")
-            if not self._continue("sample summation"): return
-            self.progress_updated.emit(0)       # reset for next stage
-
-            openbeam_after_sum = self.maybe_do_summation(self.open_beam_folder, "OpenBeam")
-            if not self._continue("open‑beam summation"): return
-            self.progress_updated.emit(0)
-
-            # 2) Clean sample ----------------------------------------------
-            sample_after_clean = self.do_outlier_removal(sample_after_sum, "Sample")
-            if not self._continue("sample cleaning"): return
-            self.progress_updated.emit(0)
-
-            # 3) Clean OB ---------------------------------------------------
-            openbeam_after_clean = self.do_outlier_removal(openbeam_after_sum, "OpenBeam")
-            if not self._continue("open‑beam cleaning"): return
-            self.progress_updated.emit(0)
-
-            # 4) Overlap sample --------------------------------------------
-            sample_after_overlap = self.do_overlap_correction(sample_after_clean, "Sample")
-            if not self._continue("sample overlap"): return
-            self.progress_updated.emit(0)
-
-            # 5) Overlap OB -------------------------------------------------
-            openbeam_after_overlap = self.do_overlap_correction(openbeam_after_clean, "OpenBeam")
-            if not self._continue("open‑beam overlap"): return
-            self.progress_updated.emit(0)
-
-            # 6) Normalisation ---------------------------------------------
-            self.do_normalisation(sample_after_overlap, openbeam_after_overlap)
-            if not self._continue("normalisation"): return
-            self.progress_updated.emit(0)
-
-            self.succeeded = True
-            self.message.emit("=== <b>Full Process Completed Successfully</b> ===")
-
+            self._pipeline = self._make_pipeline()
+            self.result = self._pipeline.run()
+            self.succeeded = self.result.status is PreprocessingStatus.SUCCEEDED
         except Exception as exc:
             self.succeeded = False
+            if self._pipeline is not None:
+                prior = self._pipeline.result()
+                self.result = FullProcessPipelineResult(
+                    PreprocessingStatus.FAILED,
+                    prior.stages,
+                    prior.failed_stage,
+                    prior.cancelled_stage,
+                    prior.outputs,
+                    (*prior.errors, FullProcessDiagnostic(None, str(exc))),
+                    prior.warnings,
+                )
+            else:
+                self.result = FullProcessPipelineResult(
+                    PreprocessingStatus.FAILED,
+                    (),
+                    None,
+                    None,
+                    (),
+                    (FullProcessDiagnostic(None, str(exc)),),
+                    (),
+                )
             self.message.emit(f"[ERROR] {exc}")
         finally:
+            self.succeeded = bool(
+                self.result is not None
+                and self.result.status is PreprocessingStatus.SUCCEEDED
+            )
             gc.collect()
             self.finished.emit()
 
-    # ------------------------------------------------------------------
-    # HELPER: continue or exit early
-    # ------------------------------------------------------------------
-    def _continue(self, phase):
-        if not self._is_running:
-            self.message.emit(f"Stopped during {phase}.")
-            return False
-        return True
-    
-    def _early_exit(self, reason: str):
-        """Emits a final message and returns quickly."""
-        self.message.emit(reason)
-        # (The final self.finished.emit() is in the 'finally' block of run().) 
-        
     def stop(self):
-        """
-        Called from the main UI when the user clicks 'Stop Full Process'.
-        Sets _is_running=False so the while loops in each step can stop the worker.
-        """
         self._is_running = False
+        token = self._active_operation_token
+        stage = self._active_operation_stage
+        if token is not None:
+            token.set()
+            if stage in (
+                FullProcessStage.SAMPLE_SUMMATION,
+                FullProcessStage.OPEN_BEAM_SUMMATION,
+            ):
+                self.message.emit("Stop signal received – cancelling at next safe point.")
+            elif stage in (
+                FullProcessStage.SAMPLE_OVERLAP,
+                FullProcessStage.OPEN_BEAM_OVERLAP,
+            ):
+                self.message.emit(
+                    "Stop signal received. Terminating Overlap Correction process."
+                )
+            elif stage is FullProcessStage.NORMALISATION:
+                self.message.emit(
+                    "Stop signal received. Terminating Normalisation process."
+                )
         child = self._active_child
         if child is not None and hasattr(child, "stop"):
             child.stop()
         self.message.emit("FullProcessWorker: Stop signal received.")
 
-    # ---------------------------------------------------------------
-    # Summation Step (conditionally skipped if no subfolders)
-    # ---------------------------------------------------------------
     def maybe_do_summation(self, folder: str, label: str) -> str:
-        if not self._is_running:
-            return folder
-    
-        # Check for subfolders
-        discovery = discover_full_process_summation(folder)
-        subfolders = discovery.folders
-        
-        short_path = self.get_short_path(folder, levels=2)
-    
-        if not discovery.should_sum:
-            self.message.emit(f"0_sumation_{label}: No subfolders found in '\\{short_path}'. Skipping Summation.")
-            return folder
-    
-        # Get the original folder name (e.g., "sample_data")
-        original_folder_name = os.path.basename(folder.rstrip(os.sep))
-        # Build the output folder: e.g., "0_summed_sample_data"
-        summation_output = os.path.join(self.output_folder, f"0_summed_{original_folder_name}")
-        os.makedirs(summation_output, exist_ok=True)
-    
-        self.message.emit(f"0_sumation_{label}: Found {len(subfolders)} subfolder(s) in '\\{short_path}'. Performing Summation...")
-        runs = []
-        for sf in subfolders:
-            r = self.load_run_dict(sf)
-            if r.get("images"):
-                runs.append(r)
-    
-        if not runs:
-            raise RuntimeError(
-                f"0_summation_{label}: no valid FITS/TIFF images were found "
-                f"in subfolders of '\\{short_path}'."
-            )
-    
-        # Create a modified base name for image naming (e.g., "summed_sample_data")
-        modified_base_name = f"summed_{original_folder_name}"
-        worker = SummationWorker(runs, modified_base_name, summation_output)
-        # worker.progress_updated.connect(lambda v: self.progress_updated.emit(v // 4))
-        worker.progress_updated.connect(self.progress_updated, Qt.QueuedConnection)
-               
-        worker.message.connect(self.message.emit, Qt.QueuedConnection)
-
-        # block until child finishes, no busy‑wait
-        loop = QEventLoop(); 
-        worker.finished.connect(loop.quit); 
-        self._active_child = worker
-        worker.start()
-        loop.exec_()
-        self._active_child = None
-        if not worker.succeeded:
-            raise RuntimeError(f"0_summation_{label} failed.")
-    
-        # Free memory from runs
-        del runs
-        import gc
-        gc.collect()
-        
-        summation_output_short = self.get_short_path(summation_output, levels = 3)
-    
-        if self._is_running:
-            self.message.emit(f"<b>0_sumation_{label} complete</b>, saved at: <b>\\{summation_output_short}</b>")
-            return summation_output
-        else:
-            return folder
-
-
-    # ---------------------------------------------------------------
-    # Outlier Removal (Clean) Step
-    # ---------------------------------------------------------------
+        return self._make_pipeline().maybe_do_summation(folder, label)
 
     def do_outlier_removal(self, folder: str, label: str) -> str:
-        if not self._is_running:
-            return folder
-        
-        short_path = self.get_short_path(folder, levels=2)
-    
-        self.message.emit(f"1_clean_{label}: Starting Outlier Removal on \\{short_path}...")
-        run = self.load_run_dict(folder)
-        if not run.get("images"):
-            raise RuntimeError(
-                f"1_clean_{label}: no images found in \\{short_path}."
-            )
-        if run.get("load_errors"):
-            raise RuntimeError(
-                f"1_clean_{label}: one or more input frames could not be loaded."
-            )
-    
-        original_folder_name = os.path.basename(folder.rstrip(os.sep))
-        # Output folder: e.g., "1_cleaned_sample_data" or "1_cleaned_openbeam_data"
-        outlier_output = os.path.join(self.output_folder, f"1_cleaned_{original_folder_name}")
-        os.makedirs(outlier_output, exist_ok=True)
-    
-        # Create a base name for cleaned image names (e.g., "cleaned_sample_data")
-        modified_base_name = f"cleaned_{original_folder_name}"
-        worker = OutlierFilteringWorker([run], outlier_output, modified_base_name)
-        # worker.progress_updated.connect(lambda v: self.progress_updated.emit(25 + v // 4))
-        worker.progress_updated.connect(self.progress_updated, Qt.QueuedConnection)
-        worker.message.connect(self.message.emit, Qt.QueuedConnection)
-
-        # block until child finishes, no busy‑wait
-        loop = QEventLoop(); 
-        worker.finished.connect(loop.quit); 
-        self._active_child = worker
-        worker.start()
-        loop.exec_()
-        self._active_child = None
-        if not getattr(worker, "succeeded", True):
-            raise RuntimeError(f"1_clean_{label} failed or skipped frames.")
-    
-        del run
-        import gc
-        gc.collect()
-        
-        short_path = self.get_short_path(outlier_output, levels=2)
-    
-        if self._is_running:
-            self.message.emit(f"<b>1_clean_{label} complete</b>, saved at: <b>\\{short_path}</b>")
-            return outlier_output
-        else:
-            return folder
-
-
-    # ---------------------------------------------------------------
-    # Overlap Correction Step
-    # ---------------------------------------------------------------
+        return self._make_pipeline().do_outlier_removal(folder, label)
 
     def do_overlap_correction(self, folder: str, label: str) -> str:
-        if not self._is_running:
-            return folder
-        
-        short_path = self.get_short_path(folder, levels=2)
-    
-        self.message.emit(f"2_correction_{label}: Starting Overlap Correction on \\{short_path}...")
-        run = self.load_run_dict(folder)
-        if not run.get("images"):
-            raise RuntimeError(
-                f"2_correction_{label}: no images found in \\{short_path}."
-            )
-        if run.get("load_errors"):
-            raise RuntimeError(
-                f"2_correction_{label}: one or more input frames could not be loaded."
-            )
-    
-        try:
-            all_files = os.listdir(folder)
-        except Exception as e:
-            raise RuntimeError(
-                f"2_correction_{label}: cannot access \\{short_path}: {e}"
-            ) from e
-    
-        # Load additional data (Spectra and ShutterCount)
-        spectra_file = next((os.path.join(folder, f) for f in all_files if f.endswith("_Spectra.txt")), None)
-        # short_spectra=self.get_short_path(spectra_file, levels=2)
-        if spectra_file:
-            try:
-                run["spectra"] = np.loadtxt(spectra_file)
-                # self.message.emit(f"2_correction_{label}: Loaded Spectra from {short_spectra}")
-            except Exception as e:
-                self.message.emit(f"2_correction_{label}: Error loading Spectra: {e}")
-                run["spectra"] = None
-        else:
-            run["spectra"] = None
-    
-        shutter_file = next((os.path.join(folder, f) for f in all_files if f.endswith("_ShutterCount.txt")), None)
-        # short_shutter=self.get_short_path(shutter_file, levels=2)
-        if shutter_file:
-            try:
-                sc_data = np.loadtxt(shutter_file)
-                run["shutter_count"] = sc_data[sc_data != 0]
-                # self.message.emit(f"2_correction_{label}: Loaded ShutterCount from {short_shutter}")
-            except Exception as e:
-                self.message.emit(f"2_correction_{label}: Error loading ShutterCount: {e}")
-                run["shutter_count"] = None
-        else:
-            run["shutter_count"] = None
-    
-        if run["spectra"] is None or run["shutter_count"] is None:
-            raise RuntimeError(
-                f"2_correction_{label}: Spectra or ShutterCount is missing; "
-                "Full Process requires overlap correction."
-            )
-    
-        original_folder_name = os.path.basename(folder.rstrip(os.sep))
-        # Output folder: e.g., "2_corrected_sample_data"
-        overlap_output = os.path.join(self.output_folder, f"2_corrected_{original_folder_name}")
-        os.makedirs(overlap_output, exist_ok=True)
-    
-        # Create a base name to be used for image naming (e.g., "corrected_sample_data")
-        modified_base_name = f"corrected_{original_folder_name}"
-        worker = OverlapCorrectionWorker(run, modified_base_name, overlap_output)
-        # worker.progress_updated.connect(lambda v: self.progress_updated.emit(50 + v // 4))
-        worker.progress_updated.connect(self.progress_updated, Qt.QueuedConnection)
-        worker.message.connect(self.message.emit, Qt.QueuedConnection)
-
-        # block until child finishes, no busy‑wait
-        loop = QEventLoop(); 
-        worker.finished.connect(loop.quit); 
-        self._active_child = worker
-        worker.start()
-        loop.exec_()
-        self._active_child = None
-        if not worker.succeeded:
-            raise RuntimeError(f"2_correction_{label} failed.")
-    
-        del run
-        import gc
-        gc.collect()
-        overlap_output_short=self.get_short_path(overlap_output, levels=3)
-    
-        if self._is_running:
-            self.message.emit(f"<b>2_correction_{label} complete</b>, saved at: <b>\\{overlap_output_short}</b>")
-            return overlap_output
-        else:
-            return folder
-
-
-    # ---------------------------------------------------------------
-    # Normalisation Step
-    # ---------------------------------------------------------------
+        return self._make_pipeline().do_overlap_correction(folder, label)
 
     def do_normalisation(self, sample_folder: str, openbeam_folder: str):
-        if not self._is_running:
-            return
-        short_path_sample = self.get_short_path(sample_folder, levels=2)
-        short_path_ob = self.get_short_path(openbeam_folder, levels=2)
-    
-        self.message.emit(
-            f"3_normalisation: Sample='{short_path_sample}', OpenBeam='{short_path_ob}'"
-        )
-    
-        sample_run = self.load_run_dict(sample_folder)
-        openbeam_run = self.load_run_dict(openbeam_folder)
-        if (not sample_run.get("images")) or (not openbeam_run.get("images")):
-            raise RuntimeError(
-                "Normalisation cannot start because sample or open beam has no images."
-            )
-        if sample_run.get("load_errors") or openbeam_run.get("load_errors"):
-            raise RuntimeError(
-                "Normalisation cannot start because one or more input frames "
-                "could not be loaded."
-            )
-    
-        # Set output folder to a fixed name for the merged result
-        normalised_output = os.path.join(self.output_folder, "3_normalised_original")
-        os.makedirs(normalised_output, exist_ok=True)
-    
-        # Base name for normalised images (here using "normalised" as the prefix)
-        modified_base_name = "normalised"
-        worker = NormalisationWorker(
-            [sample_run],
-            [openbeam_run],
-            normalised_output,
-            modified_base_name,
-            self.window_half,
-            self.adjacent_sum
-        )
-        # worker.progress_updated.connect(lambda v: self.progress_updated.emit(75 + v // 4))
-        worker.progress_updated.connect(self.progress_updated.emit, Qt.QueuedConnection)
-        worker.message.connect(self.message.emit, Qt.QueuedConnection)
+        return self._make_pipeline().do_normalisation(sample_folder, openbeam_folder)
 
-        # block until child finishes, no busy‑wait
-        loop = QEventLoop(); 
-        worker.finished.connect(loop.quit); 
-        self._active_child = worker
-        worker.start()
-        loop.exec_()
-        self._active_child = None
-        if not worker.succeeded:
-            raise RuntimeError("3_normalisation failed or skipped one or more frames.")
-    
-        del sample_run, openbeam_run
-        import gc
-        gc.collect()
-        
-        normalised_output_short=self.get_short_path(normalised_output, levels=3)
-    
-        if self._is_running:
-            self.message.emit(f"<b>3_normalisation complete</b>, saved at: <b>\\{normalised_output_short}</b>")
-
-  
     def load_run_dict(self, folder: str) -> dict:
-        """
-        Scan a folder for FITS/TIFF files and use the final underscore-delimited
-        stem component as the frame suffix. The suffix need not contain five
-        digits.
+        run = load_full_process_run(
+            folder,
+            progress_callback=self.load_progress_updated.emit,
+            message_callback=self.message.emit,
+        )
+        return {
+            "folder_path": run.primary_source,
+            "images": dict(run.frames),
+            "load_errors": list(run.load_errors),
+        }
 
-        Returns a dictionary:
-            { 'folder_path': folder, 'images': {suffix: data} }.
-        Also emits loading progress via load_progress_updated.
-        """
-        run = {"folder_path": folder, "images": {}, "load_errors": []}
-        if not os.path.isdir(folder):
-            self.message.emit(f"Folder not found: {folder}")
-            return run
-        
-        short_path = self.get_short_path(folder, levels=2)
-
-        try:
-            image_files = [
-                f for f in os.listdir(folder)
-                if f.lower().endswith((".fits", ".fit", ".tiff", ".tif"))
-            ]
-            total_files = len(image_files)
-            processed_files = 0
-
-            for f in image_files:
-                processed_files += 1
-                stem = os.path.splitext(f)[0]
-                suffix = stem.rsplit("_", 1)[-1].strip()
-                if not suffix:
-                    error = f"File '{f}' has an empty frame suffix."
-                    run["load_errors"].append(error)
-                    self.message.emit(error)
-                    self.load_progress_updated.emit(
-                        int((processed_files / total_files) * 100)
-                    )
-                    continue
-                if suffix in run["images"]:
-                    error = (
-                        f"File '{f}' duplicates frame suffix '{suffix}'. "
-                        "Frame names must be unique."
-                    )
-                    run["load_errors"].append(error)
-                    self.message.emit(error)
-                    self.load_progress_updated.emit(
-                        int((processed_files / total_files) * 100)
-                    )
-                    continue
-                try:
-                    path = os.path.join(folder, f)
-                    data = load_image_file(path)
-                    run["images"][suffix] = data.astype(np.float32)
-                except Exception as e:
-                    error = f"Error loading file {f} in \\{short_path}: {e}"
-                    run["load_errors"].append(error)
-                    self.message.emit(error)
-                # Update loading progress after processing each file
-                self.load_progress_updated.emit(int((processed_files / total_files) * 100))
-        except Exception as e:
-            error = f"Error reading folder \\{short_path}: {e}"
-            run["load_errors"].append(error)
-            self.message.emit(error)
-        return run
 
 class FilteringWorker(QThread):
     progress_updated = pyqtSignal(int)
