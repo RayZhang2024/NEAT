@@ -773,6 +773,28 @@ class TestRadenNormalisationWorkerAdapter(_RadenFixtureMixin, unittest.TestCase)
         self.assertEqual(progress[100], 100)
         self.assertEqual(gc_progress, [1, 101, 101])  # indices 0, 100, then final worker GC
 
+    def test_page_boundary_gc_failure_remains_an_in_service_failure(self):
+        worker = self.worker(n=0, m=0)
+        messages, finished = [], []
+        collections = []
+        worker.message.connect(messages.append)
+        worker.finished.connect(lambda: finished.append(True))
+
+        def collect():
+            collections.append(True)
+            if len(collections) == 1:
+                raise RuntimeError("page GC failed")
+
+        with patch("NEAT.workers.preprocessing.gc.collect", side_effect=collect):
+            worker.run()
+
+        self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
+        self.assertFalse(worker.succeeded)
+        self.assertIn("page GC failed", worker.result.errors)
+        self.assertFalse(any(message.startswith("[WARN] Worker finalization:") for message in messages))
+        self.assertEqual(collections, [True, True])
+        self.assertEqual(finished, [True])
+
     def test_worker_reports_fatal_sidecar_after_completed_tiff_without_summary(self):
         (self.sample_folder / "a.json").write_text("json")
         worker = self.worker(n=0, m=0)
