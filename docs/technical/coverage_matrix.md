@@ -42,7 +42,7 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
 | 6 | Architecture | [Structured preprocessing operation results](architecture/preprocessing_contracts.md) | `NEAT/domain/preprocessing.py`, operation services, Full Process pipeline result | Contract tests, service/worker regressions, and Full Process stage/result aggregation tests; other operation workers remain unmigrated | Not required | P1 | code-verified |
 | 6 | Architecture | [Typed loaded-image run contract](architecture/preprocessing_contracts.md) | `NEAT/domain/preprocessing_inputs.py`, classic operation services, Full Process loader | Input contract tests, classic service/adapter regressions, and Full Process loader/pipeline tests; RADEN uses resolved stack-info mappings, and other loaders/workers retain their contracts | Not required | P1 | code-verified |
 | 6 | Architecture | [Startup, window composition and state](architecture/startup_state.md) | `app.py`, `main_window.py` | Import and partial GUI tests | Not required | P2 | code-verified |
-| 6 | Architecture | [Workers, progress and shutdown](architecture/workers_shutdown.md) | UI mixins and workers | All seven preprocessing adapters: structured status/succeeded/completion regressions; direct and real-thread Qt completion probes; Filtering early paths; terminal versus in-service finalisation failures; GUI close/ownership remains untested | Not required | P1 | code-verified |
+| 6 | Architecture | [Workers, progress and shutdown](architecture/workers_shutdown.md) | `PreprocessingWorkerRegistry`, preprocessing UI mixin and workers | Offscreen real-QThread tests for GUI-thread delivery, public-finished-before-exit, fast exit, start rejection, missing-finished grace/late-signal rejection, family Stop/restart gates, payload handoff, Open Beam supersession, and registry/timer drain; adapter and Issue #39 Full Process regressions remain covered | Not required | P1 | code-verified |
 | 6 | Support | [Errors, updates and packaging](support/updates_packaging_errors.md) | main window, packaging config | Assistant error tests; no packaged smoke test | Security review | P2 | code-verified |
 | 6 | Assistant | [RAG, privacy, feedback and evaluation](support/assistant_architecture.md) | assistant UI/tools | Extensive assistant tests | Safety review | P1 | code-verified |
 
@@ -53,9 +53,11 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
   Normalisation, and Full Process orchestration. It also has headless
   directory-layout classification and call-site wiring tests. Interactive
   mask editing still lacks focused coverage.
-- Issue #41 adds direct and real-QThread lifecycle coverage for all seven
-  preprocessing worker adapters. GUI ownership, close-during-processing and
-  application-shutdown integration remain separate, uncovered follow-up work.
+- Issue #41 covers direct and real-QThread lifecycle behavior for all seven
+  preprocessing adapters. Issue #43 adds GUI ownership and interactive Stop
+  regression coverage. Application-close coordination remains explicitly
+  uncovered follow-up work; the registry is window-owned and does not yet make
+  close-during-processing safe.
 - Fitting and input loading have materially better headless coverage, but the
   full GUI-to-worker-to-output path is not comprehensively tested.
 - Documents for untested behavior can still reach `code-verified`, but the
