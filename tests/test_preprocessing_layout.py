@@ -214,10 +214,9 @@ class PreprocessingLayoutTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
         }
         maybe_sum = ast.unparse(methods["maybe_do_summation"])
-        self.assertIn("discover_full_process_summation", maybe_sum)
-        self.assertIn("discovery.should_sum", maybe_sum)
-        self.assertIn("for sf in subfolders", maybe_sum)
-        self.assertIn("SummationWorker", maybe_sum)
+        self.assertIn("_make_pipeline", maybe_sum)
+        self.assertIn("maybe_do_summation", maybe_sum)
+        self.assertNotIn("SummationWorker", maybe_sum)
 
     def test_summation_and_full_process_use_separate_layout_entry_points(self):
         self.assertEqual(classify_standalone_summation(str(self.root)).kind, "too_few")

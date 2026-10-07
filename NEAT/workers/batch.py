@@ -14,46 +14,16 @@ import numpy as np
 import pandas as pd
 from astropy.io import fits
 
-from ..services.image_io import _flip_vertical_image_axis, write_fits_image_file
-
-try:
-    import imageio.v2 as imageio
-except ImportError:  # pragma: no cover
-    imageio = None
+from ..services.image_io import (
+    _flip_vertical_image_axis,
+    load_image_file,
+    write_fits_image_file,
+)
 
 try:
     from PIL import Image
 except ImportError:  # pragma: no cover
     Image = None
-
-if imageio is None and Image is None:  # pragma: no cover
-    try:
-        from PIL import Image
-    except ImportError:
-        Image = None
-
-
-def load_image_file(file_path):
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext in (".fits", ".fit", ".fts"):
-        # FITS viewers such as ImageJ display the detector row axis opposite to
-        # NumPy/Matplotlib's default row order. Keep NEAT's in-memory arrays in
-        # the same top-to-bottom orientation users see in ImageJ.
-        return _flip_vertical_image_axis(fits.getdata(file_path, memmap=False))
-    if imageio is not None:
-        arr = imageio.imread(file_path)
-        # Keep TIFFs aligned with NEAT's ImageJ-style display orientation.
-        if ext in (".tiff", ".tif"):
-            arr = _flip_vertical_image_axis(arr)
-        return arr
-    if Image is not None:
-        with Image.open(file_path) as img:
-            arr = np.array(img)
-        if ext in (".tiff", ".tif"):
-            arr = _flip_vertical_image_axis(arr)
-        return arr
-    raise ImportError("Neither imageio nor Pillow is available to read TIFF files.")
-
 
 from PyQt5.QtCore import QThread, pyqtSignal
 from scipy.interpolate import griddata
