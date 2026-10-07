@@ -65,6 +65,7 @@ from .mixins.postprocessing import PostProcessingMixin
 from .mixins.preprocessing import PreprocessingMixin
 from .dialogs import UncertaintyEstimatorDialog
 from .assistant_panel import AssistantDockWidget, collect_neat_context
+from .preprocessing_worker_registry import PreprocessingWorkerRegistry
 from .utils import update_all_widget_fonts
 
 
@@ -124,6 +125,8 @@ class UpdateCheckWorker(QThread):
 class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMixin):
     def __init__(self):
         super().__init__()
+        self._preprocessing_worker_registry = PreprocessingWorkerRegistry(self)
+        self._preprocessing_workflow_generations = {}
         
         self.flight_path = 56.4
         self.flight_path_source = "App setting"
@@ -176,6 +179,9 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         
         # Set up the layout for Preprocessing tab
         self.setup_preprocessing_tab()
+        self._preprocessing_worker_registry.diagnostic.connect(
+            self.preproc_message_box.append, Qt.QueuedConnection
+        )
 
         # Set up the layout for FittingTab (FITS Viewer)
         self.setup_FittingTab()
