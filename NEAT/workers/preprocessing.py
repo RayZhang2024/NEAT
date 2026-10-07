@@ -2,8 +2,8 @@
 
 import gc
 import os
-import re
 import shutil
+from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
@@ -23,32 +23,17 @@ from ..services.preprocessing_filtering import (
     filter_loaded_image_runs,
 )
 from ..services.preprocessing_layout import discover_full_process_summation
+from ..services.preprocessing_normalisation import (
+    NORMALISATION_ADJACENT_RANGE,
+    NORMALISATION_WINDOW_HALF_RANGE,
+    copy_normalisation_related_files,
+    normalise_loaded_image_runs,
+    read_normalisation_shutter_count,
+    validate_normalisation_windows,
+)
 from ..services.preprocessing_overlap import correct_loaded_image_run
 from ..services.preprocessing_summation import sum_loaded_image_runs
 
-NORMALISATION_WINDOW_HALF_RANGE = (0, 100)
-NORMALISATION_ADJACENT_RANGE = (0, 10)
-
-
-def validate_normalisation_windows(window_half, adjacent_sum):
-    """Return validated normalisation window settings."""
-    try:
-        window_half = int(window_half)
-        adjacent_sum = int(adjacent_sum)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Normalisation n and m must be integers.") from exc
-
-    n_min, n_max = NORMALISATION_WINDOW_HALF_RANGE
-    m_min, m_max = NORMALISATION_ADJACENT_RANGE
-    if not n_min <= window_half <= n_max:
-        raise ValueError(
-            f"Normalisation n must be between {n_min} and {n_max}."
-        )
-    if not m_min <= adjacent_sum <= m_max:
-        raise ValueError(
-            f"Normalisation m must be between {m_min} and {m_max}."
-        )
-    return window_half, adjacent_sum
 
 
 class OutlierFilteringWorker(QThread):
@@ -225,10 +210,29 @@ class OverlapCorrectionWorker(QThread):
         self._is_running = False
         self.message.emit("Stop signal received. Terminating Overlap Correction process.")
 
+class _LegacyNormalisationRuns(Sequence):
+    """Adapt one run at a time without retaining cleared frame arrays."""
+
+    def __init__(self, runs):
+        self._runs = runs
+
+    def __len__(self):
+        return len(self._runs)
+
+    def __getitem__(self, index):
+        run = self._runs[index]
+        return LoadedImageRun(
+            primary_source=run["folder_path"],
+            frames=run["images"],
+            load_errors=run.get("load_errors") or (),
+        )
+
 class NormalisationWorker(QThread):
-    progress_updated = pyqtSignal(int)   # Emits progress percentage (0-100)
-    finished         = pyqtSignal()      # Emits when processing is finished
-    message          = pyqtSignal(str)   # Emits messages for user feedback
+    """Qt and legacy mutable-state adapter for classic normalisation."""
+
+    progress_updated = pyqtSignal(int)
+    finished = pyqtSignal()
+    message = pyqtSignal(str)
 
     def __init__(
         self,
@@ -243,264 +247,75 @@ class NormalisationWorker(QThread):
         window_half, adjacent_sum = validate_normalisation_windows(
             window_half, adjacent_sum
         )
-        self.normalisation_image_runs      = normalisation_image_runs
-        self.normalisation_open_beam_runs  = normalisation_open_beam_runs
-        self.output_folder                 = output_folder
-        self.base_name                     = base_name
-        self.window_half                   = window_half
-        self.adjacent_sum                  = adjacent_sum
-        self._is_running                   = True
-        self.succeeded                     = False
-        self.failed_frames                 = []
+        self.normalisation_image_runs = normalisation_image_runs
+        self.normalisation_open_beam_runs = normalisation_open_beam_runs
+        self.output_folder = output_folder
+        self.base_name = base_name
+        self.window_half = window_half
+        self.adjacent_sum = adjacent_sum
+        self._is_running = True
+        self.succeeded = False
+        self.failed_frames = []
+        self.result: PreprocessingOperationResult | None = None
 
-    @staticmethod
-    def _read_shutter_count(folder_path):
-        """Read the 2nd column, 1st row from *_ShutterCount.txt."""
-        try:
-            fname = next(f for f in os.listdir(folder_path)
-                         if f.endswith('_ShutterCount.txt'))
-        except StopIteration:
-            raise FileNotFoundError("no *_ShutterCount.txt found")
+    _read_shutter_count = staticmethod(read_normalisation_shutter_count)
 
-        with open(os.path.join(folder_path, fname), 'r') as fh:
-            first_line = fh.readline().strip()
+    def _delete_sample_suffix(self, run_idx, suffix):
+        del self.normalisation_image_runs[run_idx - 1]["images"][suffix]
 
-        parts = [p for p in re.split(r'[,\s]+', first_line) if p]
-        if len(parts) < 2:
-            raise ValueError(f"cannot parse shutter count in {fname}")
-
-        return float(parts[1])
+    def _cleanup_sample_run(self, run_idx):
+        self.normalisation_image_runs[run_idx - 1]["images"].clear()
 
     def run(self):
         try:
-            # prepare a short display path
-            norm_path = os.path.normpath(self.output_folder)
-            parts = norm_path.split(os.sep)
-            short_path = os.path.join(parts[-2], parts[-1]) if len(parts) >= 2 else norm_path
-
-            # basic validation
-            if not self.normalisation_image_runs or not self.normalisation_open_beam_runs:
-                self.message.emit("No runs provided. Aborting.")
-                return
-
-            if len(self.normalisation_image_runs) != len(self.normalisation_open_beam_runs):
-                self.message.emit("Data vs. Open‐beam count mismatch. Aborting.")
-                return
-
-            total_images = sum(len(r['images']) for r in self.normalisation_image_runs)
-            processed_images = 0
-
-            self.message.emit("<b>--- Starting Normalisation ---</b>")
-            window_half = self.window_half
-            full_win    = (2*window_half+1)**2
-            thresh      = 1e-7
-            frame_win   = 2*self.adjacent_sum+1
-
-            self.message.emit(
-                f"Using {2*window_half+1}×{2*window_half+1} spatial window "
-                f"and {frame_win} frames."
+            sample_runs = _LegacyNormalisationRuns(self.normalisation_image_runs)
+            open_beam_runs = _LegacyNormalisationRuns(
+                self.normalisation_open_beam_runs
             )
-
-            for run_idx, (data_run, ob_run) in enumerate(
-                zip(self.normalisation_image_runs,
-                    self.normalisation_open_beam_runs), start=1
-            ):
-            
-                if not self._is_running:
-                    self.message.emit("User stopped the process.")
-                    break
-
-                # read shutter counts
-                try:
-                    sc = self._read_shutter_count(data_run['folder_path'])
-                    ob = self._read_shutter_count(ob_run['folder_path'])
-                    scale = np.float32(ob/sc) if sc>0 else 1.0
-                    self.message.emit(
-                        f"sample={sc:.0f}, open‐beam={ob:.0f}, scale={scale:.4f}"
-                    )
-                except Exception as e:
-                    self.message.emit(
-                        f"shutter‐count error ({e}), scale=1.0"
-                    )
-                    scale = np.float32(1.0)
-
-                data_imgs = data_run['images']
-                ob_imgs   = ob_run['images']
-                common    = sorted(set(data_imgs) & set(ob_imgs))
-                if not common:
-                    self.message.emit(f" no matching suffixes—skipping.")
-                    self.failed_frames.append(f"run-{run_idx}:no-matching-suffix")
-                    continue
-
-                for i, suffix in enumerate(common):
-                    if not self._is_running:
-                        break
-  
-
-                    try:
-                        img  = data_imgs[suffix].astype(np.float32)
-                        
-                        if self.adjacent_sum == 0:
-                            ob0 = ob_imgs[suffix].astype(np.float64).copy()
-                            start = 0
-                            end = 0
-
-                        else:
-                        # build combined open‐beam
-                            start = max(0, i-self.adjacent_sum)
-                            end   = min(len(common)-1, i+self.adjacent_sum)
-                            ob0   = ob_imgs[common[start]].astype(np.float64).copy()
-                            for j in range(start+1, end+1):
-                                ob0 += ob_imgs[common[j]].astype(np.float64)
-
-                        if img.shape != ob0.shape:
-                            self.message.emit(
-                                f" {suffix}: shape mismatch—skipping."
-                            )
-                            self.failed_frames.append(str(suffix))
-                            continue
-
-                        h, w = img.shape
-                        if h < 2*window_half+1 or w < 2*window_half+1:
-                            self.message.emit(
-                                f" {suffix}: too small for window—skipping."
-                            )
-                            self.failed_frames.append(str(suffix))
-                            continue
-
-                        # integral images
-                        II = ob0.cumsum(0).cumsum(1)
-                        II = np.pad(II, ((1,0),(1,0)), 'constant')
-                        II1 = np.pad(np.ones_like(img).cumsum(0).cumsum(1), ((1,0),(1,0)), 'constant')
-
-                        # get sums via broadcasted indices
-                        I, J = np.ogrid[:h, :w]
-                        i0, i1 = I-window_half, I+window_half+1
-                        j0, j1 = J-window_half, J+window_half+1
-                        i0, i1 = np.clip(i0,0,h), np.clip(i1,0,h)
-                        j0, j1 = np.clip(j0,0,w), np.clip(j1,0,w)
-
-                        part_sum = II[i1, j1] - II[i0, j1] - II[i1, j0] + II[i0, j0]
-                        part_cnt = II1[i1,j1] - II1[i0,j1] - II1[i1,j0] + II1[i0,j0]
-                        scaled   = np.where(part_cnt>0,
-                                            part_sum*(full_win/part_cnt),
-                                            thresh).astype(np.float32)
-
-                        normed = ((end-start+1)*full_win*img/scaled)*scale
-                        normed = np.nan_to_num(normed, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-                        out_fname = f"{self.base_name}_{suffix}.fits"
-                        write_fits_image_file(os.path.join(self.output_folder, out_fname),
-                                              normed, overwrite=True)
-
-                        del data_imgs[suffix]
-                        processed_images += 1
-                        self.progress_updated.emit(int(100*processed_images/total_images))
-
-                    except Exception as e:
-                        self.failed_frames.append(str(suffix))
-                        self.message.emit(
-                            f" {suffix}: error ({e})—skipping."
-                        )
-
-                        
-                    finally:
-                        # free big arrays
-                        for v in ('img','ob0','II','II1','scaled','normed'):
-                            if v in locals():
-                                del locals()[v]
-                    if suffix == 1500:
-                        gc.collect()
-                        QThread.sleep(2)
-                    if suffix == 2500:
-                        gc.collect()
-                        QThread.sleep(2)
-            
-                # per‐run cleanup
-                data_imgs.clear()
-                gc.collect()
-                try:
-                    self.copy_related_files(run_idx, data_run)
-                except Exception as e:
-                    self.message.emit(f"copy_related_files failed: {e}")
-
-                self.message.emit("Run done.")
-                if self._is_running:
-                    QThread.sleep(5)
-
-            self.succeeded = (
-                self._is_running
-                and not self.failed_frames
-                and processed_images == total_images
+            self.result = normalise_loaded_image_runs(
+                sample_runs,
+                open_beam_runs,
+                self.output_folder,
+                self.base_name,
+                self.window_half,
+                self.adjacent_sum,
+                progress_callback=self.progress_updated.emit,
+                message_callback=self.message.emit,
+                cancellation_check=lambda: not self._is_running,
+                failed_frame_callback=self.failed_frames.append,
+                written_frame_callback=self._delete_sample_suffix,
+                run_cleanup_callback=self._cleanup_sample_run,
+                run_collect_callback=lambda _run_idx: gc.collect(),
+                run_complete_callback=lambda _run_idx: QThread.sleep(5),
+                fatal_error_callback=lambda exc: self.message.emit(
+                    f"Fatal error in normalisation: {exc}"
+                ),
             )
-            status = "completed" if self.succeeded else "failed or incomplete"
-            self.message.emit(
-                f"Normalisation {status}: {processed_images} of "
-                f"{total_images} images written to {short_path}."
-            )
-
-        except Exception as e:
+            self.succeeded = self.result.status is PreprocessingStatus.SUCCEEDED
+        except Exception as exc:
             self.succeeded = False
-            self.message.emit(f"Fatal error in normalisation: {e}")
-
+            self.result = PreprocessingOperationResult(
+                PreprocessingStatus.FAILED, 0, errors=(str(exc),)
+            )
+            self.message.emit(f"Fatal error in normalisation: {exc}")
         finally:
-            # final cleanup & memory report
             gc.collect()
-            proc  = psutil.Process(os.getpid())
+            proc = psutil.Process(os.getpid())
             memMB = proc.memory_info().rss / (1024.**2)
             self.message.emit(f"<b>Final memory usage:</b> {memMB:.1f} MB")
             self.finished.emit()
 
     def stop(self):
-        """
-        Stop the Normalisation process.
-        """
         self._is_running = False
         self.message.emit("Stop signal received. Terminating Normalisation process.")
 
     def copy_related_files(self, run_idx, data_run):
-        """
-        Copies related files (e.g., *_Spectra.txt and *_ShutterCount.txt) from the data run's folder
-        to the output folder with unique run identifiers.
-        """
-        try:
-            spectra_suffix = '_Spectra.txt'
-            shuttercount_suffix = '_ShutterCount.txt'
-
-            def create_unique_filename(run_number, original_filename):
-                return f"Run{run_number}_{original_filename}"
-
-            data_folder = data_run['folder_path']
-            data_files = os.listdir(data_folder)
-
-            # Spectra
-            spectra_files = [f for f in data_files if f.endswith(spectra_suffix)]
-            if spectra_files:
-                for sf in spectra_files:
-                    source_path = os.path.join(data_folder, sf)
-                    dest_filename = create_unique_filename(run_idx, sf)
-                    dest_path = os.path.join(self.output_folder, dest_filename)
-                    shutil.copyfile(source_path, dest_path)
-                    self.message.emit(f"Copied '{sf}' to '{dest_filename}'.")
-                    # If only one file is expected, you could break here
-            else:
-                self.message.emit(f"No file ending with '{spectra_suffix}' found in {data_folder}.")
-
-            # ShutterCount
-            shuttercount_files = [f for f in data_files if f.endswith(shuttercount_suffix)]
-            if shuttercount_files:
-                for scf in shuttercount_files:
-                    source_path = os.path.join(data_folder, scf)
-                    dest_filename = create_unique_filename(run_idx, scf)
-                    dest_path = os.path.join(self.output_folder, dest_filename)
-                    shutil.copyfile(source_path, dest_path)
-                    self.message.emit(f"Copied '{scf}' to '{dest_filename}'.")
-                    # If only one file is expected, you could break here
-            else:
-                self.message.emit(f"No file ending with '{shuttercount_suffix}' found in {data_folder}.")
-
-        except Exception as e:
-            self.message.emit(f"Error copying related files: {e}")
+        copy_normalisation_related_files(
+            run_idx,
+            data_run["folder_path"],
+            self.output_folder,
+            message_callback=self.message.emit,
+        )
 
 class FullProcessWorker(QThread):
     # Signals for messages, progress updates and final completion
