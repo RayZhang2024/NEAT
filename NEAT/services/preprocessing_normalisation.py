@@ -16,6 +16,11 @@ from ..domain import (
     ProducedOutput,
 )
 from .image_io import write_fits_image_file
+from .preprocessing_normalisation_kernel import (
+    LocalNormalisationShapeMismatch,
+    LocalNormalisationWindowTooLarge,
+    normalise_local_open_beam_frame,
+)
 
 NORMALISATION_WINDOW_HALF_RANGE = (0, 100)
 NORMALISATION_ADJACENT_RANGE = (0, 10)
@@ -93,37 +98,18 @@ def normalise_classic_frame(
         for j in range(start + 1, end + 1):
             ob0 += open_beam_images[common_suffixes[j]].astype(np.float64)
 
-    if img.shape != ob0.shape:
-        raise NormalisationShapeMismatch
-    h, w = img.shape
-    if h < 2 * window_half + 1 or w < 2 * window_half + 1:
-        raise NormalisationWindowTooLarge
-
-    full_win = (2 * window_half + 1) ** 2
-    thresh = 1e-7
-    II = ob0.cumsum(0).cumsum(1)
-    II = np.pad(II, ((1, 0), (1, 0)), "constant")
-    II1 = np.pad(
-        np.ones_like(img).cumsum(0).cumsum(1),
-        ((1, 0), (1, 0)),
-        "constant",
-    )
-    I, J = np.ogrid[:h, :w]
-    i0, i1 = I - window_half, I + window_half + 1
-    j0, j1 = J - window_half, J + window_half + 1
-    i0, i1 = np.clip(i0, 0, h), np.clip(i1, 0, h)
-    j0, j1 = np.clip(j0, 0, w), np.clip(j1, 0, w)
-    part_sum = II[i1, j1] - II[i0, j1] - II[i1, j0] + II[i0, j0]
-    part_cnt = II1[i1, j1] - II1[i0, j1] - II1[i1, j0] + II1[i0, j0]
-    scaled = np.where(
-        part_cnt > 0,
-        part_sum * (full_win / part_cnt),
-        thresh,
-    ).astype(np.float32)
-    normed = ((end - start + 1) * full_win * img / scaled) * scale
-    return np.nan_to_num(
-        normed, nan=0.0, posinf=0.0, neginf=0.0
-    ).astype(np.float32)
+    try:
+        return normalise_local_open_beam_frame(
+            img,
+            ob0,
+            end - start + 1,
+            window_half,
+            scale,
+        )
+    except LocalNormalisationShapeMismatch as exc:
+        raise NormalisationShapeMismatch from exc
+    except LocalNormalisationWindowTooLarge as exc:
+        raise NormalisationWindowTooLarge from exc
 
 
 def copy_normalisation_related_files(
