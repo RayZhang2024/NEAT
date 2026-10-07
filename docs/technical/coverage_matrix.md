@@ -11,7 +11,7 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
 | 1 | Preprocessing | [Outlier removal/Clean](preprocessing/clean.md) | `services/preprocessing_clean.py`, `OutlierFilteringWorker` adapter | Baseline golden, pure transform, sidecar, partial-output, warning and cancellation tests; Qt adapter tests | Complete | P1 | domain-reviewed |
 | 1 | Preprocessing | [Overlap/pile-up correction](preprocessing/overlap_correction.md) | `services/preprocessing_overlap.py`, `OverlapCorrectionWorker` adapter | Baseline golden, pure equation, segmentation, partial-output, sidecar, cancellation and Qt adapter tests | Required; scientific review pending | P0 | code-verified |
 | 1 | Preprocessing | [FITS normalisation](preprocessing/normalisation_fits.md) | `services/preprocessing_normalisation.py`, `NormalisationWorker` adapter | Original-worker golden, pure spatial/temporal calculation, shutter, partial-output, mutation, sidecar and cancellation tests | Required; scientific review pending | P0 | code-verified |
-| 1 | Preprocessing | [RADEN TIFF normalisation](preprocessing/normalisation_raden.md) | `RadenNormalisationWorker` | Headless TIFF normalisation test | Complete | P0 | domain-reviewed |
+| 1 | Preprocessing | [RADEN TIFF normalisation](preprocessing/normalisation_raden.md) | `services/preprocessing_normalisation_raden.py`, shared local kernel, `RadenNormalisationWorker` adapter | Baseline golden pages; metadata/ToF/pulse validation; incremental/partial TIFF; sidecars; cancellation; worker helper and signal tests (`tests/test_preprocessing_normalisation_raden.py`) | Complete | P0 | domain-reviewed |
 | 1 | Preprocessing | [Filtering and masks](preprocessing/filtering_masks.md) | `services/preprocessing_filtering.py`, `FilteringWorker` adapter, `MaskGeneratorDialog` | Baseline golden, pure transform, validation, sidecar, partial-output, dual-progress and cancellation tests; Qt adapter tests | Complete | P1 | domain-reviewed |
 | 1 | Preprocessing | [Full Process](preprocessing/full_process.md) | `FullProcessWorker` | TIFF loading helper test only | Required | P1 | code-verified |
 | 2 | Loading | [FITS stacks and orientation](loading/fits_stacks_orientation.md) | `ImageLoadWorker`, `services/image_io.py`, compatibility import in `workers/batch.py` | FITS orientation round-trip and summation service tests | Instrument orientation | P0 | code-verified |
@@ -39,8 +39,8 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
 | 5 | Post-processing | [Coordinates and display units](postprocessing/coordinates_units.md) | `ParameterPlotDialog` | Focused cell-edge test | Detector applicability | P0 | code-verified |
 | 5 | Post-processing | [Strain from reference spacing](postprocessing/strain.md) | `calculate_strain` | Formula documented; no isolated UI test | Required | P0 | code-verified |
 | 5 | Post-processing | [ROI mean and line profiles](postprocessing/roi_line_profiles.md) | plot/line-profile dialogs | Focused line-interpolation test | Interpretation limits | P1 | code-verified |
-| 6 | Architecture | [Structured preprocessing operation results](architecture/preprocessing_contracts.md) | `NEAT/domain/preprocessing.py`, Summation, Clean, Filtering, Overlap and classic Normalisation services | Contract tests plus five service/worker result regressions; remaining workers are not migrated | Not required | P1 | code-verified |
-| 6 | Architecture | [Typed loaded-image run contract](architecture/preprocessing_contracts.md) | `NEAT/domain/preprocessing_inputs.py`, Summation, Clean, Filtering, Overlap and classic Normalisation services | Input contract tests plus five service/adapter regressions; other loaders/workers remain dictionary-based | Not required | P1 | code-verified |
+| 6 | Architecture | [Structured preprocessing operation results](architecture/preprocessing_contracts.md) | `NEAT/domain/preprocessing.py`, Summation, Clean, Filtering, Overlap, classic and RADEN Normalisation services | Contract tests plus six service/worker result regressions; remaining operation workers are not migrated | Not required | P1 | code-verified |
+| 6 | Architecture | [Typed loaded-image run contract](architecture/preprocessing_contracts.md) | `NEAT/domain/preprocessing_inputs.py`, Summation, Clean, Filtering, Overlap and classic Normalisation services | Input contract tests plus five classic service/adapter regressions; RADEN uses resolved stack-info mappings, and other loaders/workers retain their contracts | Not required | P1 | code-verified |
 | 6 | Architecture | [Startup, window composition and state](architecture/startup_state.md) | `app.py`, `main_window.py` | Import and partial GUI tests | Not required | P2 | code-verified |
 | 6 | Architecture | [Workers, progress and shutdown](architecture/workers_shutdown.md) | UI mixins and workers | Partial GUI/worker tests; no consolidated shutdown test | Not required | P1 | code-verified |
 | 6 | Support | [Errors, updates and packaging](support/updates_packaging_errors.md) | main window, packaging config | Assistant error tests; no packaged smoke test | Security review | P2 | code-verified |
@@ -49,10 +49,10 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
 ## Initial test-risk observations
 
 - Batch 1 now has headless service tests for Summation, Clean, Filtering,
-  Overlap Correction and classic FITS/TIFF Normalisation, plus headless
-  directory-layout classification and call-site wiring tests. Complete
-  Full Process orchestration and interactive mask editing still lack focused
-  coverage.
+  Overlap Correction, classic FITS/TIFF Normalisation and RADEN TIFF
+  Normalisation. It also has headless directory-layout classification and
+  call-site wiring tests. Full Process orchestration and interactive mask
+  editing still lack focused coverage.
 - Fitting and input loading have materially better headless coverage, but the
   full GUI-to-worker-to-output path is not comprehensively tested.
 - Documents for untested behavior can still reach `code-verified`, but the
