@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer]
 neat_version: 4.8.0
-verified_commit: e62c089a8e62f29875fc1a5232b5688363bdac5d
+verified_commit: 2bd2c3a7fbe2de5eaa3aff55a06d1129f11de18f
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/preprocessing_inputs.py, NEAT/domain/__init__.py, NEAT/services/preprocessing_summation.py, NEAT/services/preprocessing_clean.py, NEAT/services/preprocessing_filtering.py, NEAT/services/preprocessing_overlap.py, NEAT/services/preprocessing_normalisation.py, NEAT/workers/preprocessing.py]
-source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult, LoadedImageRun, sum_loaded_image_runs, SummationWorker, clean_loaded_image_runs, OutlierFilteringWorker, filter_loaded_image_runs, FilteringWorker, correct_loaded_image_run, OverlapCorrectionWorker, normalise_loaded_image_runs, NormalisationWorker]
-test_paths: [tests/test_preprocessing_domain.py, tests/test_preprocessing_inputs.py, tests/test_preprocessing_summation.py, tests/test_preprocessing_clean.py, tests/test_preprocessing_filtering.py, tests/test_preprocessing_overlap.py, tests/test_preprocessing_normalisation.py, tests/test_preprocessing_workers.py]
+source_paths: [NEAT/domain/preprocessing.py, NEAT/domain/preprocessing_inputs.py, NEAT/domain/__init__.py, NEAT/services/preprocessing_summation.py, NEAT/services/preprocessing_clean.py, NEAT/services/preprocessing_filtering.py, NEAT/services/preprocessing_overlap.py, NEAT/services/preprocessing_normalisation.py, NEAT/services/preprocessing_normalisation_kernel.py, NEAT/services/preprocessing_normalisation_raden.py, NEAT/workers/preprocessing.py]
+source_symbols: [PreprocessingStatus, ProducedOutput, PreprocessingOperationResult, LoadedImageRun, sum_loaded_image_runs, SummationWorker, clean_loaded_image_runs, OutlierFilteringWorker, filter_loaded_image_runs, FilteringWorker, correct_loaded_image_run, OverlapCorrectionWorker, normalise_loaded_image_runs, NormalisationWorker, normalise_raden_tiff_stack, normalise_local_open_beam_frame, RadenNormalisationWorker]
+test_paths: [tests/test_preprocessing_domain.py, tests/test_preprocessing_inputs.py, tests/test_preprocessing_summation.py, tests/test_preprocessing_clean.py, tests/test_preprocessing_filtering.py, tests/test_preprocessing_overlap.py, tests/test_preprocessing_normalisation.py, tests/test_preprocessing_normalisation_raden.py, tests/test_preprocessing_workers.py]
 ---
 
 # Preprocessing input and result contracts
@@ -33,11 +33,13 @@ cancellation tokens, metadata bags, or scientific payload fields.
 The headless Summation, Clean, Filtering, Overlap Correction and classic
 Normalisation services consume `LoadedImageRun` inputs and return
 `PreprocessingOperationResult`. Their Qt worker adapters convert existing
-dictionaries at the worker boundary. Summation was the first
-adopter, Clean the second (#29), Filtering the third (#31), and Overlap
-Correction the fourth (#33); classic Normalisation is the fifth (#35). Remaining
-preprocessing workers/loaders still use their existing dictionaries and have
-not migrated to the shared result contract.
+dictionaries at the worker boundary. RADEN normalisation also returns
+`PreprocessingOperationResult`, but consumes resolved RADEN stack-info
+mappings through its own service boundary rather than `LoadedImageRun`.
+Summation was the first adopter, Clean the second (#29), Filtering the third
+(#31), Overlap Correction the fourth (#33), classic Normalisation the fifth
+(#35), and RADEN normalisation the sixth (#37). Other preprocessing
+workers/loaders retain their existing contracts until separately migrated.
 
 ## Public types
 
@@ -109,8 +111,9 @@ matters because a normal dotted import first executes the existing `NEAT` and
 `NEAT.domain` initializers, which retain their established optional ONNX and
 eager fitting/individual-edge imports. Those parent-package initialization
 behaviors are unchanged by this contract. Summation, Clean, Filtering, Overlap
-Correction and classic Normalisation have
-migrated; other Qt preprocessing workers have not.
+Correction, classic Normalisation and RADEN normalisation now have headless
+services. RADEN's service imports no Qt/UI/worker modules; other Qt
+preprocessing workers remain unmigrated.
 
 ## Loaded classic image-run input
 
@@ -164,6 +167,11 @@ of each paired sample/open-beam run and does not reject `load_errors` in the
 service. Its worker adapts one run at a time so cleared legacy sample arrays
 are not retained by snapshots across the batch.
 
+RADEN normalisation intentionally has a different input boundary: the worker
+continues to resolve missing stack info through `get_raden_tiff_stack_info`,
+then passes those resolved mappings to the headless RADEN service. It does not
+use `LoadedImageRun` or change RADEN metadata discovery.
+
 Existing loaders and other workers continue to use
 their current dictionaries. Loader-specific suffix parsing, duplicate handling
 and ordering remain unchanged. Spectra, shutter counts, masks, RADEN metadata
@@ -173,13 +181,15 @@ added to the common input model.
 
 ## Adoption boundary
 
-Summation, Clean, Filtering, Overlap Correction and classic Normalisation use
-`LoadedImageRun` and `PreprocessingOperationResult`. `SummationWorker`,
-`OutlierFilteringWorker`, `FilteringWorker`, `OverlapCorrectionWorker` and
-`NormalisationWorker` convert legacy dictionaries at their compatibility
-boundaries, delegate to headless services, and retain structured results
-alongside Qt signals and `succeeded`. For Clean and Filtering, the logical work
-unit is a successfully written image; reports and sidecars do not count.
+The five classic operation services use `LoadedImageRun` and
+`PreprocessingOperationResult`; RADEN normalisation uses resolved RADEN
+stack-info mappings and `PreprocessingOperationResult`. `SummationWorker`,
+`OutlierFilteringWorker`, `FilteringWorker`, `OverlapCorrectionWorker`,
+`NormalisationWorker` and `RadenNormalisationWorker` adapt their existing
+worker-facing inputs, delegate to headless services, and retain structured
+results alongside Qt signals and `succeeded`. For Clean and Filtering, the
+logical work unit is a successfully written image; reports and sidecars do not
+count.
 For Overlap Correction, it is a successfully written corrected FITS image;
 `expected_count` is the number of supplied frames even on setup abort, and
 sidecars do not count. Its post-image-loop completion state is preserved across
@@ -190,6 +200,15 @@ worker's legacy sample-dictionary deletion succeeds. A written FITS file is
 still retained in ordered outputs when that deletion fails. Its final status
 is sampled after per-run cleanup, sample sidecars and worker-level pacing;
 the service's `LoadedImageRun` mappings remain read-only throughout.
+
+For RADEN Normalisation, a successfully persisted TIFF page counts as one
+logical unit even though many pages share one TIFF output. `expected_count`
+remains unknown until the validated frame total is established. A saved partial
+TIFF and successfully copied sample sidecars remain in ordered outputs when
+later cancellation or a fatal page/sidecar error occurs. RADEN sidecar errors
+are fatal, and the worker preserves its per-page cancellation and final-GC
+behavior.
+
 Filtering's two progress streams and early duplicate `finished` signals remain
 legacy adapter behavior, not a general result-contract rule. Remaining
 preprocessing workers and loaders are unmigrated; their future migrations are
