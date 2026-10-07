@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: preprocessing
 audience: [user, scientist, developer]
 neat_version: 4.8.0
-verified_commit: 20b6bfa97589a9964988efffe634ccd17ecfa86b
+verified_commit: 51e65cdade5fb2b9bd89f9aa4a7ddd02c523f7e5
 status: code-verified
 instrument_applicability: [classic image folders]
 scientific_review: pending
