@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer]
 neat_version: 4.8.0
-verified_commit: 51e65cdade5fb2b9bd89f9aa4a7ddd02c523f7e5
+verified_commit: eb605978e4cbc52630ff1138866d6786c2208b0d
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
@@ -222,9 +222,26 @@ later cancellation or a fatal page/sidecar error occurs. RADEN sidecar errors
 are fatal, and the worker preserves its per-page cancellation and final-GC
 behavior.
 
-Filtering's two progress streams and early duplicate `finished` signals remain
-legacy adapter behavior, not a general result-contract rule. Apart from the
-Full Process loader/pipeline, other preprocessing loaders and orchestration
-remain unmigrated; their future migrations are later Epic #21 work and must
-define each operation's logical work unit. Full Process does not change
-scientific equations or promote its pipeline result to scientific review.
+Filtering retains its two progress streams and existing no-runs/no-mask
+messages and FAILED results. Its former duplicate `finished` emission on those
+early paths was corrected by Issue #41: all seven preprocessing Qt adapters
+now emit their public completion signal exactly once after an ordinary
+`run()`, including real `QThread.start()` execution. Each adapter derives
+`succeeded` from its retained structured result.
+
+Post-result adapter-only cleanup is best-effort. Terminal GC or the standalone
+classic Normalisation final memory report can emit
+`[WARN] Worker finalization: <error>` without changing the scientific result or
+its errors; completion is still attempted if warning delivery fails. This
+policy does not cover callbacks inside services or the Full Process pipeline.
+Per-run Normalisation GC/pacing, RADEN page-boundary GC, Full Process
+stage-completion GC, and the in-pipeline Normalisation completion callback
+retain their operation failure semantics. In particular, Issue #39's
+Full Process callback failure remains a FAILED pipeline result with its
+structured diagnostics and any operation outputs already returned.
+
+Apart from the Full Process loader/pipeline and the Issue #41 worker lifecycle
+contract, other preprocessing loaders and orchestration remain unmigrated;
+future migrations are later Epic #21 work and must define each operation's
+logical work unit. Full Process does not change scientific equations or promote
+its pipeline result to scientific review.

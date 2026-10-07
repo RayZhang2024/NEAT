@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: preprocessing
 audience: [user, scientist, developer]
 neat_version: 4.8.0
-verified_commit: e62c089a8e62f29875fc1a5232b5688363bdac5d
+verified_commit: eb605978e4cbc52630ff1138866d6786c2208b0d
 status: code-verified
 instrument_applicability: [classic image folders]
 scientific_review: pending
@@ -100,12 +100,18 @@ The open-beam spatial average uses integral images, avoiding a direct window
 loop per pixel. Progress divides successful outputs by the original number of
 sample frames, so suffix/shape/window skips can prevent 100%. The worker pauses
 five seconds after each entered run while still running and reports process
-memory at completion. Stop is checked between runs and frames, not within a
-frame. An inner-frame stop still allows entered-run clear, sidecars and `Run
-done.`; a later run boundary then reports `User stopped the process.`. Final
+memory at completion when that diagnostic succeeds. Failure in this terminal
+memory report is a nonfatal adapter warning; the structured service result is
+retained and the worker still attempts its single `finished` notification.
+Per-run GC and five-second pacing execute inside the service and retain their
+existing operation-failure semantics. Stop is checked between runs and frames,
+not within a frame. An inner-frame stop still allows entered-run clear,
+sidecars and `Run done.`; a later run boundary then reports
+`User stopped the process.`. Final
 status is sampled after sidecars and pacing, so cancellation during either can
 still produce `CANCELLED`. Early no-run/count-mismatch aborts omit the normal
-completion summary but retain worker memory reporting and one `finished`.
+completion summary but retain terminal memory reporting when available and one
+`finished`.
 
 ## Known limitations
 

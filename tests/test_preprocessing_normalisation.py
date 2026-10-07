@@ -14,7 +14,7 @@ from unittest.mock import patch
 import numpy as np
 from astropy.io import fits
 
-from NEAT.domain import LoadedImageRun, PreprocessingStatus
+from NEAT.domain import LoadedImageRun, PreprocessingOperationResult, PreprocessingStatus
 from NEAT.services import preprocessing_normalisation as service
 from NEAT.workers.batch import load_image_file
 from NEAT.workers.preprocessing import NormalisationWorker, validate_normalisation_windows
@@ -572,6 +572,34 @@ class NormalisationAdapterTests(unittest.TestCase):
             worker.copy_related_files(1, run)
             self.assertTrue((output / "Run1_a_Spectra.txt").exists())
 
+    def test_in_service_pacing_failure_remains_a_scientific_operation_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample, beam, output = (root / name for name in ("sample", "beam", "output"))
+            for folder in (sample, beam, output):
+                folder.mkdir()
+            worker = NormalisationWorker(
+                [{"folder_path": str(sample), "images": {"x": grid(1)}}],
+                [{"folder_path": str(beam), "images": {"x": grid(5)}}],
+                str(output),
+                "norm",
+                0,
+                0,
+            )
+            messages, finished = [], []
+            worker.message.connect(messages.append)
+            worker.finished.connect(lambda: finished.append(True))
+            with patch(
+                "NEAT.workers.preprocessing.QThread.sleep",
+                side_effect=RuntimeError("pacing failed inside service"),
+            ):
+                worker.run()
+            self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
+            self.assertFalse(worker.succeeded)
+            self.assertIn("pacing failed inside service", worker.result.errors)
+            self.assertFalse(any(message.startswith("[WARN] Worker finalization:") for message in messages))
+            self.assertEqual(finished, [True])
+
     def test_worker_post_write_delete_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -603,7 +631,7 @@ class NormalisationAdapterTests(unittest.TestCase):
             self.assertEqual([Path(item.path).name for item in worker.result.outputs], ["norm_a.fits", "norm_b.fits"])
             self.assertEqual(len(finished), 1)
 
-    def test_worker_fatal_path_and_unchanged_memory_reporting_failure(self):
+    def test_worker_fatal_path_and_best_effort_terminal_memory_reporting(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sample, beam, output = (root / name for name in ("sample", "beam", "output"))
@@ -621,15 +649,33 @@ class NormalisationAdapterTests(unittest.TestCase):
             self.assertEqual(worker.result.errors, ("cleanup failed",))
             self.assertEqual(messages.count("Fatal error in normalisation: cleanup failed"), 1)
             self.assertEqual(len(finished), 1)
-            # The original worker's finally block did not catch RSS-query errors;
-            # preserving that behavior means finished is not emitted in this case.
+
             worker = NormalisationWorker([], [], str(output), "norm", 0, 0)
             finished.clear()
+            messages.clear()
+            expected = PreprocessingOperationResult(
+                PreprocessingStatus.SUCCEEDED, 0, expected_count=0
+            )
+            worker.message.connect(messages.append)
             worker.finished.connect(lambda: finished.append(True))
-            with patch("NEAT.workers.preprocessing.psutil.Process", side_effect=OSError("RSS failed")):
-                with self.assertRaisesRegex(OSError, "RSS failed"):
-                    worker.run()
-            self.assertEqual(finished, [])
+            with (
+                patch(
+                    "NEAT.workers.preprocessing.normalise_loaded_image_runs",
+                    return_value=expected,
+                ),
+                patch("NEAT.workers.preprocessing.gc.collect"),
+                patch(
+                    "NEAT.workers.preprocessing.psutil.Process",
+                    side_effect=OSError("RSS failed"),
+                ),
+            ):
+                worker.run()
+            self.assertIs(worker.result, expected)
+            self.assertTrue(worker.succeeded)
+            self.assertEqual(finished, [True])
+            self.assertIn(
+                "[WARN] Worker finalization: RSS failed", messages
+            )
 
 
 if __name__ == "__main__":

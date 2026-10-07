@@ -1,17 +1,30 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from PyQt5.QtCore import QCoreApplication, QEventLoop, QThread, pyqtSignal
 
-from NEAT.domain import PreprocessingOperationResult, PreprocessingStatus
+from NEAT.domain import (
+    PreprocessingOperationResult,
+    PreprocessingStatus,
+    ProducedOutput,
+)
+from NEAT.services.preprocessing_full_process import (
+    FullProcessDiagnostic,
+    FullProcessPipelineResult,
+    FullProcessStage,
+)
 from NEAT.workers.batch import load_image_file
 from NEAT.workers.preprocessing import (
     FilteringWorker,
+    FullProcessWorker,
     NormalisationWorker,
     OutlierFilteringWorker,
     OverlapCorrectionWorker,
+    RadenNormalisationWorker,
     SummationWorker,
     validate_normalisation_windows,
 )
@@ -20,6 +33,36 @@ from NEAT.workers.preprocessing import (
 def _write_shutter_count(folder: Path, values):
     rows = np.column_stack((np.arange(len(values)), np.asarray(values)))
     np.savetxt(folder / "fixture_ShutterCount.txt", rows)
+
+
+def _operation_result(status, artifact_path):
+    errors = ("fixture failure",) if status is PreprocessingStatus.FAILED else ()
+    return PreprocessingOperationResult(
+        status,
+        1,
+        outputs=(ProducedOutput(str(artifact_path), "fixture_output"),),
+        expected_count=1,
+        errors=errors,
+        warnings=("fixture warning",),
+    )
+
+
+def _full_process_result(status, artifact_path):
+    errors = (
+        (FullProcessDiagnostic(FullProcessStage.SAMPLE_CLEAN, "fixture failure"),)
+        if status is PreprocessingStatus.FAILED
+        else ()
+    )
+    warnings = (FullProcessDiagnostic(FullProcessStage.SAMPLE_CLEAN, "fixture warning"),)
+    return FullProcessPipelineResult(
+        status,
+        (),
+        FullProcessStage.SAMPLE_CLEAN if status is PreprocessingStatus.FAILED else None,
+        FullProcessStage.SAMPLE_CLEAN if status is PreprocessingStatus.CANCELLED else None,
+        (ProducedOutput(str(artifact_path), "fixture_output"),),
+        errors,
+        warnings,
+    )
 
 
 class TestSummationWorker(unittest.TestCase):
@@ -439,12 +482,12 @@ class TestFilteringWorker(unittest.TestCase):
             self.assertTrue((separate / "Run1_a_Spectra.txt").exists())
             self.assertIn("Copied 'a_Spectra.txt' to 'Run1_a_Spectra.txt'.", copied_messages)
 
-    def test_invalid_inputs_preserve_mask_and_duplicate_early_finished(self):
+    def test_invalid_inputs_preserve_mask_and_finish_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = {"folder_path": tmp, "images": {"x": np.ones((1, 1))}}
             cases = (
-                ([], np.array([[1]]), "No filtering data runs to process.", 2),
-                ([run], None, "No mask image provided.", 2),
+                ([], np.array([[1]]), "No filtering data runs to process.", 1),
+                ([run], None, "No mask image provided.", 1),
                 ([run], np.array([[2]]), "Error during filtering: Filtering mask must be binary and contain only 0 and 1.", 1),
                 ([run], np.array([[np.nan]]), "Error during filtering: Filtering mask contains NaN or infinite values.", 1),
             )
@@ -642,6 +685,322 @@ class TestOverlapCorrectionWorker(unittest.TestCase):
 
             self.assertEqual(list(output.glob("*.fits")), [])
             self.assertFalse(worker.succeeded)
+
+
+class TestWorkerLifecycleContract(unittest.TestCase):
+    def _adapters(self, root: Path):
+        output = root / "output"
+        artifact = root / "partial-output.fits"
+        return (
+            (
+                "Clean",
+                lambda: OutlierFilteringWorker([], str(output), "clean"),
+                "NEAT.workers.preprocessing.clean_loaded_image_runs",
+            ),
+            (
+                "Summation",
+                lambda: SummationWorker([], "sum", str(output)),
+                "NEAT.workers.preprocessing.sum_loaded_image_runs",
+            ),
+            (
+                "Overlap",
+                lambda: OverlapCorrectionWorker(
+                    {"folder_path": str(root), "images": {}, "spectra": np.array([]), "shutter_count": np.array([])},
+                    "overlap",
+                    str(output),
+                ),
+                "NEAT.workers.preprocessing.correct_loaded_image_run",
+            ),
+            (
+                "classic Normalisation",
+                lambda: NormalisationWorker([], [], str(output), "norm", 0, 0),
+                "NEAT.workers.preprocessing.normalise_loaded_image_runs",
+            ),
+            (
+                "Filtering",
+                lambda: FilteringWorker([], np.ones((1, 1)), str(output), "filter"),
+                "NEAT.workers.preprocessing.filter_loaded_image_runs",
+            ),
+            (
+                "RADEN Normalisation",
+                lambda: RadenNormalisationWorker(
+                    {"info": {"fixture": "sample"}},
+                    {"info": {"fixture": "open beam"}},
+                    str(output),
+                    "raden",
+                    0,
+                    0,
+                ),
+                "NEAT.workers.preprocessing.normalise_raden_tiff_stack",
+            ),
+            (
+                "Full Process",
+                lambda: FullProcessWorker(str(root), str(root), str(output), "full", 0, 0),
+                None,
+            ),
+        )
+
+    def _result_for(self, name, status, artifact):
+        if name == "Full Process":
+            return _full_process_result(status, artifact)
+        return _operation_result(status, artifact)
+
+    def test_all_seven_adapters_retain_structured_status_and_finish_once(self):
+        statuses = (
+            PreprocessingStatus.SUCCEEDED,
+            PreprocessingStatus.FAILED,
+            PreprocessingStatus.CANCELLED,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, factory, target in self._adapters(root):
+                for status in statuses:
+                    with self.subTest(worker=name, status=status):
+                        worker = factory()
+                        expected = self._result_for(name, status, root / f"{name}.fits")
+                        finished = []
+                        worker.finished.connect(lambda: finished.append(True))
+                        if target is None:
+                            patcher = patch.object(
+                                worker,
+                                "_make_pipeline",
+                                return_value=SimpleNamespace(run=lambda: expected),
+                            )
+                        else:
+                            patcher = patch(target, return_value=expected)
+                        with patcher:
+                            worker.run()
+                        self.assertIs(worker.result, expected)
+                        self.assertEqual(worker.result.status, status)
+                        self.assertEqual(
+                            worker.succeeded,
+                            status is PreprocessingStatus.SUCCEEDED,
+                        )
+                        self.assertEqual(len(worker.result.outputs), 1)
+                        self.assertEqual(len(worker.result.warnings), 1)
+                        if status is PreprocessingStatus.FAILED:
+                            self.assertTrue(worker.result.errors)
+                        self.assertEqual(finished, [True])
+
+    def test_all_seven_adapters_build_failed_results_for_ordinary_exceptions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, factory, target in self._adapters(root):
+                with self.subTest(worker=name):
+                    worker = factory()
+                    finished = []
+                    worker.finished.connect(lambda: finished.append(True))
+                    if target is None:
+                        patcher = patch.object(
+                            worker, "_make_pipeline", side_effect=RuntimeError("service broke")
+                        )
+                    else:
+                        patcher = patch(target, side_effect=RuntimeError("service broke"))
+                    with patcher:
+                        worker.run()
+                    self.assertIsNotNone(worker.result)
+                    self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
+                    self.assertFalse(worker.succeeded)
+                    self.assertEqual(worker.result.outputs, ())
+                    if name == "Full Process":
+                        self.assertIn("service broke", worker.result.errors[0].message)
+                    else:
+                        self.assertIn("service broke", worker.result.errors)
+                    self.assertEqual(finished, [True])
+
+    def test_input_conversion_exception_returns_failed_result_without_scanning_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = SummationWorker([{}], "sum", tmp)
+            messages, finished = [], []
+            worker.message.connect(messages.append)
+            worker.finished.connect(lambda: finished.append(True))
+            worker.run()
+            self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
+            self.assertEqual(
+                worker.result.errors,
+                ("Summation run has no valid source folder.",),
+            )
+            self.assertEqual(worker.result.outputs, ())
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            self.assertFalse(worker.succeeded)
+            self.assertEqual(finished, [True])
+            self.assertEqual(
+                messages,
+                ["[FATAL] Summation aborted: Summation run has no valid source folder."],
+            )
+
+    def test_prestopped_operation_workers_pass_cancellation_to_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, factory, target in self._adapters(root):
+                with self.subTest(worker=name):
+                    worker = factory()
+                    worker.stop()
+                    finished = []
+                    worker.finished.connect(lambda: finished.append(True))
+                    expected = self._result_for(
+                        name, PreprocessingStatus.CANCELLED, root / "cancelled.fits"
+                    )
+                    if target is None:
+                        def return_cancelled():
+                            self.assertFalse(worker._is_running)
+                            return expected
+
+                        patcher = patch.object(
+                            worker,
+                            "_make_pipeline",
+                            return_value=SimpleNamespace(run=return_cancelled),
+                        )
+                    else:
+                        def cancel_at_service(*_args, **kwargs):
+                            self.assertTrue(kwargs["cancellation_check"]())
+                            return expected
+
+                        patcher = patch(target, side_effect=cancel_at_service)
+                    with patcher:
+                        worker.run()
+                    self.assertIs(worker.result, expected)
+                    self.assertEqual(worker.result.status, PreprocessingStatus.CANCELLED)
+                    self.assertFalse(worker.succeeded)
+                    self.assertEqual(finished, [True])
+
+    def test_terminal_gc_and_memory_failures_warn_without_mutating_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = _operation_result(PreprocessingStatus.SUCCEEDED, root / "kept.fits")
+            worker = SummationWorker([], "sum", str(root))
+            messages, finished = [], []
+            worker.message.connect(messages.append)
+            worker.finished.connect(lambda: finished.append(True))
+            with (
+                patch("NEAT.workers.preprocessing.sum_loaded_image_runs", return_value=expected),
+                patch("NEAT.workers.preprocessing.gc.collect", side_effect=RuntimeError("terminal GC failed")),
+            ):
+                worker.run()
+            self.assertIs(worker.result, expected)
+            self.assertTrue(worker.succeeded)
+            self.assertEqual(worker.result.errors, ())
+            self.assertEqual(worker.result.outputs, expected.outputs)
+            self.assertIn("[WARN] Worker finalization: terminal GC failed", messages)
+            self.assertEqual(finished, [True])
+
+            expected = _operation_result(PreprocessingStatus.SUCCEEDED, root / "normalised.fits")
+            worker = NormalisationWorker([], [], str(root), "norm", 0, 0)
+            messages, finished = [], []
+            worker.message.connect(messages.append)
+            worker.finished.connect(lambda: finished.append(True))
+            with (
+                patch("NEAT.workers.preprocessing.normalise_loaded_image_runs", return_value=expected),
+                patch("NEAT.workers.preprocessing.gc.collect"),
+                patch("NEAT.workers.preprocessing.psutil.Process", side_effect=OSError("RSS unavailable")),
+            ):
+                worker.run()
+            self.assertIs(worker.result, expected)
+            self.assertTrue(worker.succeeded)
+            self.assertEqual(worker.result.errors, ())
+            self.assertIn("[WARN] Worker finalization: RSS unavailable", messages)
+            self.assertFalse(any(message.startswith("<b>Final memory usage:</b>") for message in messages))
+            self.assertEqual(finished, [True])
+
+    def test_warning_emission_failure_does_not_prevent_finished_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = _operation_result(PreprocessingStatus.SUCCEEDED, Path(tmp) / "kept.fits")
+            worker = SummationWorker([], "sum", tmp)
+            finished = []
+            worker.finished.connect(lambda: finished.append(True))
+            with (
+                patch("NEAT.workers.preprocessing.sum_loaded_image_runs", return_value=expected),
+                patch("NEAT.workers.preprocessing.gc.collect", side_effect=RuntimeError("terminal GC failed")),
+                patch("NEAT.workers.preprocessing._emit_finalization_warning", side_effect=RuntimeError("warning failed")),
+            ):
+                worker.run()
+            self.assertIs(worker.result, expected)
+            self.assertTrue(worker.succeeded)
+            self.assertEqual(finished, [True])
+
+
+class TestQThreadCompletionCompatibility(unittest.TestCase):
+    def _application(self):
+        return QCoreApplication.instance() or QCoreApplication([])
+
+    def _drain_after_wait(self, app, worker, callbacks):
+        self.assertTrue(worker.wait(5000), "worker did not exit within the bounded wait")
+        self.assertFalse(worker.isRunning())
+        for _ in range(100):
+            app.processEvents(QEventLoop.AllEvents, 10)
+            if callbacks:
+                break
+
+    def test_pinned_pyqt_shadowing_distinguishes_native_and_declared_finished(self):
+        class NativeFinishedThread(QThread):
+            def run(self):
+                pass
+
+        class RedeclaredNoEmitThread(QThread):
+            finished = pyqtSignal()
+
+            def run(self):
+                pass
+
+        class RedeclaredEmitThread(QThread):
+            finished = pyqtSignal()
+
+            def run(self):
+                self.finished.emit()
+
+        app = self._application()
+        native = NativeFinishedThread()
+        native_callbacks = []
+        native.finished.connect(lambda: native_callbacks.append(True))
+        native.run()
+        self.assertEqual(native_callbacks, [])
+        native.start()
+        self._drain_after_wait(app, native, native_callbacks)
+        self.assertEqual(native_callbacks, [True])
+
+        shadowed = RedeclaredNoEmitThread()
+        shadowed_callbacks = []
+        shadowed.finished.connect(lambda: shadowed_callbacks.append(True))
+        shadowed.run()
+        self.assertEqual(shadowed_callbacks, [])
+        shadowed.start()
+        self.assertTrue(shadowed.wait(5000))
+        self.assertFalse(shadowed.isRunning())
+        for _ in range(20):
+            app.processEvents(QEventLoop.AllEvents, 10)
+        self.assertEqual(shadowed_callbacks, [])
+
+        manually_emitted = RedeclaredEmitThread()
+        manual_callbacks = []
+        manually_emitted.finished.connect(lambda: manual_callbacks.append(True))
+        manually_emitted.run()
+        self.assertEqual(manual_callbacks, [True])
+        manual_callbacks.clear()
+        manually_emitted.start()
+        self._drain_after_wait(app, manually_emitted, manual_callbacks)
+        self.assertEqual(manual_callbacks, [True])
+
+    def test_real_qthread_workers_finish_once_including_filtering_early_paths(self):
+        app = self._application()
+        with tempfile.TemporaryDirectory() as tmp:
+            run = {"folder_path": tmp, "images": {"frame": np.ones((1, 1))}}
+            workers = (
+                FilteringWorker([], np.ones((1, 1)), tmp, "no-runs"),
+                FilteringWorker([run], None, tmp, "no-mask"),
+                OutlierFilteringWorker([], tmp, "empty-clean"),
+            )
+            for worker in workers:
+                with self.subTest(worker=type(worker).__name__, runs=getattr(worker, "filtering_image_runs", None)):
+                    callbacks = []
+                    worker.finished.connect(lambda: callbacks.append(True))
+                    worker.start()
+                    self._drain_after_wait(app, worker, callbacks)
+                    self.assertEqual(callbacks, [True])
+                    self.assertIsNotNone(worker.result)
+                    self.assertEqual(
+                        worker.succeeded,
+                        worker.result.status is PreprocessingStatus.SUCCEEDED,
+                    )
 
 
 if __name__ == "__main__":

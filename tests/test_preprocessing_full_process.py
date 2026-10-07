@@ -672,6 +672,7 @@ class TestFullProcessPipeline(FullProcessFixture):
             messages[-1],
             "[ERROR] 3_normalisation failed or skipped one or more frames.",
         )
+        self.assertFalse(any(message.startswith("[WARN] Worker finalization:") for message in messages))
 
     def test_first_malformed_overlap_sidecar_does_not_fall_through(self):
         self.make_input()

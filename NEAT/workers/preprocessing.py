@@ -49,6 +49,32 @@ from ..services.preprocessing_overlap import correct_loaded_image_run
 from ..services.preprocessing_summation import sum_loaded_image_runs
 
 
+def _emit_finalization_warning(worker, error: Exception) -> None:
+    try:
+        worker.message.emit(f"[WARN] Worker finalization: {error}")
+    except Exception:
+        # A diagnostic is best-effort and must not suppress completion.
+        pass
+
+
+def _finish_worker(worker, *finalizers) -> None:
+    """Run terminal adapter cleanup without losing the structured outcome."""
+    for finalizer in finalizers:
+        try:
+            finalizer()
+        except Exception as exc:
+            try:
+                _emit_finalization_warning(worker, exc)
+            except Exception:
+                # Keep completion reachable even if warning handling is replaced.
+                pass
+    result = worker.result
+    worker.succeeded = bool(
+        result is not None and result.status is PreprocessingStatus.SUCCEEDED
+    )
+    worker.finished.emit()
+
+
 
 class OutlierFilteringWorker(QThread):
     progress_updated = pyqtSignal(int)
@@ -94,7 +120,7 @@ class OutlierFilteringWorker(QThread):
             )
             self.message.emit(f"[FATAL] {exc}")
         finally:
-            self.finished.emit()
+            _finish_worker(self)
 
     _positive_neighbor_mean = staticmethod(positive_neighbor_mean)
 
@@ -149,8 +175,7 @@ class SummationWorker(QThread):
             )
             self.message.emit(f"[FATAL] Summation aborted: {exc}")
         finally:
-            gc.collect()
-            self.finished.emit()
+            _finish_worker(self, gc.collect)
 
 
 def _loaded_image_run_from_legacy(run: dict) -> LoadedImageRun:
@@ -218,7 +243,7 @@ class OverlapCorrectionWorker(QThread):
             self.message.emit(f"Error in OverlapCorrectionWorker: {exc}")
             self.message.emit("Overlap Correction did not complete successfully.")
         finally:
-            self.finished.emit()
+            _finish_worker(self)
 
     def stop(self):
         self._is_running = False
@@ -313,11 +338,12 @@ class NormalisationWorker(QThread):
             )
             self.message.emit(f"Fatal error in normalisation: {exc}")
         finally:
-            gc.collect()
-            proc = psutil.Process(os.getpid())
-            memMB = proc.memory_info().rss / (1024.**2)
-            self.message.emit(f"<b>Final memory usage:</b> {memMB:.1f} MB")
-            self.finished.emit()
+            _finish_worker(self, gc.collect, self._report_final_memory)
+
+    def _report_final_memory(self):
+        proc = psutil.Process(os.getpid())
+        memMB = proc.memory_info().rss / (1024.**2)
+        self.message.emit(f"<b>Final memory usage:</b> {memMB:.1f} MB")
 
     def stop(self):
         self._is_running = False
@@ -434,12 +460,7 @@ class FullProcessWorker(QThread):
                 )
             self.message.emit(f"[ERROR] {exc}")
         finally:
-            self.succeeded = bool(
-                self.result is not None
-                and self.result.status is PreprocessingStatus.SUCCEEDED
-            )
-            gc.collect()
-            self.finished.emit()
+            _finish_worker(self, gc.collect)
 
     def stop(self):
         self._is_running = False
@@ -532,9 +553,6 @@ class FilteringWorker(QThread):
                 summary_path_callback=self._set_summary_path,
             )
             self.succeeded = self.result.status is PreprocessingStatus.SUCCEEDED
-            if not self.filtering_image_runs or self.filtering_mask is None:
-                self.finished.emit()  # Preserve the legacy early-return signal.
-                return
         except Exception as exc:
             self.succeeded = False
             self.result = PreprocessingOperationResult(
@@ -542,8 +560,7 @@ class FilteringWorker(QThread):
             )
             self.message.emit(f"Error during filtering: {exc}")
         finally:
-            gc.collect()
-            self.finished.emit()
+            _finish_worker(self, gc.collect)
 
     def _set_validated_mask(self, mask: np.ndarray) -> None:
         self.filtering_mask = mask
@@ -664,8 +681,7 @@ class RadenNormalisationWorker(QThread):
             )
             self.message.emit(f"Fatal error in RADEN normalisation: {exc}")
         finally:
-            gc.collect()
-            self.finished.emit()
+            _finish_worker(self, gc.collect)
 
     def stop(self):
         self._is_running = False
