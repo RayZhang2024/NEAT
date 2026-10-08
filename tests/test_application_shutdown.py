@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from NEAT.ui import main_window as main_window_module
 from NEAT.ui.assistant_panel import AssistantDockWidget
 from NEAT.ui.main_window import FitsViewer
+from NEAT.ui.mixins import fitting as fitting_module
 from NEAT.ui.preprocessing_worker_registry import PreprocessingWorkerRegistry
 from NEAT.ui.assistant_settings_dialog import AssistantSettingsDialog
 from tools.assistant_providers import AssistantSettings
@@ -52,6 +53,34 @@ class _EarlyFinishedThread(_ControlledThread):
 
     def publish_finished_early(self):
         self.finished.emit("partial.csv")
+
+
+class _LateCallbacksThread(QThread):
+    finished = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def run(self):
+        self.entered.set()
+        self.release.wait(4)
+        self.finished.emit("late.csv")
+        self.progress.emit("progress after completion")
+
+
+class _ControlledBatchFitThread(_ControlledThread):
+    progress_updated = pyqtSignal(int)
+    message = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    current_box_changed = pyqtSignal(int, int)
+
+    def run(self):
+        self.entered.set()
+        self.release.wait(4)
+        self.finished.emit("")
 
 
 class _NonblockingLegacyClearThread(_ControlledThread):
@@ -234,6 +263,49 @@ class ApplicationShutdownTests(unittest.TestCase):
         self._wait_for(lambda: not window._shutdown_close_pending)
         self.assertTrue(window.close())
 
+    def test_queued_callbacks_after_public_completion_run_before_worker_retirement(self):
+        window = _ShutdownHarness()
+        worker = _LateCallbacksThread()
+        delivered = []
+        window._track_shutdown_worker(worker, "batch_fit")
+        window._connect_shutdown_worker_signal(
+            worker,
+            worker.finished,
+            lambda value: delivered.append(
+                ("finished", value, worker in window._shutdown_worker_inventory.workers)
+            ),
+        )
+        window._connect_shutdown_worker_signal(
+            worker,
+            worker.progress,
+            lambda value: delivered.append(
+                ("progress", value, worker in window._shutdown_worker_inventory.workers)
+            ),
+        )
+        worker.start()
+        self.assertTrue(worker.entered.wait(1))
+
+        worker.release.set()
+        self.assertTrue(worker.wait(1000))
+        record = window._shutdown_worker_inventory._records[id(worker)]
+        with record.pending_callbacks_lock:
+            self.assertEqual(record.pending_callbacks, 2)
+
+        window._shutdown_worker_inventory._poll_record(record)
+        self.assertTrue(record.exit_confirmed)
+        self.assertIn(worker, window._shutdown_worker_inventory.workers)
+        self.app.processEvents(QEventLoop.AllEvents, 10)
+        self._wait_for(lambda: not window._shutdown_worker_inventory.workers)
+
+        self.assertEqual(
+            delivered,
+            [
+                ("finished", "late.csv", True),
+                ("progress", "progress after completion", True),
+            ],
+        )
+        self.assertTrue(window.close())
+
     def test_superseded_loader_instances_remain_owned_and_identity_safe(self):
         window = _ShutdownHarness()
         old = _ControlledThread()
@@ -328,6 +400,94 @@ class ApplicationShutdownTests(unittest.TestCase):
                 self._wait_for(lambda: not window._shutdown_worker_inventory.workers)
                 self._wait_for(lambda: not window._shutdown_close_pending)
                 self.assertTrue(window.close())
+
+    def test_batch_fit_can_restart_after_retirement_and_stop_is_none_safe(self):
+        window = _ShutdownHarness()
+        input_values = {
+            "box_width_input": "1",
+            "box_height_input": "1",
+            "step_x_input": "1",
+            "step_y_input": "1",
+            "min_x_input": "0",
+            "max_x_input": "2",
+            "min_y_input": "0",
+            "max_y_input": "2",
+        }
+        for attribute, value in input_values.items():
+            widget = Mock()
+            widget.text.return_value = value
+            setattr(window, attribute, widget)
+        window.fitted_s_values = [0.1]
+        window.fitted_t_values = [0.2]
+        window.work_directory = "test-output"
+        window._confirm_batch_box_size = Mock(return_value=True)
+        window._build_batch_fit_context = Mock(return_value={})
+        window.fix_s_enabled = Mock(return_value=False)
+        window.fix_t_enabled = Mock(return_value=False)
+        window.fix_eta_enabled = Mock(return_value=False)
+        window.interpolation_checkbox = Mock()
+        window.interpolation_checkbox.isChecked.return_value = False
+        window.batch_progress_bar = Mock()
+        window.batch_progress_label = Mock()
+        window.batch_remaining_time_label = Mock()
+        window.batch_progress_dialog = Mock()
+        window.update_timer = QTimer(window)
+        workers = []
+
+        def make_worker(**_kwargs):
+            worker = _ControlledBatchFitThread()
+            workers.append(worker)
+            return worker
+
+        with patch.object(
+            fitting_module, "BatchFitWorker", side_effect=make_worker
+        ):
+            window.batch_fit()
+            first = workers[0]
+            self.assertTrue(first.entered.wait(1))
+
+            window.batch_fit()
+            window.batch_fit_edges()
+            self.assertEqual(len(workers), 1)
+
+            first.release.set()
+            self._wait_for(lambda: first not in window._shutdown_worker_inventory.workers)
+            self._wait_for(lambda: window.batch_fit_worker is None)
+
+            window.stop_batch_fit()
+            self.assertIn(
+                "No batch fitting is currently running.",
+                window.message_box.toPlainText(),
+            )
+
+            window.batch_fit()
+            self.assertEqual(len(workers), 2)
+            second = workers[1]
+            self.assertTrue(second.entered.wait(1))
+            second.release.set()
+            self._wait_for(lambda: second not in window._shutdown_worker_inventory.workers)
+            self._wait_for(lambda: window.batch_fit_worker is None)
+
+        self.assertTrue(window.close())
+
+    def test_batch_fit_is_blocked_while_edge_fit_is_not_safely_retired(self):
+        window = _ShutdownHarness()
+        worker = _ControlledThread()
+        self._start_tracked(
+            window, worker, "batch_fit_edges", "batch_fit_edges_worker"
+        )
+
+        window.batch_fit()
+
+        self.assertIs(window.batch_fit_edges_worker, worker)
+        self.assertIn(
+            "already active or finishing", window.message_box.toPlainText()
+        )
+        self.assertEqual(set(window._shutdown_worker_inventory.workers), {worker})
+        worker.release.set()
+        self._wait_for(lambda: not window._shutdown_worker_inventory.workers)
+        self._wait_for(lambda: window.batch_fit_edges_worker is None)
+        self.assertTrue(window.close())
 
     def test_registry_worker_stop_and_retry_uses_generation_quiescence(self):
         window = _ShutdownHarness()
@@ -560,6 +720,52 @@ class ApplicationShutdownTests(unittest.TestCase):
         window.save_user_settings.assert_not_called()
         worker.release.set()
         self._wait_for(lambda: not window._shutdown_worker_inventory.workers)
+        self.assertTrue(window.cleanup_resources())
+        self.assertEqual(window.images, [])
+        window.close()
+
+    def test_cleanup_display_refresh_observes_cleared_image_state_once(self):
+        window = _ShutdownHarness()
+        observed = []
+        window.display_image.side_effect = lambda: observed.append(
+            (
+                window.images,
+                window.intensities.size,
+                window.tof_array,
+                window.wavelengths.size,
+                window.manual_wavelength_mode,
+            )
+        )
+
+        self.assertTrue(window.cleanup_resources())
+        self.assertTrue(window.cleanup_resources())
+
+        self.assertEqual(observed, [([], 0, None, 0, False)])
+
+    def test_finished_assistant_worker_in_retirement_inventory_blocks_cleanup(self):
+        class FinishedAssistantThread(QThread):
+            def run(self):
+                return
+
+        assistant = _Assistant()
+        worker = FinishedAssistantThread()
+        assistant.worker = worker
+        assistant._retiring_workers = {id(worker): worker}
+        worker.start()
+        self.assertTrue(worker.wait(1000))
+        self.assertFalse(worker.isRunning())
+
+        window = _ShutdownHarness(assistant)
+        original_images = window.images
+        self.assertFalse(window.cleanup_resources())
+
+        self.assertIs(window.images, original_images)
+        window.display_image.assert_not_called()
+        assistant.worker = None
+        self.assertFalse(window.cleanup_resources())
+        self.assertIs(window.images, original_images)
+        window.display_image.assert_not_called()
+        assistant._retiring_workers.clear()
         self.assertTrue(window.cleanup_resources())
         self.assertEqual(window.images, [])
         window.close()

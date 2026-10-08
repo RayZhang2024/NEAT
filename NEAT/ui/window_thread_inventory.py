@@ -7,13 +7,15 @@ application update-check thread; it is not a workflow or task manager.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import threading
 from typing import Any, Callable, cast
 
 from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 
 
 _QUEUED_CONNECTION = cast(Any, Qt).QueuedConnection
+_DIRECT_CONNECTION = cast(Any, Qt).DirectConnection
 
 
 @dataclass
@@ -29,6 +31,9 @@ class _ThreadRecord:
     stop_error: str | None = None
     grace_timer: QTimer | None = None
     settle_scheduled: bool = False
+    retirement_ready: bool = False
+    pending_callbacks: int = 0
+    pending_callbacks_lock: Any = field(default_factory=threading.Lock, repr=False)
 
 
 class _ThreadSignalProxy(QObject):
@@ -104,21 +109,38 @@ class WindowThreadInventory(QObject):
     def connect_guarded(self, worker: QThread, signal, callback: Callable, *, current_attribute: str | None = None) -> None:
         """Queue a legacy UI callback and suppress it after cancellation/supersession."""
         key = id(worker)
-        if key not in self._records:
+        record = self._records.get(key)
+        if record is None:
             raise RuntimeError("Worker must be tracked before connecting UI callbacks")
 
-        def dispatch(*args):
-            record = self._records.get(key)
-            if record is None or record.callbacks_suppressed:
-                return
-            owner = self.parent()
-            if current_attribute is not None and getattr(owner, current_attribute, None) is not worker:
-                return
-            try:
-                callback(*args)
-            except RuntimeError as exc:
-                self.diagnostic.emit(f"[WARN] {worker.__class__.__name__} UI callback failed: {exc}.")
+        def mark_callback_pending(*_args) -> None:
+            with record.pending_callbacks_lock:
+                record.pending_callbacks += 1
 
+        def dispatch(*args):
+            try:
+                if self._records.get(key) is not record or record.callbacks_suppressed:
+                    return
+                owner = self.parent()
+                if (
+                    current_attribute is not None
+                    and getattr(owner, current_attribute, None) is not worker
+                ):
+                    return
+                try:
+                    callback(*args)
+                except RuntimeError as exc:
+                    self.diagnostic.emit(
+                        f"[WARN] {worker.__class__.__name__} UI callback failed: {exc}."
+                    )
+            finally:
+                with record.pending_callbacks_lock:
+                    record.pending_callbacks -= 1
+                    callbacks_pending = record.pending_callbacks
+                if record.retirement_ready and callbacks_pending == 0:
+                    self._schedule_retirement(record)
+
+        cast(Any, signal).connect(mark_callback_pending, _DIRECT_CONNECTION)
         cast(Any, signal).connect(dispatch, _QUEUED_CONNECTION)
 
     def suppress_callbacks(self, worker: QThread) -> None:
@@ -229,17 +251,25 @@ class WindowThreadInventory(QObject):
         self._schedule_retirement(record)
 
     def _schedule_retirement(self, record: _ThreadRecord) -> None:
-        if record.settle_scheduled or id(record.worker) not in self._records:
+        if id(record.worker) not in self._records:
+            return
+        record.retirement_ready = True
+        with record.pending_callbacks_lock:
+            if record.pending_callbacks:
+                return
+        if record.settle_scheduled:
             return
         record.settle_scheduled = True
-        # Allow all signals queued before native thread exit (including UI
-        # completion handlers connected after this proxy) to reach the GUI.
-        QTimer.singleShot(25, lambda rec=record: self._retire(rec))
+        self._retire(record)
 
     def _retire(self, record: _ThreadRecord) -> None:
         key = id(record.worker)
         if key not in self._records or not record.exit_confirmed:
             return
+        with record.pending_callbacks_lock:
+            if record.pending_callbacks:
+                record.settle_scheduled = False
+                return
         if record.grace_timer is not None:
             record.grace_timer.stop()
             record.grace_timer.deleteLater()

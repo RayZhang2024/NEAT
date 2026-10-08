@@ -1271,13 +1271,9 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             return True
         assistant = getattr(self, "assistant_dock", None)
         assistant_worker = getattr(assistant, "worker", None)
-        assistant_live = bool(getattr(assistant, "_retiring_workers", {}))
-        if assistant_worker is not None:
-            try:
-                assistant_live = assistant_worker.isRunning()
-            except RuntimeError:
-                assistant_live = True
-        if assistant_live or self._has_shutdown_managed_work() or (
+        assistant_unsettled = bool(getattr(assistant, "_retiring_workers", {}))
+        assistant_unsettled = assistant_unsettled or assistant_worker is not None
+        if assistant_unsettled or self._has_shutdown_managed_work() or (
             self._shutdown_close_pending and not self._shutdown_committed
         ):
             self._shutdown_diagnostic(
@@ -1287,12 +1283,12 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
 
         if hasattr(self, "image_slider"):
             self.image_slider.setEnabled(False)
-        self.display_image()
         self.images = []
         self.intensities = np.array([])
         self.tof_array = None
         self.wavelengths = np.array([])
         self.manual_wavelength_mode = False
+        self.display_image()
         self._shutdown_cleanup_done = True
         return True
 

@@ -1504,6 +1504,19 @@ class FittingMixin:
 
         dialog.exec_()
 
+    def _batch_fit_has_unsettled_workers(self):
+        """Return whether either batch-fit family is active or still retiring."""
+        inventory = getattr(self, "_shutdown_worker_inventory", None)
+        for role, attribute in (
+            ("batch_fit", "batch_fit_worker"),
+            ("batch_fit_edges", "batch_fit_edges_worker"),
+        ):
+            if getattr(self, attribute, None) is not None:
+                return True
+            if inventory is not None and inventory.has_role(role):
+                return True
+        return False
+
     def batch_fit_edges(self):
         """
         Initiates the batch fitting process over the ROI using the 'fit_region' approach
@@ -1512,6 +1525,11 @@ class FittingMixin:
         if getattr(self, "_shutdown_close_pending", False) or getattr(
             self, "_shutdown_committed", False
         ):
+            return
+        if self._batch_fit_has_unsettled_workers():
+            self.message_box.append(
+                "A batch fitting operation is already active or finishing."
+            )
             return
         if getattr(self, "fitting_data_source", "images") == "profile":
             self.message_box.append("Mapping is not available for imported intensity profiles.")
@@ -5592,6 +5610,11 @@ class FittingMixin:
             self, "_shutdown_committed", False
         ):
             return
+        if self._batch_fit_has_unsettled_workers():
+            self.message_box.append(
+                "A batch fitting operation is already active or finishing."
+            )
+            return
         if getattr(self, "fitting_data_source", "images") == "profile":
             self.message_box.append("Mapping is not available for imported intensity profiles.")
             return
@@ -5624,10 +5647,6 @@ class FittingMixin:
                 "Initial Fit Required",
                 "Please perform an initial full pattern fitting before starting batch fitting."
             )
-            return
-
-        if hasattr(self, 'batch_fit_worker') and self.batch_fit_worker.isRunning():
-            self.message_box.append("Batch fitting is already in progress.")
             return
 
         # Warn if the batch box differs from the picked macro-pixel size
@@ -5726,16 +5745,23 @@ class FittingMixin:
 
         stopped_any = False
 
-        # Stop the standard batch-fit worker
-        if hasattr(self, 'batch_fit_worker') and self.batch_fit_worker.isRunning():
-            self._request_shutdown_worker_stop(self.batch_fit_worker)
-            self.message_box.append("Stop requested for BatchFitWorker. Please wait...")
-            stopped_any = True
-
-        # Stop the edges batch-fit worker
-        if hasattr(self, 'batch_fit_edges_worker') and self.batch_fit_edges_worker.isRunning():
-            self._request_shutdown_worker_stop(self.batch_fit_edges_worker)
-            self.message_box.append("Stop requested for BatchFitEdgesWorker. Please wait...")
+        for attribute, worker_name in (
+            ("batch_fit_worker", "BatchFitWorker"),
+            ("batch_fit_edges_worker", "BatchFitEdgesWorker"),
+        ):
+            worker = getattr(self, attribute, None)
+            if worker is None:
+                continue
+            try:
+                is_running = worker.isRunning()
+            except (AttributeError, RuntimeError):
+                is_running = False
+            if not is_running:
+                continue
+            self._request_shutdown_worker_stop(worker)
+            self.message_box.append(
+                f"Stop requested for {worker_name}. Please wait..."
+            )
             stopped_any = True
 
         # If neither was running, inform the user

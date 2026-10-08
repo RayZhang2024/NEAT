@@ -222,11 +222,14 @@ the pending guard is reset so normal work can resume.
 loaders, both batch-fitting workers and the update-check thread. It records
 workers before `start()`, independent of replaceable convenience attributes,
 and suppresses stale queued UI callbacks after cancellation or supersession.
-An update check cannot be cooperatively interrupted, so it remains tracked
-until actual thread exit. Worker references and their signal proxies are not
-cleared or deleted while native execution may continue. Exceptions from stop
-requests are diagnostic only and never treated as proof of exit. There is no
-forceful `terminate()` path.
+Each guarded signal callback is counted at emission and released after its
+GUI-thread handler has run (or been suppressed). Retirement requires verified
+native exit and an empty callback count, so late or reordered queued handlers
+do not depend on a fixed settling delay. An update check cannot be cooperatively
+interrupted, so it remains tracked until actual thread exit. Worker references
+and their signal proxies are not cleared or deleted while native execution may
+continue. Exceptions from stop requests are diagnostic only and never treated
+as proof of exit. There is no forceful `terminate()` path.
 
 After quiescence is verified, the second close request preserves the
 Assistant's established shutdown contract: request interruption and wait up
