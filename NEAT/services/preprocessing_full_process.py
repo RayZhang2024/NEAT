@@ -22,6 +22,7 @@ from .preprocessing_layout import discover_full_process_summation
 from .preprocessing_normalisation import normalise_loaded_image_runs
 from .preprocessing_normalisation import validate_normalisation_windows
 from .preprocessing_overlap import correct_loaded_image_run
+from .preprocessing_overlap_inputs import prepare_overlap_inputs
 from .preprocessing_summation import sum_loaded_image_runs
 
 ProgressCallback = Callable[[int], None]
@@ -107,13 +108,16 @@ class _StageBuilder:
 def load_full_process_run(
     folder: str,
     *,
+    image_paths: tuple[str, ...] | list[str] | None = None,
     progress_callback: ProgressCallback | None = None,
     message_callback: MessageCallback | None = None,
 ) -> LoadedImageRun:
-    """Load one Full Process FITS/TIFF folder in raw filesystem order.
+    """Load one Full Process FITS/TIFF folder.
 
     This intentionally has no cancellation check: a loader invocation always
-    processes every eligible file, matching the historical worker.
+    processes every selected file, matching the historical worker. When a
+    producer manifest is supplied, only files produced by that stage are
+    loaded and other image files are reported as unmanifested.
     """
     frames: dict[str, np.ndarray] = {}
     errors: list[str] = []
@@ -124,11 +128,23 @@ def load_full_process_run(
 
     short_path = _short_path(folder, levels=2)
     try:
-        filenames = [
+        folder_filenames = os.listdir(folder)
+        eligible = [
             filename
-            for filename in os.listdir(folder)
+            for filename in folder_filenames
             if filename.lower().endswith((".fits", ".fit", ".tiff", ".tif"))
         ]
+        if image_paths is None:
+            filenames = eligible
+        else:
+            filenames = [os.path.basename(os.fspath(path)) for path in image_paths]
+            selected = set(filenames)
+            stale = sorted(set(eligible) - selected)
+            if stale and message_callback is not None:
+                message_callback(
+                    f"Ignored {len(stale)} unmanifested image(s) in '{folder}'; "
+                    f"first: {stale[0]}"
+                )
         total = len(filenames)
         for processed, filename in enumerate(filenames, start=1):
             stem = os.path.splitext(filename)[0]
@@ -168,6 +184,24 @@ def _short_path(path: str, *, levels: int = 2) -> str:
     normalized = os.path.normpath(path)
     parts = normalized.split(os.sep)
     return os.path.join(*parts[-levels:]) if len(parts) >= levels else normalized
+
+
+def _path_key(path: str) -> str:
+    """Normalize folder keys for producer manifests on Windows and Unix."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _list_sidecar_paths(folder: str) -> tuple[str, ...]:
+    """Snapshot sidecars present in a current source folder."""
+    try:
+        return tuple(
+            os.path.join(folder, filename)
+            for filename in sorted(os.listdir(folder))
+            if filename.endswith(("_Spectra.txt", "_ShutterCount.txt"))
+            and os.path.isfile(os.path.join(folder, filename))
+        )
+    except OSError:
+        return ()
 
 
 class FullProcessPipeline:
@@ -216,6 +250,10 @@ class FullProcessPipeline:
         self._cancelled_stage: FullProcessStage | None = None
         self._current: _StageBuilder | None = None
         self._overall_status = PreprocessingStatus.SUCCEEDED
+        self._stage_image_manifests: dict[str, tuple[str, ...]] = {}
+        self._stage_sidecar_manifests: dict[str, tuple[str, ...]] = {}
+        self._normalisation_output_folder: str | None = None
+        self._normalised_image_manifest: tuple[str, ...] = ()
 
     def run(self) -> FullProcessPipelineResult:
         self._message("=== <b>Full Process Pipeline Started</b> ===")
@@ -253,6 +291,7 @@ class FullProcessPipeline:
             self.do_normalisation(sample_overlap, beam_overlap)
             if not self._continue(FullProcessStage.NORMALISATION, "normalisation", None, None):
                 return self.result()
+            self._prune_stale_normalised_images()
             self._progress(0)
             self._message("=== <b>Full Process Completed Successfully</b> ===")
         except _StageAbort:
@@ -301,6 +340,26 @@ class FullProcessPipeline:
             )
             builder.outcome = FullProcessStageOutcome.SKIPPED
             builder.propagation_folder = folder
+            sidecar_paths = _list_sidecar_paths(folder)
+            ambiguities = []
+            for suffix, kind in (
+                ("_Spectra.txt", "Spectra"),
+                ("_ShutterCount.txt", "ShutterCount"),
+            ):
+                matches = [
+                    os.path.basename(path)
+                    for path in sidecar_paths
+                    if os.path.basename(path).endswith(suffix)
+                ]
+                if len(matches) > 1:
+                    ambiguities.append(
+                        f"ambiguous source {kind} sidecars: {', '.join(matches)}"
+                    )
+            if ambiguities:
+                raise RuntimeError(
+                    f"0_summation_{label}: {'; '.join(ambiguities)} in '{short}'."
+                )
+            self._stage_sidecar_manifests[_path_key(folder)] = sidecar_paths
             self._record(builder)
             return folder
 
@@ -353,6 +412,16 @@ class FullProcessPipeline:
             builder.propagation_folder = folder
             self._record(builder)
             self._abort_for_result(stage, operation_result, f"0_summation_{label} failed.")
+        self._stage_image_manifests[_path_key(out_folder)] = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role == "summed_image"
+        )
+        self._stage_sidecar_manifests[_path_key(out_folder)] = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role in {"summed_shutter_count", "spectrum_copy"}
+        )
         if self._parent_running():
             self._message(
                 f"<b>0_sumation_{label} complete</b>, saved at: "
@@ -378,8 +447,11 @@ class FullProcessPipeline:
         builder = self._begin(stage, branch, folder)
         short = _short_path(folder)
         self._message(f"1_clean_{label}: Starting Outlier Removal on \\{short}...")
+        manifest = self._stage_image_manifests.get(_path_key(folder))
+        related_files = self._stage_sidecar_manifests.get(_path_key(folder), ())
         run = load_full_process_run(
             folder,
+            image_paths=manifest,
             progress_callback=self._load_progress,
             message_callback=self._message,
         )
@@ -402,6 +474,7 @@ class FullProcessPipeline:
                 progress_callback=self._progress,
                 message_callback=self._message,
                 cancellation_check=token.is_set,
+                related_files_by_run=(related_files,),
             )
         except Exception as exc:
             raise _StageOperationFailure(
@@ -420,6 +493,16 @@ class FullProcessPipeline:
                 operation_result,
                 f"1_clean_{label} failed or skipped frames.",
             )
+        self._stage_image_manifests[_path_key(out_folder)] = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role == "cleaned_image"
+        )
+        self._stage_sidecar_manifests[_path_key(out_folder)] = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role == "related_file_copy"
+        )
         if self._parent_running():
             self._message(
                 f"<b>1_clean_{label} complete</b>, saved at: "
@@ -445,57 +528,23 @@ class FullProcessPipeline:
         builder = self._begin(stage, branch, folder)
         short = _short_path(folder)
         self._message(f"2_correction_{label}: Starting Overlap Correction on \\{short}...")
-        run = load_full_process_run(
+        manifest = self._stage_image_manifests.get(_path_key(folder))
+        prepared = prepare_overlap_inputs(
             folder,
+            image_paths=manifest,
+            related_files=self._stage_sidecar_manifests.get(_path_key(folder), ()),
+            stage=f"2_correction_{label}",
             progress_callback=self._load_progress,
             message_callback=self._message,
         )
-        if not run.frames:
-            raise RuntimeError(f"2_correction_{label}: no images found in \\{short}.")
-        if run.load_errors:
-            raise RuntimeError(
-                f"2_correction_{label}: one or more input frames could not be loaded."
-            )
-        try:
-            files = os.listdir(folder)
-        except Exception as exc:
-            raise RuntimeError(f"2_correction_{label}: cannot access \\{short}: {exc}") from exc
-        spectra_path = next(
-            (os.path.join(folder, name) for name in files if name.endswith("_Spectra.txt")),
-            None,
-        )
-        spectra = None
-        if spectra_path:
-            try:
-                spectra = np.loadtxt(spectra_path)
-            except Exception as exc:
-                self._message(f"2_correction_{label}: Error loading Spectra: {exc}")
-        shutter_path = next(
-            (os.path.join(folder, name) for name in files if name.endswith("_ShutterCount.txt")),
-            None,
-        )
-        shutter = None
-        if shutter_path:
-            try:
-                counts = np.loadtxt(shutter_path)
-                shutter = counts[counts != 0]
-            except Exception as exc:
-                self._message(f"2_correction_{label}: Error loading ShutterCount: {exc}")
-        if spectra is None or shutter is None:
-            raise RuntimeError(
-                f"2_correction_{label}: Spectra or ShutterCount is missing; "
-                "Full Process requires overlap correction."
-            )
         original_name = os.path.basename(folder.rstrip(os.sep))
         out_folder = os.path.join(self.output_folder, f"2_corrected_{original_name}")
-        os.makedirs(out_folder, exist_ok=True)
-        builder.artifact_folder = out_folder
         token = self._start_operation(stage)
         try:
             operation_result = correct_loaded_image_run(
-                run,
-                spectra,
-                shutter,
+                prepared.run,
+                prepared.spectra_data,
+                prepared.shutter_count_data,
                 f"corrected_{original_name}",
                 out_folder,
                 progress_callback=self._progress,
@@ -504,6 +553,11 @@ class FullProcessPipeline:
                 fatal_error_callback=lambda exc: self._message(
                     f"Error in OverlapCorrectionWorker: {exc}"
                 ),
+                preflight_errors=prepared.errors,
+                expected_count=prepared.expected_count,
+                spectra_filename=prepared.spectra_filename,
+                related_files=prepared.related_files,
+                preflight_warnings=prepared.warnings,
             )
         except Exception as exc:
             self._message(f"Error in OverlapCorrectionWorker: {exc}")
@@ -516,11 +570,24 @@ class FullProcessPipeline:
             self._stage_completed()
         builder.operation_result = operation_result
         if operation_result.status is not PreprocessingStatus.SUCCEEDED:
+            if operation_result.outputs:
+                builder.artifact_folder = out_folder
             builder.outcome = self._operation_outcome(operation_result)
             builder.propagation_folder = folder
             self._record(builder)
             self._abort_for_result(stage, operation_result, f"2_correction_{label} failed.")
+        self._stage_image_manifests[_path_key(out_folder)] = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role == "corrected_image"
+        )
+        self._stage_sidecar_manifests[_path_key(out_folder)] = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role == "related_file_copy"
+        )
         if self._parent_running():
+            builder.artifact_folder = out_folder
             self._message(
                 f"<b>2_correction_{label} complete</b>, saved at: "
                 f"<b>\\{_short_path(out_folder, levels=3)}</b>"
@@ -545,11 +612,13 @@ class FullProcessPipeline:
         )
         sample = load_full_process_run(
             sample_folder,
+            image_paths=self._stage_image_manifests.get(_path_key(sample_folder), ()),
             progress_callback=self._load_progress,
             message_callback=self._message,
         )
         beam = load_full_process_run(
             open_beam_folder,
+            image_paths=self._stage_image_manifests.get(_path_key(open_beam_folder), ()),
             progress_callback=self._load_progress,
             message_callback=self._message,
         )
@@ -562,6 +631,12 @@ class FullProcessPipeline:
                 "Normalisation cannot start because one or more input frames "
                 "could not be loaded."
             )
+        sample_sidecars = self._stage_sidecar_manifests.get(
+            _path_key(sample_folder), ()
+        )
+        open_beam_sidecars = self._stage_sidecar_manifests.get(
+            _path_key(open_beam_folder), ()
+        )
         out_folder = os.path.join(self.output_folder, "3_normalised_original")
         os.makedirs(out_folder, exist_ok=True)
         builder.artifact_folder = out_folder
@@ -583,6 +658,8 @@ class FullProcessPipeline:
                 fatal_error_callback=lambda exc: self._message(
                     f"Fatal error in normalisation: {exc}"
                 ),
+                sample_sidecars_by_run=(sample_sidecars,),
+                open_beam_sidecars_by_run=(open_beam_sidecars,),
             )
         except Exception as exc:
             operation_error = exc
@@ -615,6 +692,12 @@ class FullProcessPipeline:
                 operation_result,
                 "3_normalisation failed or skipped one or more frames.",
             )
+        self._normalisation_output_folder = out_folder
+        self._normalised_image_manifest = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role == "normalised_image"
+        )
         if self._parent_running():
             self._message(
                 f"<b>3_normalisation complete</b>, saved at: "
@@ -626,6 +709,34 @@ class FullProcessPipeline:
             self._cancelled_stage = stage
         builder.outcome = FullProcessStageOutcome.SUCCEEDED
         self._record(builder)
+
+    def _prune_stale_normalised_images(self) -> None:
+        """Remove obsolete images from the Full Process owned output namespace."""
+        output_folder = self._normalisation_output_folder
+        if output_folder is None or not self._normalised_image_manifest:
+            return
+
+        output_root = os.path.normcase(os.path.abspath(output_folder))
+        current_images = {
+            os.path.normcase(os.path.abspath(path))
+            for path in self._normalised_image_manifest
+        }
+        # A malformed or unexpected manifest must never broaden cleanup beyond
+        # the known Full Process output directory.
+        if any(os.path.dirname(path) != output_root for path in current_images):
+            return
+
+        for filename in os.listdir(output_folder):
+            if not (
+                filename.startswith("normalised_")
+                and filename.endswith(".fits")
+            ):
+                continue
+            path = os.path.join(output_folder, filename)
+            if not os.path.isfile(path):
+                continue
+            if os.path.normcase(os.path.abspath(path)) not in current_images:
+                os.remove(path)
 
     def _begin(
         self, stage: FullProcessStage, branch: str | None, input_folder: str | None

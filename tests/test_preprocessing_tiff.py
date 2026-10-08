@@ -53,7 +53,7 @@ class TestFullProcessWorkerTiffLoading(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(
-                RuntimeError, "Full Process requires overlap correction"
+                RuntimeError, "2_correction_Sample failed"
             ):
                 worker.do_overlap_correction(str(input_folder), "Sample")
 

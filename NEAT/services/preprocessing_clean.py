@@ -143,8 +143,13 @@ def clean_loaded_image_runs(
     message_callback: MessageCallback | None = None,
     cancellation_check: CancellationCheck | None = None,
     frame_failure_callback: FrameFailureCallback | None = None,
+    related_files_by_run: Sequence[Sequence[str]] | None = None,
 ) -> PreprocessingOperationResult:
-    """Persist Clean artifacts, retaining partial outputs on failure or stop."""
+    """Persist Clean artifacts, retaining partial outputs on failure or stop.
+
+    When supplied, ``related_files_by_run`` limits copied sidecars to files
+    selected by the current pipeline run instead of rescanning source folders.
+    """
     expected_count = sum(len(run.frames) for run in runs)
     report_path = os.path.join(output_folder, f"{base_name}_outlier_report.csv")
     outputs: list[ProducedOutput] = []
@@ -171,6 +176,8 @@ def clean_loaded_image_runs(
         )
 
     try:
+        if related_files_by_run is not None and len(related_files_by_run) != len(runs):
+            raise ValueError("related_files_by_run must contain one entry per run.")
         os.makedirs(output_folder, exist_ok=True)
         try:
             with open(report_path, "w", encoding="utf-8") as fh:
@@ -184,11 +191,21 @@ def clean_loaded_image_runs(
                 emit("Process stopped by user")
                 break
 
+            if related_files_by_run is None:
+                related_file_candidates = [
+                    os.path.join(run.primary_source, filename)
+                    for filename in os.listdir(run.primary_source)
+                ]
+            else:
+                related_file_candidates = [
+                    os.fspath(path) for path in related_files_by_run[run_idx - 1]
+                ]
+
             for sidecar_suffix in ("_Spectra.txt", "_ShutterCount.txt"):
-                # Re-enumerate for each suffix, matching the legacy first-match rule.
-                for filename in os.listdir(run.primary_source):
+                # Keep the first-match rule, scoped to this run's provenance.
+                for src in related_file_candidates:
+                    filename = os.path.basename(src)
                     if filename.endswith(sidecar_suffix):
-                        src = os.path.join(run.primary_source, filename)
                         dst = os.path.join(output_folder, f"Run{run_idx}_{filename}")
                         try:
                             shutil.copy2(src, dst)

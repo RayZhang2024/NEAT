@@ -51,16 +51,44 @@ def validate_normalisation_windows(window_half, adjacent_sum) -> tuple[int, int]
     return window_half, adjacent_sum
 
 
-def read_normalisation_shutter_count(folder_path: str) -> float:
-    """Read the second token of line one in the first raw-order sidecar."""
-    try:
-        fname = next(
-            f for f in os.listdir(folder_path) if f.endswith("_ShutterCount.txt")
-        )
-    except StopIteration:
-        raise FileNotFoundError("no *_ShutterCount.txt found") from None
+def read_normalisation_shutter_count(
+    folder_path: str,
+    *,
+    sidecar_paths: Sequence[str] | None = None,
+) -> float:
+    """Read the second token of line one in the selected shutter sidecar.
 
-    with open(os.path.join(folder_path, fname), "r") as fh:
+    Standalone callers retain the legacy first raw-order match. Full Process
+    supplies a current-run manifest so stale files in a reused output folder
+    cannot choose the normalisation scale.
+    """
+    if sidecar_paths is None:
+        try:
+            fname = next(
+                f for f in os.listdir(folder_path) if f.endswith("_ShutterCount.txt")
+            )
+        except StopIteration:
+            raise FileNotFoundError("no *_ShutterCount.txt found") from None
+        source_path = os.path.join(folder_path, fname)
+    else:
+        matches = []
+        for sidecar_path in sidecar_paths:
+            candidate_path = os.fspath(sidecar_path)
+            if not os.path.isabs(candidate_path):
+                candidate_path = os.path.join(folder_path, candidate_path)
+            if os.path.basename(candidate_path).endswith("_ShutterCount.txt"):
+                matches.append(candidate_path)
+        if not matches:
+            raise FileNotFoundError("no current-run *_ShutterCount.txt found")
+        if len(matches) != 1:
+            names = ", ".join(os.path.basename(path) for path in matches)
+            raise ValueError(
+                f"ambiguous current-run ShutterCount sidecars: {names}"
+            )
+        source_path = matches[0]
+        fname = os.path.basename(source_path)
+
+    with open(source_path, "r") as fh:
         first_line = fh.readline().strip()
     parts = [p for p in re.split(r"[,\s]+", first_line) if p]
     if len(parts) < 2:
@@ -117,9 +145,15 @@ def copy_normalisation_related_files(
     data_folder: str,
     output_folder: str,
     *,
+    sidecar_paths: Sequence[str] | None = None,
     message_callback: MessageCallback | None = None,
 ) -> tuple[tuple[ProducedOutput, ...], tuple[str, ...]]:
-    """Copy all sample sidecars in the original type-grouped raw order."""
+    """Copy sample sidecars in type-grouped order.
+
+    With an explicit manifest, only current-run sidecars are copied and prior
+    sidecars for this output run are pruned. Without one, standalone callers
+    retain the legacy full-folder copy behavior.
+    """
     outputs: list[ProducedOutput] = []
     warnings: list[str] = []
 
@@ -130,26 +164,60 @@ def copy_normalisation_related_files(
     try:
         spectra_suffix = "_Spectra.txt"
         shuttercount_suffix = "_ShutterCount.txt"
-        data_files = os.listdir(data_folder)
-        spectra_files = [f for f in data_files if f.endswith(spectra_suffix)]
+        if sidecar_paths is None:
+            data_files = os.listdir(data_folder)
+            spectra_files = [
+                (filename, os.path.join(data_folder, filename))
+                for filename in data_files if filename.endswith(spectra_suffix)
+            ]
+            shuttercount_files = [
+                (filename, os.path.join(data_folder, filename))
+                for filename in data_files if filename.endswith(shuttercount_suffix)
+            ]
+        else:
+            spectra_files = []
+            shuttercount_files = []
+            for sidecar_path in sidecar_paths:
+                source_path = os.fspath(sidecar_path)
+                if not os.path.isabs(source_path):
+                    source_path = os.path.join(data_folder, source_path)
+                filename = os.path.basename(source_path)
+                if filename.endswith(spectra_suffix):
+                    spectra_files.append((filename, source_path))
+                elif filename.endswith(shuttercount_suffix):
+                    shuttercount_files.append((filename, source_path))
+
+            current_names = {
+                f"Run{run_idx}_{filename}"
+                for filename, source in (*spectra_files, *shuttercount_files)
+                if os.path.isfile(source)
+            }
+            for filename in os.listdir(output_folder):
+                if not filename.startswith(f"Run{run_idx}_"):
+                    continue
+                if not filename.endswith((spectra_suffix, shuttercount_suffix)):
+                    continue
+                if filename not in current_names:
+                    stale_path = os.path.join(output_folder, filename)
+                    if os.path.isfile(stale_path):
+                        os.remove(stale_path)
+                        emit(f"Removed stale sidecar '{filename}'.")
+
         if spectra_files:
-            for filename in spectra_files:
+            for filename, source_path in spectra_files:
                 dest_filename = f"Run{run_idx}_{filename}"
                 dest_path = os.path.join(output_folder, dest_filename)
-                shutil.copyfile(os.path.join(data_folder, filename), dest_path)
+                shutil.copyfile(source_path, dest_path)
                 outputs.append(ProducedOutput(dest_path, "related_file_copy"))
                 emit(f"Copied '{filename}' to '{dest_filename}'.")
         else:
             emit(f"No file ending with '{spectra_suffix}' found in {data_folder}.")
 
-        shuttercount_files = [
-            f for f in data_files if f.endswith(shuttercount_suffix)
-        ]
         if shuttercount_files:
-            for filename in shuttercount_files:
+            for filename, source_path in shuttercount_files:
                 dest_filename = f"Run{run_idx}_{filename}"
                 dest_path = os.path.join(output_folder, dest_filename)
-                shutil.copyfile(os.path.join(data_folder, filename), dest_path)
+                shutil.copyfile(source_path, dest_path)
                 outputs.append(ProducedOutput(dest_path, "related_file_copy"))
                 emit(f"Copied '{filename}' to '{dest_filename}'.")
         else:
@@ -178,6 +246,8 @@ def normalise_loaded_image_runs(
     run_collect_callback: RunCallback | None = None,
     run_complete_callback: RunCallback | None = None,
     fatal_error_callback: FatalCallback | None = None,
+    sample_sidecars_by_run: Sequence[Sequence[str]] | None = None,
+    open_beam_sidecars_by_run: Sequence[Sequence[str]] | None = None,
 ) -> PreprocessingOperationResult:
     """Normalise paired runs while preserving partial outputs and adapter events."""
     expected_count = sum(len(run.frames) for run in sample_runs)
@@ -229,6 +299,15 @@ def normalise_loaded_image_runs(
             errors.append(message)
             emit(message)
             return result(PreprocessingStatus.FAILED)
+        for name, manifests in (
+            ("sample_sidecars_by_run", sample_sidecars_by_run),
+            ("open_beam_sidecars_by_run", open_beam_sidecars_by_run),
+        ):
+            if manifests is not None and len(manifests) != len(sample_runs):
+                message = f"{name} must contain one entry per run."
+                errors.append(message)
+                emit(message)
+                return result(PreprocessingStatus.FAILED)
 
         emit("<b>--- Starting Normalisation ---</b>")
         emit(
@@ -245,13 +324,32 @@ def normalise_loaded_image_runs(
                 break
             sample_run = sample_runs[sample_pos]
             open_beam_run = open_beam_runs[beam_pos]
+            sample_sidecars = (
+                None if sample_sidecars_by_run is None
+                else sample_sidecars_by_run[sample_pos]
+            )
+            open_beam_sidecars = (
+                None if open_beam_sidecars_by_run is None
+                else open_beam_sidecars_by_run[beam_pos]
+            )
 
             try:
-                sc = read_normalisation_shutter_count(sample_run.primary_source)
-                ob = read_normalisation_shutter_count(open_beam_run.primary_source)
+                sc = read_normalisation_shutter_count(
+                    sample_run.primary_source, sidecar_paths=sample_sidecars
+                )
+                ob = read_normalisation_shutter_count(
+                    open_beam_run.primary_source, sidecar_paths=open_beam_sidecars
+                )
                 scale = np.float32(ob / sc) if sc > 0 else 1.0
                 emit(f"sample={sc:.0f}, open‐beam={ob:.0f}, scale={scale:.4f}")
             except Exception as exc:
+                if (
+                    sample_sidecars_by_run is not None
+                    or open_beam_sidecars_by_run is not None
+                ):
+                    raise ValueError(
+                        f"current-run shutter-count metadata is unavailable: {exc}"
+                    ) from exc
                 emit(f"shutter‐count error ({exc}), scale=1.0")
                 scale = np.float32(1.0)
 
@@ -299,6 +397,7 @@ def normalise_loaded_image_runs(
                 run_idx,
                 sample_source,
                 output_folder,
+                sidecar_paths=sample_sidecars,
                 message_callback=emit,
             )
             outputs.extend(sidecar_outputs)

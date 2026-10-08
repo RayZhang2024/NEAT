@@ -40,6 +40,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ...workers.batch import ImageLoadWorker, OpenBeamLoadWorker, get_raden_tiff_stack_info, load_image_file
+from ...domain import PreprocessingStatus
 from ...workers.preprocessing import (
     FilteringWorker,
     FullProcessWorker,
@@ -1186,6 +1187,7 @@ class PreprocessingMixin:
         self._overlap_output_folder = overall_output_folder
         self._overlap_base_name = base_name
         self._current_overlap_index = 0
+        self._overlap_batch_failed = False
 
         # Disable the Correct button to prevent duplicate runs
         self.overlap_correction_correct_button.setEnabled(False)
@@ -1202,7 +1204,12 @@ class PreprocessingMixin:
         if generation is None or self._preprocessing_worker_registry.is_cancelled(generation):
             return
         if self._current_overlap_index >= len(self._overlap_batch_paths):
-            self.preproc_message_box.append("Batch overlap correction completed.")
+            if self._overlap_batch_failed:
+                self.preproc_message_box.append(
+                    "Batch overlap correction finished with failures."
+                )
+            else:
+                self.preproc_message_box.append("Batch overlap correction completed.")
             self.overlap_correction_correct_button.setEnabled(True)
             self.overlap_correction_stop_button.setEnabled(False)
             self._finish_preprocessing_workflow("overlap")
@@ -1221,6 +1228,7 @@ class PreprocessingMixin:
         self.preproc_message_box.append("Loading dataset from folder: " + short_path)
         # Start an ImageLoadWorker for the current folder
         self._overlap_data_load_worker = ImageLoadWorker(current_folder)
+        self._overlap_data_load_worker.overlap_inputs = True
         self._start_preprocessing_worker(
             self._overlap_data_load_worker,
             "overlap",
@@ -1233,16 +1241,20 @@ class PreprocessingMixin:
         )
 
     def _on_overlap_dataset_loaded(self, folder_path, run_dict):
-        # Store the loaded dataset along with placeholders for spectra and shutter count data.
-        if run_dict:
-            self._current_overlap_run = {
-                'folder_path': folder_path,
-                'images': run_dict,
-                'spectra': None,
-                'shutter_count': None
-            }
+        # The shared headless preparer returns selected frames, validated
+        # metadata, and any preflight diagnostics in this payload.
+        if isinstance(run_dict, dict) and "images" in run_dict and "folder_path" in run_dict:
+            self._current_overlap_run = run_dict
         else:
-            self._current_overlap_run = None
+            # Retain a safe adapter for older/custom ImageLoadWorker doubles.
+            self._current_overlap_run = {
+                "folder_path": folder_path,
+                "images": run_dict,
+                "spectra": None,
+                "shutter_count": None,
+                "preflight_errors": (),
+                "expected_count": len(run_dict),
+            }
 
     def _on_overlap_data_load_finished(self):
         """
@@ -1252,72 +1264,18 @@ class PreprocessingMixin:
         if generation is None or self._preprocessing_worker_registry.is_cancelled(generation):
             return
         if not self._current_overlap_run:
-            self.preproc_message_box.append("Failed to load dataset; skipping...")
+            self._overlap_batch_failed = True
+            self.preproc_message_box.append("Failed to prepare dataset; skipping...")
             self._current_overlap_index += 1
             self._process_next_overlap_dataset()
             return
 
         folder_path = self._current_overlap_run['folder_path']
-
         short_path = self.get_short_path(folder_path, levels=2)
-
-        try:
-            all_files = os.listdir(folder_path)
-        except Exception as e:
-            self.preproc_message_box.append(f"Error accessing folder '\\{short_path}': {e}")
-            self._current_overlap_index += 1
-            self._process_next_overlap_dataset()
-            return
-
-        # Identify Spectra and ShutterCount files (using first match)
-        spectra_files = [f for f in all_files if f.endswith('_Spectra.txt')]
-        shutter_files = [f for f in all_files if f.endswith('_ShutterCount.txt')]
-
-        # Load Spectra
-        if spectra_files:
-            spectra_file = os.path.join(folder_path, spectra_files[0])
-            try:
-                spectra_data = np.loadtxt(spectra_file)
-                self._current_overlap_run['spectra'] = spectra_data
-                # self.preproc_message_box.append("Loaded Spectra file: " + spectra_file)
-            except Exception as e:
-                self.preproc_message_box.append(f"Failed to load Spectra file '{spectra_file}': {e}")
-                self._current_overlap_run['spectra'] = None
-        else:
-            self.preproc_message_box.append(f"Spectra file not found in '\\{short_path}'.")
-            self._current_overlap_run['spectra'] = None
-
-        # Load ShutterCount
-        if shutter_files:
-            shutter_file = os.path.join(folder_path, shutter_files[0])
-            try:
-                shutter_data = np.loadtxt(shutter_file)
-                self._current_overlap_run['shutter_count'] = shutter_data[shutter_data != 0]
-                # self.preproc_message_box.append("Loaded ShutterCount file: " + shutter_file)
-            except Exception as e:
-                self.preproc_message_box.append(f"Failed to load ShutterCount file '{shutter_file}': {e}")
-                self._current_overlap_run['shutter_count'] = None
-        else:
-            self.preproc_message_box.append(f"ShutterCount file not found in '\\{short_path}'.")
-            self._current_overlap_run['shutter_count'] = None
-
-        # If required text data is missing, skip this dataset.
-        if self._current_overlap_run['spectra'] is None or self._current_overlap_run['shutter_count'] is None:
-            self.preproc_message_box.append("Dataset in " + folder_path + " lacks necessary Spectra or ShutterCount data; skipping.")
-            self._current_overlap_index += 1
-            self._process_next_overlap_dataset()
-            return
-
-        # Create an output folder for this dataset (e.g. "Corrected_<foldername>")
-        output_folder_run = os.path.join(self._overlap_output_folder, "Corrected_" + os.path.basename(folder_path))
-        try:
-            if not os.path.exists(output_folder_run):
-                os.makedirs(output_folder_run)
-        except Exception as e:
-            self.preproc_message_box.append(f"Failed to create output folder for \\{short_path}: {e}")
-            self._current_overlap_index += 1
-            self._process_next_overlap_dataset()
-            return
+        output_folder_run = os.path.join(
+            self._overlap_output_folder,
+            "Corrected_" + os.path.basename(folder_path),
+        )
 
         self.preproc_message_box.append("Starting overlap correction for dataset: <b>\\" + short_path + "</b>")
         # Start the OverlapCorrectionWorker for the current run.
@@ -1342,6 +1300,9 @@ class PreprocessingMixin:
         self.preproc_message_box.append(
             f"Finished overlap correction for dataset {self._current_overlap_index + 1} of {len(self._overlap_batch_paths)}."
         )
+        result = getattr(self.overlap_correction_worker, "result", None)
+        if result is None or result.status is not PreprocessingStatus.SUCCEEDED:
+            self._overlap_batch_failed = True
         # Clean up
         self._current_overlap_run = None
         self._overlap_data_load_worker = None

@@ -88,6 +88,13 @@ Accumulated prefixes such as `0_summed_`, `1_cleaned_0_summed_`, and
 `2_corrected_1_cleaned_0_summed_` are intentional. The overall base name
 remains unused.
 
+When Summation is skipped, Full Process rejects duplicate source Spectra or
+ShutterCount sidecars before Clean applies its first-match copy rule. Sidecar
+manifests follow the current run through Overlap and Normalisation, so the
+normalisation scale and copied sample sidecars come from current-run metadata.
+Prior generated sidecars for that run are removed from the reused final output
+folder. Standalone Normalisation keeps its legacy folder-discovery behavior.
+
 The pipeline result is immutable and Full Process-specific. It contains the
 overall `PreprocessingStatus`, ordered stage records, the failed/cancelled
 stage, operation-produced outputs in chronological order, and stage-attributed

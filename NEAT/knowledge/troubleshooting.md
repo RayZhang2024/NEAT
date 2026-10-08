@@ -56,13 +56,28 @@ Source: NEAT User Manual §3.2.
 
 ## Overlap Correction skips a dataset
 
-**Likely cause:** `*_Spectra.txt` or `*_ShutterCount.txt` is absent or unreadable.
+Overlap Correction selects `.fits`, `.fit`, `.tiff` and `.tif` files whose final
+underscore-separated suffix contains 1–10 ASCII digits. Frames are ordered by
+the numeric suffix. Duplicate numeric IDs (including `1` and `01`), gaps in the
+sequence, unsupported names, or more image frames than Spectra rows are rejected
+before corrected images are written. The Spectra rows are paired positionally
+with frames in numeric order; the filename does not encode a ToF value.
+
+**Likely causes:** a missing or malformed sidecar, ambiguous multiple sidecars,
+invalid frame suffixes, a noncontiguous frame sequence, or a mismatch between
+the selected image count and Spectra ToF row count.
 
 **Actions:**
 
-1. Confirm that both required text files are present inside each dataset folder.
-2. Confirm that the files are readable and belong to the same dataset as the FITS images.
-3. Read the message pane for the exact missing or failed file.
+1. Confirm that exactly one `*_Spectra.txt` and one `*_ShutterCount.txt` file
+   are present inside each dataset folder and that both belong to the images.
+2. Confirm that frame suffixes are numeric, unique, contiguous, and have one
+   corresponding Spectra row each.
+3. Read the message pane for the stage, selected folder, counts, sidecar name,
+   and any extra, missing, or invalid frame identifier.
+4. In Full Process, unmanifested FITS/TIFF files in reused intermediate folders
+   are ignored and reported; the current stage's output manifest defines the
+   selected frames.
 
 Source: NEAT User Manual §3.3.
 
