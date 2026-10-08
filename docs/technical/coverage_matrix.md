@@ -42,7 +42,7 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
 | 6 | Architecture | [Structured preprocessing operation results](architecture/preprocessing_contracts.md) | `NEAT/domain/preprocessing.py`, operation services, Full Process pipeline result | Contract tests, service/worker regressions, and Full Process stage/result aggregation tests; other operation workers remain unmigrated | Not required | P1 | code-verified |
 | 6 | Architecture | [Typed loaded-image run contract](architecture/preprocessing_contracts.md) | `NEAT/domain/preprocessing_inputs.py`, classic operation services, Full Process loader | Input contract tests, classic service/adapter regressions, and Full Process loader/pipeline tests; RADEN uses resolved stack-info mappings, and other loaders/workers retain their contracts | Not required | P1 | code-verified |
 | 6 | Architecture | [Startup, window composition and state](architecture/startup_state.md) | `app.py`, `main_window.py` | Import and partial GUI tests | Not required | P2 | code-verified |
-| 6 | Architecture | [Workers, progress and shutdown](architecture/workers_shutdown.md) | `PreprocessingWorkerRegistry`, preprocessing UI mixin and workers | Offscreen real-QThread tests cover delayed startup beyond 500 ms with retained ownership, explicit synchronous rejection, exceptions after start, fast exit, public-finished-before-exit, missing-finished fallback, cleanup of cancelled/abnormal worker and loader references, stale-reference protection, retry-button restoration, and timer/registry drain. Production mixin workflows cover Outlier, Overlap, classic Normalisation, two-/three-level Summation, Filtering, and a successful two-dataset Outlier batch; Issue #39 Full Process regressions remain covered | Not required | P1 | code-verified |
+| 6 | Architecture | [Workers, progress and shutdown](architecture/workers_shutdown.md) | `FitsViewer.closeEvent`, `PreprocessingWorkerRegistry`, `WindowThreadInventory`, assistant and fitting UI | `tests/test_application_shutdown.py` exercises actual offscreen `closeEvent()` with controlled QThreads: preprocessing/fitting/update work, public completion before native exit, missing completion and ambiguous startup, empty/closing generations, superseded references, stop exceptions, callback suppression, data preservation, close retry/resume, assistant precedence, and child-dialog workers. Existing Issue #43 ownership and Full Process suites remain covered | Not required | P0 | code-verified |
 | 6 | Support | [Errors, updates and packaging](support/updates_packaging_errors.md) | main window, packaging config | Assistant error tests; no packaged smoke test | Security review | P2 | code-verified |
 | 6 | Assistant | [RAG, privacy, feedback and evaluation](support/assistant_architecture.md) | assistant UI/tools | Extensive assistant tests | Safety review | P1 | code-verified |
 
@@ -55,9 +55,9 @@ safety-critical, `P1` is core behavior, and `P2` is supporting behavior.
   mask editing still lacks focused coverage.
 - Issue #41 covers direct and real-QThread lifecycle behavior for all seven
   preprocessing adapters. Issue #43 adds GUI ownership and interactive Stop
-  regression coverage. Application-close coordination remains explicitly
-  uncovered follow-up work; the registry is window-owned and does not yet make
-  close-during-processing safe.
+  regression coverage. Application-close safety now has separate real-thread
+  close-event coverage in `tests/test_application_shutdown.py`; non-cooperative
+  operations can still delay a retry until they naturally exit.
 - Fitting and input loading have materially better headless coverage, but the
   full GUI-to-worker-to-output path is not comprehensively tested.
 - Documents for untested behavior can still reach `code-verified`, but the
