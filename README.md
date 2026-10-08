@@ -102,6 +102,13 @@ will appear, with tabs for:
 * **Bragg Edge Fitting**
 * **Data Post-Processing**
 
+For a Git source checkout, the window title also shows a short development commit,
+for example `v4.8.2 [dev 2c6e5d37]`; **About > About NEAT** shows the same
+revision. This identifies the exact source checkout without changing the
+package version. Official Windows releases and installed packages without
+checkout metadata continue to display only the release version. If Git is
+unavailable, no development identifier is shown.
+
 ### AI Assistant
 
 NEAT 4.8 adds a dockable, retrieval-grounded assistant for questions about the
