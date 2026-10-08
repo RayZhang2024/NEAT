@@ -377,9 +377,9 @@ def prepare_overlap_inputs(
 
     for error in errors:
         emit(error)
-    related_files: tuple[str, ...] = ()
+    prepared_related_files: tuple[str, ...] = ()
     if spectra_path is not None and shutter_path is not None:
-        related_files = (spectra_path, shutter_path)
+        prepared_related_files = (spectra_path, shutter_path)
     run = LoadedImageRun(folder, frames, load_errors=errors)
     return PreparedOverlapInputs(
         run,
@@ -387,7 +387,7 @@ def prepare_overlap_inputs(
         shutter_data,
         image_count,
         os.path.basename(spectra_path) if spectra_path else None,
-        related_files,
+        prepared_related_files,
         tuple(errors),
         tuple(warnings),
         tuple(selected_path_by_suffix[suffix] for suffix in ordered_suffixes),
