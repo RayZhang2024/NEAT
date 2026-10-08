@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import html
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence, cast
 
 from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_feedback import record_assistant_feedback
@@ -516,7 +516,7 @@ class AssistantDockWidget(QDockWidget):
     @staticmethod
     def _connect_worker_signal(signal, callback) -> None:
         try:
-            signal.connect(callback, Qt.QueuedConnection)
+            cast(Any, signal).connect(callback, cast(Any, Qt).QueuedConnection)
         except TypeError:
             # Keep lightweight non-Qt test doubles compatible; production
             # QThread signals always use queued delivery to this QWidget.
