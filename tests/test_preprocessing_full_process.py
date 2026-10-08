@@ -467,6 +467,9 @@ class TestFullProcessPipeline(FullProcessFixture):
         self.make_input()
         first_result, _messages, _progress, _load = self.run_pipeline()
         self.assertEqual(first_result.status, PreprocessingStatus.SUCCEEDED)
+        final_folder = self.output / "3_normalised_original"
+        user_file = final_folder / "user_review_image.fits"
+        user_file.write_bytes(b"user-owned FITS data")
 
         self.set_run_frame_count(self.sample, "sample", 2)
         self.set_run_frame_count(self.beam, "beam", 2)
@@ -486,11 +489,76 @@ class TestFullProcessPipeline(FullProcessFixture):
         self.assertEqual(beam_overlap.operation_result.expected_count, 2)
         self.assertEqual(normalisation.operation_result.expected_count, 2)
         self.assertEqual(
-            len([
-                output for output in normalisation.operation_result.outputs
+            {
+                output.path
+                for output in normalisation.operation_result.outputs
                 if output.role == "normalised_image"
-            ]),
-            2,
+            },
+            {
+                str(final_folder / "normalised_00000.fits"),
+                str(final_folder / "normalised_00001.fits"),
+            },
+        )
+        self.assertEqual(
+            {path.name for path in final_folder.glob("normalised_*.fits")},
+            {"normalised_00000.fits", "normalised_00001.fits"},
+        )
+        self.assertEqual(user_file.read_bytes(), b"user-owned FITS data")
+
+    def _assert_rerun_preserves_normalised_images_on_non_success(
+        self, status: PreprocessingStatus
+    ):
+        self.make_input()
+        first_result, _messages, _progress, _load = self.run_pipeline()
+        self.assertEqual(first_result.status, PreprocessingStatus.SUCCEEDED)
+
+        final_folder = self.output / "3_normalised_original"
+        original_images = {
+            path.name: path.read_bytes()
+            for path in final_folder.glob("normalised_*.fits")
+        }
+        self.assertEqual(len(original_images), 4)
+        user_file = final_folder / "user_review_image.fits"
+        user_file.write_bytes(b"user-owned FITS data")
+
+        self.set_run_frame_count(self.sample, "sample", 2)
+        self.set_run_frame_count(self.beam, "beam", 2)
+        errors = (
+            ("simulated normalisation failure",)
+            if status is PreprocessingStatus.FAILED
+            else ()
+        )
+        operation_result = PreprocessingOperationResult(
+            status,
+            0,
+            expected_count=2,
+            errors=errors,
+        )
+        with patch.object(
+            full_process,
+            "normalise_loaded_image_runs",
+            return_value=operation_result,
+        ):
+            result, _messages, _progress, _load = self.run_pipeline()
+
+        self.assertEqual(result.status, status)
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in final_folder.glob("normalised_*.fits")
+            },
+            original_images,
+        )
+        self.assertEqual(user_file.read_bytes(), b"user-owned FITS data")
+
+    def test_failed_rerun_preserves_previous_normalised_images(self):
+        self._assert_rerun_preserves_normalised_images_on_non_success(
+            PreprocessingStatus.FAILED
+        )
+
+    def test_cancelled_rerun_preserves_previous_normalised_images(self):
+        self._assert_rerun_preserves_normalised_images_on_non_success(
+            PreprocessingStatus.CANCELLED
         )
 
     def test_normalisation_rerun_uses_current_sidecars_and_prunes_stale_outputs(self):

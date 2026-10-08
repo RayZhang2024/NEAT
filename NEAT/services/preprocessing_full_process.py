@@ -252,6 +252,8 @@ class FullProcessPipeline:
         self._overall_status = PreprocessingStatus.SUCCEEDED
         self._stage_image_manifests: dict[str, tuple[str, ...]] = {}
         self._stage_sidecar_manifests: dict[str, tuple[str, ...]] = {}
+        self._normalisation_output_folder: str | None = None
+        self._normalised_image_manifest: tuple[str, ...] = ()
 
     def run(self) -> FullProcessPipelineResult:
         self._message("=== <b>Full Process Pipeline Started</b> ===")
@@ -289,6 +291,7 @@ class FullProcessPipeline:
             self.do_normalisation(sample_overlap, beam_overlap)
             if not self._continue(FullProcessStage.NORMALISATION, "normalisation", None, None):
                 return self.result()
+            self._prune_stale_normalised_images()
             self._progress(0)
             self._message("=== <b>Full Process Completed Successfully</b> ===")
         except _StageAbort:
@@ -689,6 +692,12 @@ class FullProcessPipeline:
                 operation_result,
                 "3_normalisation failed or skipped one or more frames.",
             )
+        self._normalisation_output_folder = out_folder
+        self._normalised_image_manifest = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role == "normalised_image"
+        )
         if self._parent_running():
             self._message(
                 f"<b>3_normalisation complete</b>, saved at: "
@@ -700,6 +709,34 @@ class FullProcessPipeline:
             self._cancelled_stage = stage
         builder.outcome = FullProcessStageOutcome.SUCCEEDED
         self._record(builder)
+
+    def _prune_stale_normalised_images(self) -> None:
+        """Remove obsolete images from the Full Process owned output namespace."""
+        output_folder = self._normalisation_output_folder
+        if output_folder is None or not self._normalised_image_manifest:
+            return
+
+        output_root = os.path.normcase(os.path.abspath(output_folder))
+        current_images = {
+            os.path.normcase(os.path.abspath(path))
+            for path in self._normalised_image_manifest
+        }
+        # A malformed or unexpected manifest must never broaden cleanup beyond
+        # the known Full Process output directory.
+        if any(os.path.dirname(path) != output_root for path in current_images):
+            return
+
+        for filename in os.listdir(output_folder):
+            if not (
+                filename.startswith("normalised_")
+                and filename.endswith(".fits")
+            ):
+                continue
+            path = os.path.join(output_folder, filename)
+            if not os.path.isfile(path):
+                continue
+            if os.path.normcase(os.path.abspath(path)) not in current_images:
+                os.remove(path)
 
     def _begin(
         self, stage: FullProcessStage, branch: str | None, input_folder: str | None
