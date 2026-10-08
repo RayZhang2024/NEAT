@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 from urllib.parse import urlparse
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
@@ -154,6 +154,10 @@ class AssistantSettingsDialog(QDialog):
         self.auto_discover_local_models = bool(auto_discover_local_models)
         self.test_worker: Optional[QThread] = None
         self.local_discovery_worker: Optional[QThread] = None
+        self._owned_worker_threads: dict[int, QThread] = {}
+        self._worker_retirement_timer = QTimer(self)
+        self._worker_retirement_timer.setInterval(25)
+        self._worker_retirement_timer.timeout.connect(self._retire_finished_workers)
         self.local_models_by_url: dict[str, tuple[str, ...]] = {}
         self.initial_settings = self.settings_repository.load()
         if shared_service_available is None:
@@ -557,7 +561,32 @@ class AssistantSettingsDialog(QDialog):
         self.local_discovery_worker.finished.connect(
             self._on_local_discovery_finished
         )
+        self._track_dialog_worker(self.local_discovery_worker)
         self.local_discovery_worker.start()
+
+    @property
+    def has_unsettled_workers(self) -> bool:
+        return bool(self._owned_worker_threads)
+
+    def _track_dialog_worker(self, worker: QThread) -> None:
+        self._owned_worker_threads[id(worker)] = worker
+        self._worker_retirement_timer.start()
+
+    def _retire_finished_workers(self) -> None:
+        for key, worker in tuple(self._owned_worker_threads.items()):
+            try:
+                if worker.isRunning() or not worker.isFinished() or not worker.wait(0):
+                    continue
+            except RuntimeError:
+                continue
+            self._owned_worker_threads.pop(key, None)
+            if self.test_worker is worker:
+                self.test_worker = None
+            if self.local_discovery_worker is worker:
+                self.local_discovery_worker = None
+            worker.deleteLater()
+        if not self._owned_worker_threads:
+            self._worker_retirement_timer.stop()
 
     def _on_local_models_discovered(self, discovered: object) -> None:
         result = dict(discovered or {})
@@ -612,10 +641,6 @@ class AssistantSettingsDialog(QDialog):
 
     def _on_local_discovery_finished(self) -> None:
         self.detect_local_button.setEnabled(True)
-        worker = self.local_discovery_worker
-        self.local_discovery_worker = None
-        if worker is not None:
-            worker.deleteLater()
 
     def save_and_accept(self) -> None:
         pending_key = self.key_edit.text().strip()
@@ -687,6 +712,7 @@ class AssistantSettingsDialog(QDialog):
         self.test_worker.succeeded.connect(self._on_test_succeeded)
         self.test_worker.failed.connect(self._on_test_failed)
         self.test_worker.finished.connect(self._on_test_finished)
+        self._track_dialog_worker(self.test_worker)
         self.test_worker.start()
 
     def _on_test_succeeded(self) -> None:
@@ -700,25 +726,11 @@ class AssistantSettingsDialog(QDialog):
     def _on_test_finished(self) -> None:
         self.test_button.setEnabled(True)
         self.button_box.setEnabled(True)
-        worker = self.test_worker
-        self.test_worker = None
-        if worker is not None:
-            worker.deleteLater()
 
     def closeEvent(self, event) -> None:
-        if self.test_worker is not None and self.test_worker.isRunning():
+        if self.has_unsettled_workers:
             self.result_label.setText(
-                "Please wait for the connection test to finish before closing."
-            )
-            self.result_label.setStyleSheet("color: #9a6700;")
-            event.ignore()
-            return
-        if (
-            self.local_discovery_worker is not None
-            and self.local_discovery_worker.isRunning()
-        ):
-            self.result_label.setText(
-                "Please wait for local model detection to finish before closing."
+                "Please wait for the background assistant task to finish before closing."
             )
             self.result_label.setStyleSheet("color: #9a6700;")
             event.ignore()

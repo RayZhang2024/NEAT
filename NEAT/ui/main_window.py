@@ -66,6 +66,7 @@ from .mixins.preprocessing import PreprocessingMixin
 from .dialogs import UncertaintyEstimatorDialog
 from .assistant_panel import AssistantDockWidget, collect_neat_context
 from .preprocessing_worker_registry import PreprocessingWorkerRegistry
+from .window_thread_inventory import WindowThreadInventory
 from .utils import update_all_widget_fonts
 
 
@@ -125,8 +126,7 @@ class UpdateCheckWorker(QThread):
 class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMixin):
     def __init__(self):
         super().__init__()
-        self._preprocessing_worker_registry = PreprocessingWorkerRegistry(self)
-        self._preprocessing_workflow_generations = {}
+        self._initialize_shutdown_lifecycle()
         
         self.flight_path = 56.4
         self.flight_path_source = "App setting"
@@ -180,6 +180,9 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         # Set up the layout for Preprocessing tab
         self.setup_preprocessing_tab()
         self._preprocessing_worker_registry.diagnostic.connect(
+            self.preproc_message_box.append, Qt.QueuedConnection
+        )
+        self._shutdown_worker_inventory.diagnostic.connect(
             self.preproc_message_box.append, Qt.QueuedConnection
         )
 
@@ -284,7 +287,34 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         # Set initial global font and Matplotlib settings
         self.setGlobalFont()
         
-        QTimer.singleShot(1500, self.maybe_check_for_updates_on_startup)
+        self._startup_update_timer = QTimer(self)
+        self._startup_update_timer.setSingleShot(True)
+        self._startup_update_timer.timeout.connect(
+            self.maybe_check_for_updates_on_startup
+        )
+        self._startup_update_timer.start(1500)
+
+    def _initialize_shutdown_lifecycle(self):
+        """Install shutdown ownership before any worker can be started."""
+        self._preprocessing_worker_registry = PreprocessingWorkerRegistry(self)
+        self._preprocessing_workflow_generations = {}
+        self._shutdown_worker_inventory = WindowThreadInventory(self)
+        self._shutdown_close_pending = False
+        self._shutdown_committed = False
+        self._shutdown_busy_message_shown = False
+        self._shutdown_settings_saved = False
+        self._shutdown_cleanup_done = False
+        self._shutdown_pending_timer = QTimer(self)
+        self._shutdown_pending_timer.setInterval(25)
+        self._shutdown_pending_timer.timeout.connect(
+            self._finish_shutdown_attempt_if_drained
+        )
+        self._preprocessing_worker_registry.state_changed.connect(
+            self._schedule_shutdown_attempt_check
+        )
+        self._shutdown_worker_inventory.changed.connect(
+            self._schedule_shutdown_attempt_check
+        )
 
     def setGlobalFont(self):
         # Update the global font for the QApplication
@@ -1142,44 +1172,125 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         if getattr(self, "images", None) is not None and getattr(self, "selected_area", None):
             self.update_plots()
 
-    def cleanup_resources(self):
-        """Release images, workers, and temporary handles before exit."""
-        worker_attrs = [
-            "fits_image_load_worker",
-            "image_load_worker",
-            "summation_worker",
-            "scaling_worker",
-            "normalisation_worker",
-            "open_beam_load_worker",
-            "outlier_worker",
-            "overlap_worker",
-            "filtering_worker",
-            "batch_fit_worker",
-            "batch_fit_edges_worker",
-            "full_process_worker",
-        ]
-        for name in worker_attrs:
-            worker = getattr(self, name, None)
-            if worker is None:
-                continue
-            try:
-                if hasattr(worker, "stop"):
-                    worker.stop()
-            except Exception:
-                pass
-            if worker.isRunning():
-                worker.requestInterruption()
-                worker.wait(1000)
-            setattr(self, name, None)
+    def _active_shutdown_child_dialogs(self):
+        return tuple(
+            dialog
+            for dialog in self.findChildren(QtWidgets.QDialog)
+            if bool(getattr(dialog, "has_unsettled_workers", False))
+        )
 
+    def _has_shutdown_managed_work(self):
+        return bool(
+            self._preprocessing_worker_registry.workers
+            or self._preprocessing_worker_registry.active_families
+            or self._shutdown_worker_inventory.has_unsettled_workers
+            or self._active_shutdown_child_dialogs()
+        )
+
+    def _track_shutdown_worker(self, worker, role):
+        """Retain one legacy window-owned thread before its ``start()`` call."""
+        self._shutdown_worker_inventory.track(worker, role)
+
+    def _connect_shutdown_worker_signal(
+        self, worker, signal, callback, *, current_attribute=None
+    ):
+        self._shutdown_worker_inventory.connect_guarded(
+            worker,
+            signal,
+            callback,
+            current_attribute=current_attribute,
+        )
+
+    def _suppress_shutdown_worker_callbacks(self, worker):
+        self._shutdown_worker_inventory.suppress_callbacks(worker)
+
+    def _request_shutdown_worker_stop(self, worker, *, suppress_callbacks=False):
+        return self._shutdown_worker_inventory.request_stop(
+            worker,
+            suppress_callbacks=suppress_callbacks,
+        )
+
+    def _window_thread_retired(self, worker, role, callbacks_suppressed):
+        """Release only convenience references that still name this instance."""
+        for name, value in tuple(vars(self).items()):
+            if value is worker and name.endswith("worker"):
+                setattr(self, name, None)
+        if self._shutdown_close_pending and callbacks_suppressed:
+            if role == "fits_image_loader":
+                self._hide_load_progress_dialog()
+                self._set_fits_image_button_states(is_loading=False)
+            elif role in {"batch_fit", "batch_fit_edges"}:
+                if getattr(self, "update_timer", None) is not None:
+                    self.update_timer.stop()
+                remaining_timer = getattr(self, "remaining_time_timer", None)
+                if remaining_timer is not None:
+                    remaining_timer.stop()
+                progress_dialog = getattr(self, "batch_progress_dialog", None)
+                if progress_dialog is not None:
+                    progress_dialog.hide()
+        self._finish_shutdown_attempt_if_drained()
+
+    def _shutdown_diagnostic(self, message):
+        box = getattr(self, "preproc_message_box", None)
+        if box is None:
+            box = getattr(self, "message_box", None)
+        if box is not None:
+            box.append(str(message))
+
+    def _show_shutdown_busy_message(self):
+        if self._shutdown_busy_message_shown:
+            return
+        self._shutdown_busy_message_shown = True
+        message = (
+            "Processing is stopping or finishing; NEAT remains open. "
+            "Close again after the work has completed. A worker that cannot "
+            "stop promptly must exit before NEAT can close."
+        )
+        self.statusBar().showMessage(message)
+        self._shutdown_diagnostic(message)
+
+    def _schedule_shutdown_attempt_check(self):
+        if self._shutdown_close_pending:
+            QTimer.singleShot(0, self._finish_shutdown_attempt_if_drained)
+
+    def _finish_shutdown_attempt_if_drained(self):
+        if not self._shutdown_close_pending:
+            return
+        if self._has_shutdown_managed_work():
+            if not self._shutdown_pending_timer.isActive():
+                self._shutdown_pending_timer.start()
+            return
+        self._shutdown_pending_timer.stop()
+        self._shutdown_close_pending = False
+        self._shutdown_busy_message_shown = False
+        self.statusBar().clearMessage()
+
+    def cleanup_resources(self):
+        """Release data only after shutdown preflight proves every owner safe."""
+        if self._shutdown_cleanup_done:
+            return True
+        assistant = getattr(self, "assistant_dock", None)
+        assistant_worker = getattr(assistant, "worker", None)
+        assistant_unsettled = bool(getattr(assistant, "_retiring_workers", {}))
+        assistant_unsettled = assistant_unsettled or assistant_worker is not None
+        if assistant_unsettled or self._has_shutdown_managed_work() or (
+            self._shutdown_close_pending and not self._shutdown_committed
+        ):
+            self._shutdown_diagnostic(
+                "[WARN] Cleanup was declined because shutdown-managed work remains active."
+            )
+            return False
+
+        if hasattr(self, "image_slider"):
+            self.image_slider.setEnabled(False)
         self.images = []
         self.intensities = np.array([])
         self.tof_array = None
         self.wavelengths = np.array([])
-        if hasattr(self, "image_slider"):
-            self.image_slider.setEnabled(False)
-        self.display_image()
         self.manual_wavelength_mode = False
+        self.display_image()
+        self._shutdown_cleanup_done = True
+        return True
 
     def rebuild_phase_data(self):
         """Rebuild the combined phase dictionary from built-ins, removals, and customs."""
@@ -1300,6 +1411,8 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
 
     def maybe_check_for_updates_on_startup(self):
         """Startup hook for passive update checks."""
+        if self._shutdown_close_pending or self._shutdown_committed:
+            return
         if not self.check_updates_on_startup:
             return
         if self._checked_for_updates_recently(hours=24):
@@ -1347,6 +1460,12 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
 
     def start_update_check(self, manual=False):
         """Run a background check against GitHub latest release."""
+        if self._shutdown_close_pending or self._shutdown_committed:
+            return
+        if self._shutdown_worker_inventory.has_role("update_check"):
+            if manual and hasattr(self, "message_box"):
+                self.message_box.append("Update check is already running.")
+            return
         if self._update_check_worker is not None and self._update_check_worker.isRunning():
             if manual and hasattr(self, "message_box"):
                 self.message_box.append("Update check is already running.")
@@ -1357,9 +1476,11 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             self.message_box.append("Checking for updates...")
 
         worker = UpdateCheckWorker(current_version=self.app_version, parent=self)
-        worker.check_finished.connect(self._on_update_check_finished)
-        worker.finished.connect(worker.deleteLater)
         self._update_check_worker = worker
+        self._track_shutdown_worker(worker, "update_check")
+        self._connect_shutdown_worker_signal(
+            worker, worker.check_finished, self._on_update_check_finished
+        )
         worker.start()
 
     def _show_update_available_dialog(self, latest_version, release_url):
@@ -1595,8 +1716,37 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             pass
 
     def closeEvent(self, event):
+        # Capture the entry state before requesting cancellation. This event is
+        # rejected whenever it encountered unsettled work, even if that work
+        # drains synchronously during the request.
+        if self._shutdown_committed:
+            event.accept()
+            return
+        work_at_entry = self._has_shutdown_managed_work()
+        if work_at_entry:
+            self._shutdown_close_pending = True
+            for timer_name in ("update_timer", "remaining_time_timer"):
+                timer = getattr(self, timer_name, None)
+                if timer is not None:
+                    timer.stop()
+            self._preprocessing_worker_registry.request_shutdown()
+            self._shutdown_worker_inventory.request_shutdown()
+            if not self._shutdown_pending_timer.isActive():
+                self._shutdown_pending_timer.start()
+            self._show_shutdown_busy_message()
+            event.ignore()
+            return
+
+        self._finish_shutdown_attempt_if_drained()
         assistant_dock = getattr(self, "assistant_dock", None)
-        if assistant_dock is not None and not assistant_dock.shutdown():
+        try:
+            assistant_ready = assistant_dock is None or assistant_dock.shutdown()
+        except Exception as exc:
+            assistant_ready = False
+            self._shutdown_diagnostic(
+                f"[WARN] AI Assistant shutdown check failed: {type(exc).__name__}: {exc}."
+            )
+        if not assistant_ready:
             QMessageBox.information(
                 self,
                 "AI Assistant Busy",
@@ -1605,8 +1755,19 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             )
             event.ignore()
             return
-        self.save_user_settings()
-        self.cleanup_resources()
+
+        self._shutdown_committed = True
+        self._shutdown_close_pending = False
+        startup_timer = getattr(self, "_startup_update_timer", None)
+        if startup_timer is not None:
+            startup_timer.stop()
+        if not self.cleanup_resources():
+            self._shutdown_committed = False
+            event.ignore()
+            return
+        if not self._shutdown_settings_saved:
+            self.save_user_settings()
+            self._shutdown_settings_saved = True
         super().closeEvent(event)
 
     

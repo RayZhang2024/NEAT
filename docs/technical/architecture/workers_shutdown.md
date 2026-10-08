@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer, support]
 neat_version: 4.8.0
-verified_commit: d3de8d15895fa577a6a8bfcd060ea0f48c56f94f
+verified_commit: 9a8568d516181ec7c98a25301888a280a4167167
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
-source_paths: [NEAT/ui/preprocessing_worker_registry.py, NEAT/ui/main_window.py, NEAT/ui/mixins/preprocessing.py, NEAT/ui/mixins/fitting.py, NEAT/ui/assistant_panel.py, NEAT/services/fitting_engine.py, NEAT/workers/preprocessing.py, NEAT/workers/batch.py]
-source_symbols: [PreprocessingWorkerRegistry.start_worker, PreprocessingWorkerRegistry._poll_workers, PreprocessingWorkerRegistry._startup_expired, PreprocessingWorkerRegistry._retire, PreprocessingWorkerRegistry._settle_public_completion, PreprocessingMixin._begin_preprocessing_workflow, PreprocessingMixin._clear_preprocessing_worker_reference, PreprocessingMixin.stop_summation, PreprocessingMixin.stop_full_process, FitsViewer.cleanup_resources, AssistantDockWidget.shutdown, _finish_worker, BatchFitWorker.stop, BatchFitEdgesWorker.stop]
-test_paths: [tests/test_preprocessing_worker_ownership.py, tests/test_preprocessing_workers.py, tests/test_preprocessing_normalisation.py, tests/test_preprocessing_normalisation_raden.py, tests/test_preprocessing_full_process.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_semantic_retrieval.py, tests/test_pattern_batch_worker.py, tests/test_batch_mapping_outputs.py]
+source_paths: [NEAT/ui/preprocessing_worker_registry.py, NEAT/ui/window_thread_inventory.py, NEAT/ui/main_window.py, NEAT/ui/mixins/preprocessing.py, NEAT/ui/mixins/fitting.py, NEAT/ui/assistant_panel.py, NEAT/ui/assistant_settings_dialog.py, NEAT/services/fitting_engine.py, NEAT/workers/preprocessing.py, NEAT/workers/batch.py]
+source_symbols: [PreprocessingWorkerRegistry.start_worker, PreprocessingWorkerRegistry.request_shutdown, PreprocessingWorkerRegistry._poll_workers, PreprocessingWorkerRegistry._retire, PreprocessingMixin._begin_preprocessing_workflow, FitsViewer.closeEvent, FitsViewer.cleanup_resources, WindowThreadInventory.track, WindowThreadInventory.request_shutdown, AssistantDockWidget.shutdown, AssistantSettingsDialog.has_unsettled_workers, BatchFitWorker.stop, BatchFitEdgesWorker.stop]
+test_paths: [tests/test_application_shutdown.py, tests/test_preprocessing_worker_ownership.py, tests/test_preprocessing_workers.py, tests/test_preprocessing_normalisation.py, tests/test_preprocessing_normalisation_raden.py, tests/test_preprocessing_full_process.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_settings_dialog.py, tests/test_assistant_semantic_retrieval.py, tests/test_pattern_batch_worker.py, tests/test_batch_mapping_outputs.py]
 ---
 
 # Worker ownership, progress, cancellation and shutdown
@@ -198,35 +198,56 @@ not written to a persistent application log.
 
 ## Application shutdown
 
-`FitsViewer.cleanup_resources` still checks a fixed list of known worker attributes.
-For each worker it:
+Window close is a two-phase operation. On the first close request,
+`FitsViewer.closeEvent` snapshots unsettled work, marks close pending, blocks
+new preprocessing/fitting/update starts, and requests cooperative cancellation
+from the preprocessing registry and the window's legacy-thread inventory. It
+then rejects that close event without clearing data, saving settings or
+destroying widgets. A GUI-thread poll keeps ownership until every worker has
+verified native exit. Public completion alone is not sufficient evidence;
+native exit is checked with `isFinished()` and nonblocking `wait(0)` after
+startup/exit evidence. A worker whose completion notification is missing gets
+a bounded queued-signal grace, but remains owned until the safe retirement
+path completes.
 
-1. calls `stop()` when present;
-2. calls `requestInterruption()` if still running;
-3. waits at most 1000 ms; and
-4. clears the stored reference.
+The preprocessing registry is the source of truth for generation lifetime,
+including active, starting, stop-requested, closing and ambiguous starts.
+Shutdown cancels every existing generation, including one already closing or
+one with no currently registered workers. New same-window preprocessing work
+is blocked only while the close attempt is pending. Once all work drains, a
+later close request may proceed; if a close is rejected for another reason,
+the pending guard is reset so normal work can resume.
 
-It then releases main image/spectrum arrays and disables image navigation.
-There is no forceful `terminate()` call.
+`WindowThreadInventory` covers the window-owned FITS, NeXus and RADEN image
+loaders, both batch-fitting workers and the update-check thread. It records
+workers before `start()`, independent of replaceable convenience attributes,
+and suppresses stale queued UI callbacks after cancellation or supersession.
+Each guarded signal callback is counted at emission and released after its
+GUI-thread handler has run (or been suppressed). Retirement requires verified
+native exit and an empty callback count, so late or reordered queued handlers
+do not depend on a fixed settling delay. An update check cannot be cooperatively
+interrupted, so it remains tracked until actual thread exit. Worker references
+and their signal proxies are not cleared or deleted while native execution may
+continue. Exceptions from stop requests are diagnostic only and never treated
+as proof of exit. There is no forceful `terminate()` path.
 
-The assistant has a stricter close contract. It requests interruption and waits
-1500 ms; if the thread remains active, the entire window close is rejected.
-The assistant worker does not poll interruption while waiting for OpenAI, so
-network timeout/retry settings can outlast that close wait.
+After quiescence is verified, the second close request preserves the
+Assistant's established shutdown contract: request interruption and wait up
+to 1500 ms. If the assistant thread remains active, close is rejected and
+application data/settings are left untouched. Child assistant settings
+dialogs also veto their own close while provider-test or model-discovery
+threads remain unsettled. Accepted cleanup is guarded against duplicate
+execution; it does not perform a second worker-stop/clear pass.
 
 ## Observed implementation limitations
 
-- **P0 interim limitation:** this issue does not make close-during-processing
-  safe. `closeEvent()`/`cleanup_resources()` can still accept a close after a
-  1000 ms wait and clear window references while registry-owned preprocessing
-  threads remain alive. Because the registry is owned by the window, window
-  destruction can also destroy the registry while a thread is active. The
-  following Workstream E shutdown issue must integrate the registry and reject
-  or defer unsafe close before claiming safe shutdown.
-- `cleanup_resources` remains an explicit legacy attribute list and still
-  omits transient loader attributes. The registry provides a consolidated
-  ownership view for that follow-up; this issue intentionally leaves close
-  handling unchanged.
+- A non-cooperative legacy loader or update-check thread can keep the first
+  close attempt pending until its native call returns. The user can continue
+  using the window after a rejected close; close is retried only by a later
+  request, not accepted automatically in the background.
+- A startup whose state remains genuinely ambiguous is retained and blocks
+  close rather than being guessed dead. This favors safety over automatic
+  recovery; a diagnostic identifies the outstanding work.
 - `OpenBeamLoadWorker` has no `stop()` method and does not check Qt interruption
   requests in its load loop; it is retained until exit and obsolete selected
   payloads are ignored.
@@ -234,10 +255,6 @@ network timeout/retry settings can outlast that close wait.
   ended; use its structured result and `succeeded` state to distinguish
   success, cancellation and failure.
 - Wait timeouts are not followed by a second warning or persistent diagnostic.
-- Application-close coordination remains a follow-up release blocker for
-  close-during-processing safety; this issue changes interactive preprocessing
-  Stop and GUI worker ownership only, not `closeEvent()` or
-  `cleanup_resources()`.
 
 ## Retrieval questions
 
@@ -245,6 +262,6 @@ network timeout/retry settings can outlast that close wait.
 - How does worker progress reach the GUI?
 - Which operations run outside the GUI thread?
 - What happens to active processing when NEAT closes?
-- Why can close-during-processing still be unsafe after the GUI Stop repair?
+- Why does NEAT ask the user to close again after workers drain?
 - Why might closing wait for an AI request or file operation?
 

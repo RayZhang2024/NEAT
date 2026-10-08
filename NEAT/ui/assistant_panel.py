@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import html
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence, cast
 
 from NEAT.package_resources import assistant_knowledge_root
 from tools.assistant_feedback import record_assistant_feedback
@@ -12,7 +12,7 @@ from tools.assistant_runtime import (
     prepare_optional_semantic_runtime,
 )
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeyEvent
 from PyQt5.QtWidgets import (
     QDockWidget,
@@ -255,6 +255,11 @@ class AssistantDockWidget(QDockWidget):
         self.feedback_logger = feedback_logger
         self._semantic_runtime_ready = False
         self.worker: Optional[QThread] = None
+        self._retiring_workers: dict[int, QThread] = {}
+        self._shutdown_suppress_callbacks = False
+        self._worker_retirement_timer = QTimer(self)
+        self._worker_retirement_timer.setInterval(25)
+        self._worker_retirement_timer.timeout.connect(self._retire_finished_workers)
         self.history: list[dict[str, str]] = []
         self._pending_feedback: Optional[dict[str, object]] = None
         self._request_neat_version = "unknown"
@@ -416,7 +421,7 @@ class AssistantDockWidget(QDockWidget):
     def open_settings_dialog(self) -> None:
         """Open supplier/model settings and refresh the assistant status."""
 
-        if self.worker is not None and self.worker.isRunning():
+        if self.worker is not None or self._retiring_workers:
             self.status_label.setText(
                 "Wait for the current answer before changing AI settings."
             )
@@ -440,7 +445,7 @@ class AssistantDockWidget(QDockWidget):
             self._set_ready_status()
 
     def submit_question(self) -> None:
-        if self.worker is not None and self.worker.isRunning():
+        if self.worker is not None or self._retiring_workers:
             return
         question = self.question_input.toPlainText().strip()
         if not question:
@@ -481,19 +486,46 @@ class AssistantDockWidget(QDockWidget):
             self.history[-12:],
             parent=self,
         )
-        self.worker.answer_ready.connect(
-            lambda result, sent_question=question: self._on_answer_ready(
-                sent_question, result
-            )
+        worker = self.worker
+        self._connect_worker_signal(
+            worker.answer_ready,
+            lambda result, sent_question=question, current=worker: (
+                self._on_answer_ready(sent_question, result)
+                if not self._shutdown_suppress_callbacks and self.worker is current
+                else None
+            ),
         )
-        self.worker.request_failed.connect(self._on_request_failed)
-        self.worker.finished.connect(self._on_worker_finished)
-        self.worker.start()
+        self._connect_worker_signal(
+            worker.request_failed,
+            lambda message, current=worker: (
+                self._on_request_failed(message)
+                if not self._shutdown_suppress_callbacks and self.worker is current
+                else None
+            ),
+        )
+        self._connect_worker_signal(
+            worker.finished,
+            lambda current=worker: (
+                self._on_worker_finished()
+                if not self._shutdown_suppress_callbacks and self.worker is current
+                else None
+            ),
+        )
+        worker.start()
+
+    @staticmethod
+    def _connect_worker_signal(signal, callback) -> None:
+        try:
+            cast(Any, signal).connect(callback, cast(Any, Qt).QueuedConnection)
+        except TypeError:
+            # Keep lightweight non-Qt test doubles compatible; production
+            # QThread signals always use queued delivery to this QWidget.
+            signal.connect(callback)
 
     def explain_current_screen(self) -> None:
         """Ask for a grounded explanation of the active NEAT workflow."""
 
-        if self.worker is not None and self.worker.isRunning():
+        if self.worker is not None or self._retiring_workers:
             return
         try:
             context = dict(self.context_provider())
@@ -612,9 +644,30 @@ class AssistantDockWidget(QDockWidget):
         self.explain_screen_button.setEnabled(True)
         self.settings_button.setEnabled(True)
         worker = self.worker
-        self.worker = None
         if worker is not None:
+            if not all(
+                callable(getattr(worker, name, None))
+                for name in ("isFinished", "wait")
+            ):
+                self.worker = None
+                worker.deleteLater()
+                return
+            self._retiring_workers[id(worker)] = worker
+            self._worker_retirement_timer.start()
+
+    def _retire_finished_workers(self) -> None:
+        for key, worker in tuple(self._retiring_workers.items()):
+            try:
+                if worker.isRunning() or not worker.isFinished() or not worker.wait(0):
+                    continue
+            except (AttributeError, RuntimeError):
+                continue
+            self._retiring_workers.pop(key, None)
+            if self.worker is worker:
+                self.worker = None
             worker.deleteLater()
+        if not self._retiring_workers:
+            self._worker_retirement_timer.stop()
 
     def clear_conversation(self) -> None:
         self.history.clear()
@@ -625,10 +678,18 @@ class AssistantDockWidget(QDockWidget):
 
     def shutdown(self) -> bool:
         worker = self.worker
-        if worker is None or not worker.isRunning():
+        if worker is None and self._retiring_workers:
+            worker = next(iter(self._retiring_workers.values()))
+        if worker is None:
             return True
-        worker.requestInterruption()
-        return bool(worker.wait(1500))
+        if worker.isRunning():
+            worker.requestInterruption()
+        exited = bool(worker.wait(1500))
+        if exited:
+            self._shutdown_suppress_callbacks = True
+            self._retiring_workers[id(worker)] = worker
+            self._retire_finished_workers()
+        return exited
 
 
 __all__ = [
