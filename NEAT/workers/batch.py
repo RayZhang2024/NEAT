@@ -1797,7 +1797,7 @@ class ImageLoadWorker(QThread):
                 self.run_loaded.emit(self.folder_path, run_dict)
 
         except Exception as e:
-            self.message.emit(f"Error loading images from \\{short_path}: {e}")
+            self.message.emit(f"Error loading images from \\{self.folder_path}: {e}")
         finally:
             # Explicitly call garbage collector to ensure all file handles are released
             gc.collect()

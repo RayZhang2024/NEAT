@@ -58,14 +58,18 @@ Source: NEAT User Manual §3.2.
 
 Overlap Correction selects `.fits`, `.fit`, `.tiff` and `.tif` files whose final
 underscore-separated suffix contains 1–10 ASCII digits. Frames are ordered by
-the numeric suffix. Duplicate numeric IDs (including `1` and `01`), gaps in the
-sequence, unsupported names, or more image frames than Spectra rows are rejected
-before corrected images are written. The Spectra rows are paired positionally
-with frames in numeric order; the filename does not encode a ToF value.
+the numeric suffix. Other supported FITS/TIFF images, including
+`*_SummedImg.fits` summaries, are excluded from the correction stack and
+reported in a warning; those files are left untouched. Duplicate numeric IDs (including
+1 and 01), gaps in the sequence, or a mismatch between selected numeric frames
+and Spectra rows are rejected before corrected images are written. The Spectra
+rows are paired positionally with frames in numeric order; the filename does
+not encode a ToF value. A folder with no numeric-suffix frames cannot be
+processed.
 
 **Likely causes:** a missing or malformed sidecar, ambiguous multiple sidecars,
-invalid frame suffixes, a noncontiguous frame sequence, or a mismatch between
-the selected image count and Spectra ToF row count.
+a noncontiguous numeric frame sequence, or a mismatch between the selected
+numeric image count and Spectra ToF row count.
 
 **Actions:**
 

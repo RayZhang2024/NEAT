@@ -14,6 +14,7 @@ from NEAT.domain import PreprocessingStatus
 from NEAT.services import preprocessing_full_process as full_process
 from NEAT.services import preprocessing_overlap as overlap
 from NEAT.services import preprocessing_overlap_inputs as overlap_inputs
+from NEAT.workers import batch as batch_workers
 from NEAT.workers.batch import ImageLoadWorker
 from NEAT.workers.preprocessing import OverlapCorrectionWorker
 
@@ -65,9 +66,8 @@ class TestOverlapInputPreparation(OverlapInputFixture):
             {"sample_Spectra.txt", "sample_ShutterCount.txt"},
         )
 
-    def test_invalid_suffix_gap_and_numeric_collision_are_preflight_errors(self):
+    def test_numeric_gap_and_collision_are_preflight_errors(self):
         cases = (
-            (("sample_bad.fits",), "invalid suffix 'bad'"),
             (("sample_00000.fits", "sample_00002.fits"), "Frame suffix gap"),
             (("sample_1.fits", "other_01.fit"), "Frame suffix collision"),
         )
@@ -117,6 +117,153 @@ class TestOverlapInputPreparation(OverlapInputFixture):
         self.assertEqual(tuple(prepared.run.frames), ("00000", "00001"))
         self.assertEqual(prepared.expected_count, 2)
         self.assertTrue(any("ignored 1 unmanifested image" in warning for warning in prepared.warnings))
+
+    def test_nonnumeric_auxiliary_is_excluded_for_standalone_and_manifested_inputs(self):
+        count = 2925
+        self.write_sidecars(self.source, count)
+        for index in range(count):
+            (self.source / f"sample_{index:05}.fits").touch()
+        auxiliary = self.source / "cleaned_0_sample_run1_SummedImg.fits"
+        auxiliary.write_bytes(b"auxiliary image, not a correction frame")
+        manifested_paths = tuple(
+            str(path) for path in sorted(self.source.glob("*.fits"))
+        )
+
+        standalone_payloads = []
+        standalone_messages = []
+        standalone = ImageLoadWorker(str(self.source), overlap_inputs=True)
+        standalone.run_loaded.connect(
+            lambda _folder, payload: standalone_payloads.append(payload)
+        )
+        standalone.message.connect(standalone_messages.append)
+        full_process_messages = []
+        with patch.object(
+            overlap_inputs,
+            "load_image_file",
+            return_value=np.ones((1, 1), dtype=np.float32),
+        ) as image_loader:
+            standalone.run()
+            manifested = full_process.prepare_overlap_inputs(
+                str(self.source),
+                image_paths=manifested_paths,
+                stage="Full Process overlap",
+                message_callback=full_process_messages.append,
+            )
+
+        self.assertEqual(len(standalone_payloads), 1)
+        payload = standalone_payloads[0]
+        self.assertEqual(payload["preflight_errors"], ())
+        self.assertEqual(payload["expected_count"], count)
+        self.assertEqual(len(payload["images"]), count)
+        self.assertEqual(len(payload["image_paths"]), count)
+        self.assertTrue(
+            any(
+                "excluded 1 image(s)" in warning and auxiliary.name in warning
+                for warning in payload["preflight_warnings"]
+            )
+        )
+        self.assertTrue(any(auxiliary.name in message for message in standalone_messages))
+        self.assertEqual(manifested.errors, ())
+        self.assertEqual(manifested.expected_count, count)
+        self.assertEqual(len(manifested.run.frames), count)
+        self.assertEqual(len(manifested.image_paths), count)
+        self.assertTrue(
+            any(
+                "excluded 1 image(s)" in warning and auxiliary.name in warning
+                for warning in manifested.warnings
+            )
+        )
+        self.assertTrue(any(auxiliary.name in message for message in full_process_messages))
+        self.assertEqual(image_loader.call_count, count * 2)
+        self.assertEqual(
+            auxiliary.read_bytes(), b"auxiliary image, not a correction frame"
+        )
+        self.assertNotIn(auxiliary.name, {Path(path).name for path in manifested.image_paths})
+
+    def test_only_nonnumeric_images_fail_preflight_without_loading(self):
+        self.write_sidecars(self.source, 1)
+        auxiliary = self.source / "sample_SummedImg.fits"
+        auxiliary.write_bytes(b"not a correction frame")
+
+        with patch.object(overlap_inputs, "load_image_file") as image_loader:
+            prepared = overlap_inputs.prepare_overlap_inputs(str(self.source))
+
+        self.assertEqual(prepared.expected_count, 0)
+        self.assertEqual(prepared.image_paths, ())
+        self.assertEqual(prepared.run.frames, {})
+        self.assertTrue(
+            any(
+                "no numeric-suffix FITS/TIFF correction frames were selected" in error
+                for error in prepared.errors
+            )
+        )
+        self.assertTrue(any(auxiliary.name in warning for warning in prepared.warnings))
+        image_loader.assert_not_called()
+
+        payload = {
+            "folder_path": str(self.source),
+            "images": dict(prepared.run.frames),
+            "spectra": prepared.spectra_data,
+            "shutter_count": prepared.shutter_count_data,
+            "preflight_errors": prepared.errors,
+            "preflight_warnings": prepared.warnings,
+            "expected_count": prepared.expected_count,
+            "spectra_filename": prepared.spectra_filename,
+            "related_files": prepared.related_files,
+            "image_paths": prepared.image_paths,
+        }
+        worker = OverlapCorrectionWorker(
+            payload, "standalone", str(self.root / "no-numeric-output")
+        )
+        worker.run()
+        self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
+        self.assertEqual(worker.result.expected_count, 0)
+        self.assertEqual(worker.result.processed_count, 0)
+        self.assertEqual(worker.result.outputs, ())
+        self.assertFalse((self.root / "no-numeric-output").exists())
+
+    def test_nonnumeric_auxiliary_does_not_mask_a_real_numeric_count_mismatch(self):
+        self.write_sidecars(self.source, 1)
+        self.write_images(self.source, ("00000", "00001"))
+        (self.source / "sample_SummedImg.fits").write_bytes(b"not a correction frame")
+
+        with patch.object(overlap_inputs, "load_image_file") as image_loader:
+            prepared = overlap_inputs.prepare_overlap_inputs(str(self.source))
+
+        self.assertEqual(prepared.expected_count, 2)
+        self.assertTrue(
+            any(
+                "images=2, ToF rows=1" in error
+                and "extra/unmatched image suffix '00001'" in error
+                for error in prepared.errors
+            )
+        )
+        self.assertFalse(any("IndexError" in error for error in prepared.errors))
+        image_loader.assert_not_called()
+
+    def test_standalone_preflight_exception_reports_source_and_finishes(self):
+        worker = ImageLoadWorker(str(self.source), overlap_inputs=True)
+        messages = []
+        finished = []
+        worker.message.connect(messages.append)
+        worker.finished.connect(lambda: finished.append(True))
+
+        with patch.object(
+            batch_workers,
+            "prepare_overlap_inputs",
+            side_effect=RuntimeError("injected preflight failure"),
+        ):
+            worker.run()
+
+        self.assertEqual(finished, [True])
+        self.assertTrue(
+            any(
+                str(self.source) in message
+                and "injected preflight failure" in message
+                for message in messages
+            )
+        )
+        self.assertFalse(any("UnboundLocalError" in message for message in messages))
 
     def test_seven_tof_segments_keep_legacy_shutter_selection(self):
         segment_tof = [
@@ -234,6 +381,8 @@ class TestOverlapInputPreparation(OverlapInputFixture):
     def test_standalone_worker_and_full_process_produce_identical_overlap_arrays(self):
         self.write_sidecars(self.source, 3)
         self.write_images(self.source, ("00002", "00000", "00001"))
+        auxiliary = self.source / "sample_SummedImg.fits"
+        auxiliary.write_bytes(b"not a correction frame")
 
         payloads = []
         loader = ImageLoadWorker(str(self.source), overlap_inputs=True)
@@ -241,6 +390,9 @@ class TestOverlapInputPreparation(OverlapInputFixture):
         loader.run()
         payload = payloads[0]
         self.assertEqual(tuple(payload["images"]), ("00000", "00001", "00002"))
+        self.assertTrue(
+            any(auxiliary.name in warning for warning in payload["preflight_warnings"])
+        )
 
         standalone = OverlapCorrectionWorker(
             payload, "standalone", str(self.root / "standalone")
@@ -255,7 +407,7 @@ class TestOverlapInputPreparation(OverlapInputFixture):
         )
         pipeline._stage_image_manifests[
             full_process._path_key(str(self.source))
-        ] = tuple(payload["image_paths"])
+        ] = (*tuple(payload["image_paths"]), str(auxiliary))
         pipeline._stage_sidecar_manifests[
             full_process._path_key(str(self.source))
         ] = (
@@ -265,6 +417,16 @@ class TestOverlapInputPreparation(OverlapInputFixture):
         pipeline.do_overlap_correction(str(self.source), "Sample")
         full_result = pipeline.result().stages[0].operation_result
         self.assertEqual(full_result.status, PreprocessingStatus.SUCCEEDED)
+        self.assertTrue(
+            any(auxiliary.name in warning for warning in full_result.warnings)
+        )
+        self.assertFalse(
+            any("extra/unmatched" in warning for warning in full_result.warnings)
+        )
+        self.assertFalse(
+            any(auxiliary.name in Path(item.path).name for item in full_result.outputs)
+        )
+        self.assertEqual(auxiliary.read_bytes(), b"not a correction frame")
         self.assertEqual(full_result.processed_count, standalone.result.processed_count)
         self.assertEqual(full_result.expected_count, standalone.result.expected_count)
         self.assertEqual(

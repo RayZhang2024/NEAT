@@ -22,6 +22,15 @@ SHUTTER_SUFFIX = "_ShutterCount.txt"
 _FRAME_SUFFIX = re.compile(r"[0-9]{1,10}\Z")
 
 
+def _numeric_frame_suffix(filename: str) -> str | None:
+    """Return a supported numeric frame suffix, or None for auxiliary images."""
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    if "_" not in stem:
+        return None
+    suffix = stem.rsplit("_", 1)[-1]
+    return suffix if _FRAME_SUFFIX.fullmatch(suffix) else None
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedOverlapInputs:
     """One selected frame sequence and its unambiguous overlap sidecars."""
@@ -113,7 +122,16 @@ def prepare_overlap_inputs(
     except Exception as exc:
         errors.append(_context(stage, folder, 0, None, None, f"cannot list folder: {exc}"))
 
-    preliminary_image_count = len(all_image_names) if image_paths is None else len(image_paths)
+    preliminary_names = (
+        sorted(all_image_names)
+        if image_paths is None
+        else [os.path.basename(os.fspath(path)) for path in image_paths]
+    )
+    preliminary_image_count = sum(
+        name.lower().endswith(IMAGE_EXTENSIONS)
+        and _numeric_frame_suffix(name) is not None
+        for name in preliminary_names
+    )
     if related_files is None:
         spectra_matches = [
             (name, os.path.join(folder, name))
@@ -240,12 +258,15 @@ def prepare_overlap_inputs(
                 candidate_path = os.path.join(folder, candidate_path)
             if name.lower().endswith(IMAGE_EXTENSIONS):
                 candidate_names.append(name)
-                if not os.path.isfile(candidate_path):
+                if (
+                    _numeric_frame_suffix(name) is not None
+                    and not os.path.isfile(candidate_path)
+                ):
                     errors.append(
                         _context(
                             stage,
                             folder,
-                            len(image_paths),
+                            preliminary_image_count,
                             _row_count(spectra_data),
                             os.path.basename(spectra_path) if spectra_path else None,
                             f"manifest image '{name}' is missing",
@@ -256,7 +277,7 @@ def prepare_overlap_inputs(
                     _context(
                         stage,
                         folder,
-                        len(image_paths),
+                        preliminary_image_count,
                         _row_count(spectra_data),
                         os.path.basename(spectra_path) if spectra_path else None,
                         f"manifest entry '{name}' is not a supported FITS/TIFF image",
@@ -273,37 +294,36 @@ def prepare_overlap_inputs(
             warnings.append(warning)
             emit(warning)
 
-    image_count = len(candidate_names)
+    excluded_names: list[str] = []
     for filename in candidate_names:
-        stem = os.path.splitext(filename)[0]
-        if "_" not in stem:
-            errors.append(
-                _context(
-                    stage,
-                    folder,
-                    image_count,
-                    _row_count(spectra_data),
-                    os.path.basename(spectra_path) if spectra_path else None,
-                    f"problem image '{filename}': no underscore-separated numeric suffix",
-                )
-            )
-            continue
-        suffix = stem.rsplit("_", 1)[-1]
-        if not _FRAME_SUFFIX.fullmatch(suffix):
-            errors.append(
-                _context(
-                    stage,
-                    folder,
-                    image_count,
-                    _row_count(spectra_data),
-                    os.path.basename(spectra_path) if spectra_path else None,
-                    f"problem image '{filename}' has invalid suffix '{suffix}'; "
-                    "expected 1–10 ASCII digits",
-                )
-            )
+        suffix = _numeric_frame_suffix(filename)
+        if suffix is None:
+            excluded_names.append(filename)
             continue
         selected_paths.append(os.path.join(folder, filename))
         selected_suffixes.append(suffix)
+
+    image_count = len(selected_paths)
+    if excluded_names:
+        examples = ", ".join(excluded_names[:3])
+        warning = (
+            f"{stage}: excluded {len(excluded_names)} image(s) with nonnumeric or "
+            f"missing frame suffix from overlap correction; examples: {examples}. "
+            "Only files with a final underscore-separated token of 1–10 ASCII digits are frames."
+        )
+        warnings.append(warning)
+        emit(warning)
+    if not selected_paths:
+        errors.append(
+            _context(
+                stage,
+                folder,
+                image_count,
+                _row_count(spectra_data),
+                os.path.basename(spectra_path) if spectra_path else None,
+                "no numeric-suffix FITS/TIFF correction frames were selected",
+            )
+        )
 
     ordered_suffixes, identity_errors = validate_frame_suffixes(selected_suffixes)
     for detail in identity_errors:
@@ -319,17 +339,19 @@ def prepare_overlap_inputs(
         )
 
     if spectra_data is not None and image_count != len(spectra_data):
-        if image_count > len(spectra_data) and ordered_suffixes:
-            problem = (
-                f"extra/unmatched image suffix '{ordered_suffixes[len(spectra_data)]}' "
-                f"at sorted frame position {len(spectra_data) + 1}"
-            )
+        if image_count > len(spectra_data):
+            if len(ordered_suffixes) > len(spectra_data):
+                problem = (
+                    f"extra/unmatched image suffix '{ordered_suffixes[len(spectra_data)]}' "
+                    f"at sorted frame position {len(spectra_data) + 1}"
+                )
+            else:
+                problem = (
+                    f"numeric image/ToF count mismatch ({image_count} images for "
+                    f"{len(spectra_data)} ToF rows)"
+                )
         else:
-            problem = (
-                f"missing image for ToF row {image_count + 1}"
-                if image_count < len(spectra_data)
-                else "image/ToF count mismatch"
-            )
+            problem = f"missing image for ToF row {image_count + 1}"
         errors.append(
             _context(
                 stage,
@@ -342,7 +364,9 @@ def prepare_overlap_inputs(
         )
 
     frames: dict[str, np.ndarray] = {}
-    selected_path_by_suffix = dict(zip(selected_suffixes, selected_paths))
+    selected_path_by_suffix: dict[str, str] = {}
+    for suffix, path in zip(selected_suffixes, selected_paths):
+        selected_path_by_suffix.setdefault(suffix, path)
     # Fail cheaply: do not read multi-thousand-frame image stacks if names,
     # sidecars, identity, or frame/ToF counts have already failed preflight.
     if not errors:
