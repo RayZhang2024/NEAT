@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: preprocessing
 audience: [user, scientist, developer]
 neat_version: 4.8.0
-verified_commit: b90a8508a232ea00d292d8301954b8b79e5c950a
+verified_commit: d3de8d15895fa577a6a8bfcd060ea0f48c56f94f
 status: code-verified
 instrument_applicability: [classic image folders]
 scientific_review: pending
@@ -129,11 +129,15 @@ When launched from the GUI, `FullProcessWorker` is registered with the
 window-owned preprocessing worker registry before start. The GUI Stop handler
 delegates to the worker's existing `stop()` and returns without waiting; the
 registry retains the QThread until native exit and completion handling are
-both confirmed. As with other preprocessing families, no subsequent GUI run
-can reuse that family while its worker is still retiring. This changes only
-GUI ownership and interactive Stop; the pipeline's stage order, one-child
-Summation behavior, cancellation safe points, outputs and progress streams are
-unchanged.
+both confirmed. Structured results remain available through normal completion
+handling; after that, or after a cancelled/abnormal worker exits, the registry
+clears a convenience reference only if it still points to the retiring worker.
+As with other preprocessing families, no subsequent GUI run can reuse that
+family while its worker is still retiring. If Qt does not acknowledge startup,
+the registry retains ownership and reports the ambiguity instead of treating
+the startup timeout as proof of failure. This changes only GUI ownership and
+interactive Stop; the pipeline's stage order, one-child Summation behavior,
+cancellation safe points, outputs and progress streams are unchanged.
 
 This is not application-close coordination. The current
 `closeEvent()`/`cleanup_resources()` path can still accept a close after its

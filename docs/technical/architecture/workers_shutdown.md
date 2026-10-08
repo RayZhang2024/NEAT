@@ -5,12 +5,12 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer, support]
 neat_version: 4.8.0
-verified_commit: b90a8508a232ea00d292d8301954b8b79e5c950a
+verified_commit: d3de8d15895fa577a6a8bfcd060ea0f48c56f94f
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
 source_paths: [NEAT/ui/preprocessing_worker_registry.py, NEAT/ui/main_window.py, NEAT/ui/mixins/preprocessing.py, NEAT/ui/mixins/fitting.py, NEAT/ui/assistant_panel.py, NEAT/services/fitting_engine.py, NEAT/workers/preprocessing.py, NEAT/workers/batch.py]
-source_symbols: [PreprocessingWorkerRegistry.start_worker, PreprocessingWorkerRegistry._poll_workers, PreprocessingWorkerRegistry._settle_public_completion, PreprocessingMixin._begin_preprocessing_workflow, PreprocessingMixin.stop_summation, PreprocessingMixin.stop_full_process, FitsViewer.cleanup_resources, AssistantDockWidget.shutdown, _finish_worker, BatchFitWorker.stop, BatchFitEdgesWorker.stop]
+source_symbols: [PreprocessingWorkerRegistry.start_worker, PreprocessingWorkerRegistry._poll_workers, PreprocessingWorkerRegistry._startup_expired, PreprocessingWorkerRegistry._retire, PreprocessingWorkerRegistry._settle_public_completion, PreprocessingMixin._begin_preprocessing_workflow, PreprocessingMixin._clear_preprocessing_worker_reference, PreprocessingMixin.stop_summation, PreprocessingMixin.stop_full_process, FitsViewer.cleanup_resources, AssistantDockWidget.shutdown, _finish_worker, BatchFitWorker.stop, BatchFitEdgesWorker.stop]
 test_paths: [tests/test_preprocessing_worker_ownership.py, tests/test_preprocessing_workers.py, tests/test_preprocessing_normalisation.py, tests/test_preprocessing_normalisation_raden.py, tests/test_preprocessing_full_process.py, tests/test_fitting_headless.py, tests/test_assistant_panel.py, tests/test_assistant_semantic_retrieval.py, tests/test_pattern_batch_worker.py, tests/test_batch_mapping_outputs.py]
 ---
 
@@ -79,10 +79,19 @@ a fast post-start `isFinished()` state also covers a thread that exits before
 the GUI observes it running. The registry never treats `wait(0)` on a
 never-started thread as completion: it uses that nonblocking check only after
 start/exit evidence and combines it with `isFinished()` and not-running state.
-If start is rejected or unacknowledged, a bounded 500 ms startup check reports
-that the operation did not run and returns the family to idle. If Qt state is
-ambiguous, the worker stays owned rather than risking destruction of a thread
-that may still be starting.
+The 500 ms startup check is diagnostic, not grounds for retirement: if Qt has
+not acknowledged a start and the thread is not verifiably rejected, the
+registry reports that startup remains unacknowledged and keeps the worker
+strongly owned while its active-only poll continues. A delayed start can then
+be acknowledged normally. A custom wrapper may raise
+`PreprocessingWorkerStartRejected` to report a synchronous rejection; even
+then, retirement requires an unchanged pre-start state and a nonblocking
+`wait(0)`. An arbitrary exception may have occurred after Qt accepted the
+start, so it is treated as ambiguous. If startup remains indefinitely
+ambiguous, ownership and the family lock are intentionally retained rather
+than risking destruction of a thread that may later start. The user receives
+a diagnostic; same-family Run remains unavailable until Qt supplies safe
+start/exit evidence. This is an exceptional residual limitation.
 
 Public adapter `finished` is deliberately separate from native QThread exit.
 Issue #41 workers manually emit a public signal from `run()`, and that signal
@@ -92,6 +101,18 @@ exit through `isFinished()`, not-running state and successful `wait(0)`. The
 worker remains strongly referenced until its queued payload/completion handoff
 is processed and actual exit is confirmed. No GUI Stop or completion path
 uses a positive-timeout wait, `quit()` or forceful termination.
+
+After completion handling consumes the worker's structured result, or after a
+cancelled/abnormal worker's actual exit is confirmed, the registry runs a
+GUI-side cleanup callback. It clears direct mixin convenience attributes only
+when they still refer to that exact worker, including transient image-loader
+attributes and numbered lazy Summation loaders. A stale worker therefore
+cannot clear a newer worker bound to the same attribute. Cancelled workers do
+not need their public completion handler to run for references to be released.
+Timer callbacks and signal-proxy references are detached on retirement so they
+do not keep the worker/result graph alive. Run-button state is restored from
+the state recorded when that generation began, and Normalisation remains
+disabled while a related Open Beam loader is still active.
 
 Payload and public completion signals enter one queued QObject receiver.
 Payloads are held for the receiver's completion handoff, then delivered before
