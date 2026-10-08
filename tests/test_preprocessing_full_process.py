@@ -76,6 +76,17 @@ class FullProcessFixture(unittest.TestCase):
             _write_run(self.sample, "sample")
             _write_run(self.beam, "beam")
 
+    def set_run_frame_count(self, folder: Path, branch: str, count: int):
+        for index in range(count, 4):
+            (folder / f"{branch}_{index:05}.fits").unlink()
+        tof = np.array([1.0, 1.00001, 2.0, 2.00001], dtype=np.float32)[:count]
+        np.savetxt(folder / f"{branch}_Spectra.txt", np.column_stack((tof, tof)))
+        np.savetxt(
+            folder / f"{branch}_ShutterCount.txt",
+            np.array([[0, 2500], [1, 2500]], dtype=np.int32),
+            fmt="%d\t%d",
+        )
+
     def worker(self):
         return FullProcessWorker(
             str(self.sample), str(self.beam), str(self.output), "unused-base", 0, 0
@@ -427,6 +438,82 @@ class TestFullProcessPipeline(FullProcessFixture):
         )
         self.assertTrue(any("unmanifested image" in message for message in messages))
 
+    def test_repeated_run_with_fewer_corrected_frames_uses_current_image_manifests(self):
+        self.make_input()
+        first_result, _messages, _progress, _load = self.run_pipeline()
+        self.assertEqual(first_result.status, PreprocessingStatus.SUCCEEDED)
+
+        self.set_run_frame_count(self.sample, "sample", 2)
+        self.set_run_frame_count(self.beam, "beam", 2)
+        result, _messages, _progress, _load = self.run_pipeline()
+
+        self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
+        sample_overlap = next(
+            stage for stage in result.stages
+            if stage.stage is full_process.FullProcessStage.SAMPLE_OVERLAP
+        )
+        beam_overlap = next(
+            stage for stage in result.stages
+            if stage.stage is full_process.FullProcessStage.OPEN_BEAM_OVERLAP
+        )
+        normalisation = result.stages[-1]
+        self.assertEqual(sample_overlap.operation_result.expected_count, 2)
+        self.assertEqual(beam_overlap.operation_result.expected_count, 2)
+        self.assertEqual(normalisation.operation_result.expected_count, 2)
+        self.assertEqual(
+            len([
+                output for output in normalisation.operation_result.outputs
+                if output.role == "normalised_image"
+            ]),
+            2,
+        )
+
+    def test_missing_current_metadata_fails_even_when_stale_sidecar_remains(self):
+        self.make_input()
+        first_result, _messages, _progress, _load = self.run_pipeline()
+        self.assertEqual(first_result.status, PreprocessingStatus.SUCCEEDED)
+        stale_shutter = (
+            self.output
+            / "1_cleaned_sample_data"
+            / "Run1_sample_ShutterCount.txt"
+        )
+        self.assertTrue(stale_shutter.exists())
+
+        (self.sample / "sample_ShutterCount.txt").unlink()
+        result, _messages, _progress, _load = self.run_pipeline()
+
+        self.assertEqual(result.status, PreprocessingStatus.FAILED)
+        self.assertEqual(result.failed_stage, full_process.FullProcessStage.SAMPLE_OVERLAP)
+        self.assertTrue(stale_shutter.exists())
+        self.assertTrue(
+            any("missing ShutterCount sidecar" in error.message for error in result.errors)
+        )
+        self.assertNotIn("normalisation", [stage.stage.value for stage in result.stages])
+
+    def test_changed_input_metadata_is_copied_and_used_on_rerun(self):
+        self.make_input()
+        first_result, _messages, _progress, _load = self.run_pipeline()
+        self.assertEqual(first_result.status, PreprocessingStatus.SUCCEEDED)
+
+        changed_tof = np.array([1.0, 1.00001, 2.0, 2.00002], dtype=np.float32)
+        changed_spectra = np.column_stack((changed_tof, changed_tof))
+        np.savetxt(self.sample / "sample_Spectra.txt", changed_spectra)
+        changed_shutter = np.array([[0, 3500], [1, 3500]], dtype=np.int32)
+        np.savetxt(
+            self.sample / "sample_ShutterCount.txt", changed_shutter, fmt="%d\t%d"
+        )
+
+        result, _messages, _progress, _load = self.run_pipeline()
+
+        self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
+        corrected = self.output / "2_corrected_1_cleaned_sample_data"
+        np.testing.assert_allclose(
+            np.loadtxt(corrected / "Run1_sample_Spectra.txt"), changed_spectra
+        )
+        np.testing.assert_array_equal(
+            np.loadtxt(corrected / "Run1_sample_ShutterCount.txt"), changed_shutter
+        )
+
     def test_service_outputs_keep_duplicate_paths_without_directory_scanning(self):
         self.make_input(child_count=1)
         duplicate = ProducedOutput(str(self.output / "existing.fits"), "test")
@@ -680,23 +767,15 @@ class TestFullProcessPipeline(FullProcessFixture):
         )
         self.assertFalse(any(message.startswith("[WARN] Worker finalization:") for message in messages))
 
-    def test_ambiguous_overlap_sidecars_fail_preflight_without_fallback(self):
+    def test_unmanifested_overlap_sidecars_do_not_override_current_run_metadata(self):
         self.make_input()
-        malformed = self.output / "1_cleaned_sample_data" / "a_Spectra.txt"
-        malformed.parent.mkdir()
+        stale_folder = self.output / "1_cleaned_sample_data"
+        stale_folder.mkdir()
+        malformed = stale_folder / "a_Spectra.txt"
         malformed.write_text("not numeric", encoding="utf-8")
-        original_listdir = os.listdir
+        stale_shutter = stale_folder / "a_ShutterCount.txt"
+        stale_shutter.write_text("nan\n", encoding="utf-8")
         selected = []
-
-        def ordered_listdir(path):
-            if os.path.normcase(path) == os.path.normcase(str(malformed.parent)):
-                actual = original_listdir(path)
-                images = [name for name in actual if name.lower().endswith(".fits")]
-                sidecars = [name for name in actual if name.endswith("_Spectra.txt")]
-                return images + ["a_Spectra.txt"] + [name for name in sidecars if name != "a_Spectra.txt"] + [
-                    name for name in actual if name.endswith("_ShutterCount.txt")
-                ]
-            return original_listdir(path)
 
         original_loadtxt = np.loadtxt
 
@@ -708,22 +787,20 @@ class TestFullProcessPipeline(FullProcessFixture):
             str(self.sample), str(self.beam), str(self.output), "unused", 0, 0
         )
         with (
-            patch.object(full_process.os, "listdir", side_effect=ordered_listdir),
             patch.object(full_process.np, "loadtxt", side_effect=track_loadtxt),
         ):
             result = pipeline.run()
-        self.assertEqual(result.status, PreprocessingStatus.FAILED)
-        self.assertEqual(result.failed_stage, full_process.FullProcessStage.SAMPLE_OVERLAP)
+        self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
+        self.assertTrue(malformed.exists())
+        self.assertTrue(stale_shutter.exists())
         self.assertNotIn("a_Spectra.txt", selected)
-        self.assertNotIn("Run1_sample_Spectra.txt", selected)
+        self.assertNotIn("a_ShutterCount.txt", selected)
+        self.assertIn("Run1_sample_Spectra.txt", selected)
+        self.assertIn("Run1_sample_ShutterCount.txt", selected)
         overlap = result.stages[-1]
-        self.assertEqual(overlap.outcome.value, "failed")
+        self.assertEqual(overlap.outcome.value, "succeeded")
         self.assertIsNotNone(overlap.operation_result)
-        self.assertEqual(overlap.operation_result.outputs, ())
-        self.assertTrue(
-            any("ambiguous Spectra sidecars" in error.message for error in result.errors)
-        )
-        self.assertIsNone(overlap.artifact_folder)
+        self.assertTrue(overlap.operation_result.outputs)
 
     def test_stop_during_loader_uses_fresh_operation_token_then_stops_at_boundary(self):
         self.make_input(child_count=1)

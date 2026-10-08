@@ -211,6 +211,12 @@ class TestOverlapInputPreparation(OverlapInputFixture):
                 0,
                 progress_callback=full_progress.append,
             )
+            pipeline._stage_sidecar_manifests[
+                full_process._path_key(str(self.source))
+            ] = (
+                str(self.source / "sample_Spectra.txt"),
+                str(self.source / "sample_ShutterCount.txt"),
+            )
             with self.assertRaises(full_process._StageAbort):
                 pipeline.do_overlap_correction(str(self.source), "Sample")
             result = pipeline.result()
@@ -250,6 +256,12 @@ class TestOverlapInputPreparation(OverlapInputFixture):
         pipeline._stage_image_manifests[
             full_process._path_key(str(self.source))
         ] = tuple(payload["image_paths"])
+        pipeline._stage_sidecar_manifests[
+            full_process._path_key(str(self.source))
+        ] = (
+            str(self.source / "sample_Spectra.txt"),
+            str(self.source / "sample_ShutterCount.txt"),
+        )
         pipeline.do_overlap_correction(str(self.source), "Sample")
         full_result = pipeline.result().stages[0].operation_result
         self.assertEqual(full_result.status, PreprocessingStatus.SUCCEEDED)

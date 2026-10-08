@@ -75,6 +75,7 @@ def prepare_overlap_inputs(
     folder: str,
     *,
     image_paths: Sequence[str] | None = None,
+    related_files: Sequence[str] | None = None,
     stage: str = "Overlap Correction",
     progress_callback: ProgressCallback | None = None,
     message_callback: MessageCallback | None = None,
@@ -113,19 +114,59 @@ def prepare_overlap_inputs(
         errors.append(_context(stage, folder, 0, None, None, f"cannot list folder: {exc}"))
 
     preliminary_image_count = len(all_image_names) if image_paths is None else len(image_paths)
-    spectra_matches = sorted(name for name in folder_names if name.endswith(SPECTRA_SUFFIX))
-    shutter_matches = sorted(name for name in folder_names if name.endswith(SHUTTER_SUFFIX))
+    if related_files is None:
+        spectra_matches = [
+            (name, os.path.join(folder, name))
+            for name in sorted(folder_names)
+            if name.endswith(SPECTRA_SUFFIX)
+        ]
+        shutter_matches = [
+            (name, os.path.join(folder, name))
+            for name in sorted(folder_names)
+            if name.endswith(SHUTTER_SUFFIX)
+        ]
+    else:
+        spectra_matches = []
+        shutter_matches = []
+        for related_path in related_files:
+            candidate_path = os.fspath(related_path)
+            if not os.path.isabs(candidate_path):
+                candidate_path = os.path.join(folder, candidate_path)
+            name = os.path.basename(candidate_path)
+            if name.endswith(SPECTRA_SUFFIX):
+                sidecar_matches = spectra_matches
+            elif name.endswith(SHUTTER_SUFFIX):
+                sidecar_matches = shutter_matches
+            else:
+                continue
+            if not os.path.isfile(candidate_path):
+                errors.append(
+                    _context(
+                        stage,
+                        folder,
+                        preliminary_image_count,
+                        None,
+                        name if name.endswith(SPECTRA_SUFFIX) else None,
+                        f"current-run sidecar '{name}' is missing",
+                    )
+                )
+                continue
+            sidecar_matches.append((name, candidate_path))
+        spectra_matches.sort()
+        shutter_matches.sort()
+
     if len(spectra_matches) != 1:
         detail = (
             "missing Spectra sidecar"
             if not spectra_matches
-            else f"ambiguous Spectra sidecars: {', '.join(spectra_matches)}"
+            else "ambiguous Spectra sidecars: "
+            + ", ".join(name for name, _path in spectra_matches)
         )
         errors.append(
             _context(stage, folder, preliminary_image_count, None, None, detail)
         )
     else:
-        spectra_path = os.path.join(folder, spectra_matches[0])
+        spectra_path = spectra_matches[0][1]
         try:
             spectra_data = np.loadtxt(spectra_path, ndmin=2)
             if spectra_data.ndim != 2 or spectra_data.shape[0] == 0 or spectra_data.shape[1] == 0:
@@ -149,7 +190,8 @@ def prepare_overlap_inputs(
         detail = (
             "missing ShutterCount sidecar"
             if not shutter_matches
-            else f"ambiguous ShutterCount sidecars: {', '.join(shutter_matches)}"
+            else "ambiguous ShutterCount sidecars: "
+            + ", ".join(name for name, _path in shutter_matches)
         )
         errors.append(
             _context(
@@ -162,7 +204,7 @@ def prepare_overlap_inputs(
             )
         )
     else:
-        shutter_path = os.path.join(folder, shutter_matches[0])
+        shutter_path = shutter_matches[0][1]
         try:
             raw_shutter = np.loadtxt(shutter_path, ndmin=2)
             if raw_shutter.ndim != 2 or raw_shutter.size == 0:

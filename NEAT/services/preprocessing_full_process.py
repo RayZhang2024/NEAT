@@ -191,6 +191,19 @@ def _path_key(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
+def _list_sidecar_paths(folder: str) -> tuple[str, ...]:
+    """Snapshot sidecars present in a current source folder."""
+    try:
+        return tuple(
+            os.path.join(folder, filename)
+            for filename in sorted(os.listdir(folder))
+            if filename.endswith(("_Spectra.txt", "_ShutterCount.txt"))
+            and os.path.isfile(os.path.join(folder, filename))
+        )
+    except OSError:
+        return ()
+
+
 class FullProcessPipeline:
     """Compose existing preprocessing services without importing GUI/Qt code."""
 
@@ -238,6 +251,7 @@ class FullProcessPipeline:
         self._current: _StageBuilder | None = None
         self._overall_status = PreprocessingStatus.SUCCEEDED
         self._stage_image_manifests: dict[str, tuple[str, ...]] = {}
+        self._stage_sidecar_manifests: dict[str, tuple[str, ...]] = {}
 
     def run(self) -> FullProcessPipelineResult:
         self._message("=== <b>Full Process Pipeline Started</b> ===")
@@ -323,6 +337,7 @@ class FullProcessPipeline:
             )
             builder.outcome = FullProcessStageOutcome.SKIPPED
             builder.propagation_folder = folder
+            self._stage_sidecar_manifests[_path_key(folder)] = _list_sidecar_paths(folder)
             self._record(builder)
             return folder
 
@@ -380,6 +395,11 @@ class FullProcessPipeline:
             for output in operation_result.outputs
             if output.role == "summed_image"
         )
+        self._stage_sidecar_manifests[_path_key(out_folder)] = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role in {"summed_shutter_count", "spectrum_copy"}
+        )
         if self._parent_running():
             self._message(
                 f"<b>0_sumation_{label} complete</b>, saved at: "
@@ -406,6 +426,7 @@ class FullProcessPipeline:
         short = _short_path(folder)
         self._message(f"1_clean_{label}: Starting Outlier Removal on \\{short}...")
         manifest = self._stage_image_manifests.get(_path_key(folder))
+        related_files = self._stage_sidecar_manifests.get(_path_key(folder), ())
         run = load_full_process_run(
             folder,
             image_paths=manifest,
@@ -431,6 +452,7 @@ class FullProcessPipeline:
                 progress_callback=self._progress,
                 message_callback=self._message,
                 cancellation_check=token.is_set,
+                related_files_by_run=(related_files,),
             )
         except Exception as exc:
             raise _StageOperationFailure(
@@ -453,6 +475,11 @@ class FullProcessPipeline:
             output.path
             for output in operation_result.outputs
             if output.role == "cleaned_image"
+        )
+        self._stage_sidecar_manifests[_path_key(out_folder)] = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role == "related_file_copy"
         )
         if self._parent_running():
             self._message(
@@ -483,6 +510,7 @@ class FullProcessPipeline:
         prepared = prepare_overlap_inputs(
             folder,
             image_paths=manifest,
+            related_files=self._stage_sidecar_manifests.get(_path_key(folder), ()),
             stage=f"2_correction_{label}",
             progress_callback=self._load_progress,
             message_callback=self._message,
@@ -526,6 +554,16 @@ class FullProcessPipeline:
             builder.propagation_folder = folder
             self._record(builder)
             self._abort_for_result(stage, operation_result, f"2_correction_{label} failed.")
+        self._stage_image_manifests[_path_key(out_folder)] = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role == "corrected_image"
+        )
+        self._stage_sidecar_manifests[_path_key(out_folder)] = tuple(
+            output.path
+            for output in operation_result.outputs
+            if output.role == "related_file_copy"
+        )
         if self._parent_running():
             builder.artifact_folder = out_folder
             self._message(
@@ -552,11 +590,13 @@ class FullProcessPipeline:
         )
         sample = load_full_process_run(
             sample_folder,
+            image_paths=self._stage_image_manifests.get(_path_key(sample_folder), ()),
             progress_callback=self._load_progress,
             message_callback=self._message,
         )
         beam = load_full_process_run(
             open_beam_folder,
+            image_paths=self._stage_image_manifests.get(_path_key(open_beam_folder), ()),
             progress_callback=self._load_progress,
             message_callback=self._message,
         )
