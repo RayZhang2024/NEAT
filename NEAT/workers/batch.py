@@ -19,6 +19,7 @@ from ..services.image_io import (
     load_image_file,
     write_fits_image_file,
 )
+from ..services.preprocessing_overlap_inputs import prepare_overlap_inputs
 
 try:
     from PIL import Image
@@ -1687,13 +1688,40 @@ class ImageLoadWorker(QThread):
     finished = pyqtSignal()              # Emits when loading is finished
     message = pyqtSignal(str)            # Emits messages for user feedback
 
-    def __init__(self, folder_path):
+    def __init__(self, folder_path, *, overlap_inputs=False):
         super().__init__()
         self.folder_path = folder_path
+        self.overlap_inputs = overlap_inputs
         self._stop_requested = False
 
     def run(self):
         try:
+            if self.overlap_inputs:
+                prepared = prepare_overlap_inputs(
+                    self.folder_path,
+                    stage="Standalone Overlap Correction preflight",
+                    progress_callback=self.progress_updated.emit,
+                    message_callback=self.message.emit,
+                    cancellation_check=lambda: self._stop_requested,
+                )
+                self.run_loaded.emit(
+                    self.folder_path,
+                    {
+                        "folder_path": self.folder_path,
+                        "images": dict(prepared.run.frames),
+                        "spectra": prepared.spectra_data,
+                        "shutter_count": prepared.shutter_count_data,
+                        "load_errors": prepared.run.load_errors,
+                        "preflight_errors": prepared.errors,
+                        "preflight_warnings": prepared.warnings,
+                        "expected_count": prepared.expected_count,
+                        "spectra_filename": prepared.spectra_filename,
+                        "related_files": prepared.related_files,
+                        "image_paths": prepared.image_paths,
+                    },
+                )
+                return
+
             normalized_path = os.path.normpath(self.folder_path)
             path_parts = normalized_path.split(os.sep)
             if len(path_parts) >= 2:

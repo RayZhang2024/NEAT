@@ -354,10 +354,14 @@ class TestFullProcessPipeline(FullProcessFixture):
         self.assertEqual(result.status, PreprocessingStatus.FAILED)
         self.assertEqual(result.failed_stage, full_process.FullProcessStage.SAMPLE_OVERLAP)
         self.assertNotIn("normalisation", [stage.stage.value for stage in result.stages])
-        self.assertTrue(messages[-1].startswith("[ERROR] 2_correction_Sample:"))
+        self.assertTrue(any("missing Spectra sidecar" in message for message in messages))
         self.assertFalse(
             any("Error in OverlapCorrectionWorker:" in message for message in messages)
         )
+        overlap = result.stages[-1]
+        self.assertEqual(overlap.outcome.value, "failed")
+        self.assertIsNotNone(overlap.operation_result)
+        self.assertEqual(overlap.operation_result.outputs, ())
 
     def test_clean_setup_failure_has_no_artifact_folder(self):
         self.sample.mkdir(parents=True)
@@ -404,22 +408,24 @@ class TestFullProcessPipeline(FullProcessFixture):
         self.assertEqual(stage.operation_result.status, PreprocessingStatus.FAILED)
         self.assertTrue(any("load error" in error.message.lower() for error in result.errors))
 
-    def test_stale_folder_is_reused_but_not_reported_as_new_summation_output(self):
+    def test_stale_summation_image_is_not_cleaned_or_passed_to_overlap(self):
         self.make_input(child_count=2)
         stale_folder = self.output / "0_summed_sample_data"
-        stale_folder.mkdir()
+        first_result, _first_messages, _progress, _load = self.run_pipeline()
+        self.assertEqual(first_result.status, PreprocessingStatus.SUCCEEDED)
         stale = np.full((512, 512), 77, dtype=np.float32)
         fits.writeto(stale_folder / "stale_99999.fits", np.flipud(stale), overwrite=True)
-        result, _messages, _progress, _load = self.run_pipeline()
+        result, messages, _progress, _load = self.run_pipeline()
         self.assertTrue((stale_folder / "stale_99999.fits").exists())
         sum_paths = [
             os.path.normcase(output.path)
             for output in result.stages[0].operation_result.outputs
         ]
         self.assertNotIn(os.path.normcase(str(stale_folder / "stale_99999.fits")), sum_paths)
-        self.assertTrue(
+        self.assertFalse(
             (self.output / "1_cleaned_0_summed_sample_data" / "cleaned_0_summed_sample_data_99999.fits").exists()
         )
+        self.assertTrue(any("unmanifested image" in message for message in messages))
 
     def test_service_outputs_keep_duplicate_paths_without_directory_scanning(self):
         self.make_input(child_count=1)
@@ -674,7 +680,7 @@ class TestFullProcessPipeline(FullProcessFixture):
         )
         self.assertFalse(any(message.startswith("[WARN] Worker finalization:") for message in messages))
 
-    def test_first_malformed_overlap_sidecar_does_not_fall_through(self):
+    def test_ambiguous_overlap_sidecars_fail_preflight_without_fallback(self):
         self.make_input()
         malformed = self.output / "1_cleaned_sample_data" / "a_Spectra.txt"
         malformed.parent.mkdir()
@@ -708,11 +714,15 @@ class TestFullProcessPipeline(FullProcessFixture):
             result = pipeline.run()
         self.assertEqual(result.status, PreprocessingStatus.FAILED)
         self.assertEqual(result.failed_stage, full_process.FullProcessStage.SAMPLE_OVERLAP)
-        self.assertIn("a_Spectra.txt", selected)
+        self.assertNotIn("a_Spectra.txt", selected)
         self.assertNotIn("Run1_sample_Spectra.txt", selected)
         overlap = result.stages[-1]
         self.assertEqual(overlap.outcome.value, "failed")
-        self.assertIsNone(overlap.operation_result)
+        self.assertIsNotNone(overlap.operation_result)
+        self.assertEqual(overlap.operation_result.outputs, ())
+        self.assertTrue(
+            any("ambiguous Spectra sidecars" in error.message for error in result.errors)
+        )
         self.assertIsNone(overlap.artifact_folder)
 
     def test_stop_during_loader_uses_fresh_operation_token_then_stops_at_boundary(self):

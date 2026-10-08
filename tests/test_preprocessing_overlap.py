@@ -177,22 +177,24 @@ class OverlapServiceTests(unittest.TestCase):
         self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
         self.assertEqual(fits.getdata(self.output / "Corrected_sample_2.fits").shape, (1, 1))
 
-    def test_missing_segment_and_duplicate_digit_destinations(self):
+    def test_frame_count_and_non_numeric_suffixes_fail_preflight(self):
         spectra = np.array([[0]], dtype=np.float32)
         frames = {"b1": frame(1), "a01": frame(2), "nodigits": frame(3)}
         result = self.run_service(frames, spectra)
         self.assertEqual(result.status, PreprocessingStatus.FAILED)
-        self.assertEqual(self.failed, ["b1", "a01"])
-        self.assertEqual(self.progress, [33])
-        self.assertEqual(Path(result.outputs[0].path).name, "Corrected_sample_.fits")
+        self.assertEqual((result.processed_count, result.expected_count), (0, 3))
+        self.assertEqual(self.failed, [])
+        self.assertEqual(self.progress, [])
+        self.assertEqual(result.outputs, ())
+        self.assertTrue(any("invalid; expected 1–10 ASCII digits" in message for message in self.messages))
         self.messages.clear()
         self.progress.clear()
         self.failed.clear()
         spectra = np.array([[0], [0.00001]], dtype=np.float32)
         result = self.run_service({"b1": frame(1), "a-1": frame(2)}, spectra)
-        self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
-        self.assertEqual([item.path for item in result.outputs], [str(self.output / "Corrected_sample_1.fits")] * 2)
-        self.assertEqual(self.progress, [50, 100])
+        self.assertEqual(result.status, PreprocessingStatus.FAILED)
+        self.assertEqual(result.outputs, ())
+        self.assertTrue(any("invalid; expected 1–10 ASCII digits" in message for message in self.messages))
 
     def test_nan_frame_fails_after_cumulative_update(self):
         first = frame(1)
@@ -224,9 +226,13 @@ class OverlapServiceTests(unittest.TestCase):
     def test_shutter_reference_and_malformed_setup(self):
         result = self.run_service({"1": frame(1)}, np.empty((0, 1), dtype=np.float32))
         self.assertEqual(result.status, PreprocessingStatus.FAILED)
-        self.assertIn("First segment's interval is 0.", self.messages[-1])
+        self.assertTrue(self.messages[-1].startswith("Error extracting ToF values:"))
         self.messages.clear()
-        result = self.run_service({"1": frame(1)}, shutter=object())
+        result = self.run_service(
+            {"1": frame(1)},
+            np.array([[0]], dtype=np.float32),
+            shutter=object(),
+        )
         self.assertEqual(result.status, PreprocessingStatus.FAILED)
         self.assertTrue(self.messages[-1].startswith("Error processing shutter counts:"))
 
@@ -243,29 +249,32 @@ class OverlapServiceTests(unittest.TestCase):
             return real_copy(src, dst)
 
         with patch.object(overlap.shutil, "copyfile", side_effect=flaky):
-            result = self.run_service({"1": frame(1)})
+            result = self.run_service({str(i): frame(i) for i in (1, 2, 3)})
         self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
         self.assertEqual(calls, ["a_Spectra.txt", "b_Spectra.txt"])
-        self.assertEqual([Path(item.path).name for item in result.outputs], ["Corrected_sample_1.fits", "a_Spectra.txt"])
+        self.assertEqual(
+            [Path(item.path).name for item in result.outputs],
+            ["Corrected_sample_1.fits", "Corrected_sample_2.fits", "Corrected_sample_3.fits", "a_Spectra.txt"],
+        )
         self.assertEqual(len(result.warnings), 1)
 
     def test_missing_output_folder_is_not_upfront_setup_rejection(self):
         missing = self.root / "missing"
-        run = LoadedImageRun(str(self.source), {"1": frame(1)})
         messages = []
         result = overlap.correct_loaded_image_run(
-            run, np.array([[0]], dtype=np.float32),
+            LoadedImageRun(str(self.source), {"1": frame(1), "2": frame(2)}),
+            np.array([[0], [0.00001]], dtype=np.float32),
             np.array([2000], dtype=np.float32), "sample", str(missing),
             message_callback=messages.append,
         )
-        self.assertEqual(result.status, PreprocessingStatus.FAILED)
-        self.assertEqual((result.processed_count, result.expected_count), (0, 1))
+        self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
+        self.assertEqual((result.processed_count, result.expected_count), (2, 2))
         self.assertIn("--- Starting Overlap Correction ---", messages)
-        self.assertTrue(any("Error processing image '1':" in message for message in messages))
-        self.assertFalse(missing.exists())
+        self.assertTrue(missing.exists())
 
     def test_missing_sidecar_messages_use_legacy_short_path(self):
-        result = self.run_service({"1": frame(1)})
+        spectra = np.array([[0], [0.00001]], dtype=np.float32)
+        result = self.run_service({"1": frame(1), "2": frame(2)}, spectra)
         self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
         parts = os.path.normpath(str(self.source)).split(os.sep)
         short_path = os.path.join(parts[-2], parts[-1])
@@ -311,19 +320,21 @@ class OverlapServiceTests(unittest.TestCase):
             return names if path == str(self.source) else real_listdir(path)
 
         with patch.object(overlap.os, "listdir", side_effect=listed):
-            result = self.run_service({"1": frame(1)})
+            result = self.run_service({str(i): frame(i) for i in (1, 2, 3)})
         self.assertEqual(calls, [str(self.source), str(self.source)])
-        self.assertEqual([Path(item.path).name for item in result.outputs[1:]], names)
+        self.assertEqual([Path(item.path).name for item in result.outputs[3:]], names)
         self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
         self.messages.clear()
         with patch.object(overlap.shutil, "copyfile", side_effect=OSError("copy failed")):
-            result = self.run_service({"1": frame(1)})
+            result = self.run_service({str(i): frame(i) for i in (1, 2, 3)})
         self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
         self.assertEqual(result.warnings, ("Error copying spectra or shuttercount files: copy failed",))
-        self.assertEqual(len(result.outputs), 1)
+        self.assertEqual(len(result.outputs), 3)
 
     def test_cancellation_before_loop_and_after_last_frame_snapshot(self):
-        result = self.run_service({"1": frame(1)}, cancellation_check=lambda: True)
+        result = self.run_service(
+            {str(i): frame(i) for i in (1, 2, 3)}, cancellation_check=lambda: True
+        )
         self.assertEqual(result.status, PreprocessingStatus.CANCELLED)
         self.assertIn("--- Starting Overlap Correction ---", self.messages)
         self.assertIn("Overlap Correction process has been stopped by the user.", self.messages)
@@ -357,9 +368,12 @@ class OverlapServiceTests(unittest.TestCase):
             cancelled = True
 
         with patch.object(overlap.shutil, "copyfile", side_effect=copy_then_cancel):
-            result = self.run_service({"1": frame(1)}, cancellation_check=lambda: cancelled)
+            result = self.run_service(
+                {str(i): frame(i) for i in (1, 2, 3)},
+                cancellation_check=lambda: cancelled,
+            )
         self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
-        self.assertEqual(len(result.outputs), 2)
+        self.assertEqual(len(result.outputs), 4)
 
     def test_import_is_headless_in_fresh_process(self):
         code = "\n".join(
@@ -462,9 +476,12 @@ class OverlapWorkerAdapterTests(unittest.TestCase):
             worker.finished.connect(lambda: finished.append(True))
             worker.run()
             self.assertFalse(worker.succeeded)
-            self.assertEqual(worker.failed_frames, ["2", "3"])
+            self.assertEqual(worker.failed_frames, [])
             self.assertEqual(worker.result.status, PreprocessingStatus.FAILED)
-            self.assertEqual(worker.result.processed_count, 1)
+            self.assertEqual(worker.result.processed_count, 0)
+            self.assertEqual(worker.result.expected_count, 3)
+            self.assertIn("images=3, ToF rows=1", worker.result.errors[0])
+            self.assertFalse(list(output.iterdir()))
             self.assertEqual(len(finished), 1)
 
 

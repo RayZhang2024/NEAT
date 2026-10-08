@@ -230,6 +230,11 @@ class OverlapCorrectionWorker(QThread):
                 fatal_error_callback=lambda exc: self.message.emit(
                     f"Error in OverlapCorrectionWorker: {exc}"
                 ),
+                preflight_errors=self.run_data.get("preflight_errors") or (),
+                expected_count=self.run_data.get("expected_count"),
+                spectra_filename=self.run_data.get("spectra_filename"),
+                related_files=self.run_data.get("related_files"),
+                preflight_warnings=self.run_data.get("preflight_warnings") or (),
             )
             self.succeeded = self.result.status is PreprocessingStatus.SUCCEEDED
         except Exception as exc:

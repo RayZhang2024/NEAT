@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
@@ -15,6 +15,7 @@ from ..domain import (
     ProducedOutput,
 )
 from .image_io import write_fits_image_file
+from .preprocessing_overlap_inputs import validate_frame_suffixes
 
 ProgressCallback = Callable[[int], None]
 MessageCallback = Callable[[str], None]
@@ -68,8 +69,8 @@ def _numeric_key(suffix: str) -> int:
 
 def correct_loaded_image_run(
     run: LoadedImageRun,
-    spectra_data: np.ndarray,
-    shutter_count_data: np.ndarray,
+    spectra_data: np.ndarray | None,
+    shutter_count_data: np.ndarray | None,
     base_name: str,
     output_folder: str,
     *,
@@ -78,14 +79,20 @@ def correct_loaded_image_run(
     cancellation_check: CancellationCheck | None = None,
     frame_failure_callback: FrameFailureCallback | None = None,
     fatal_error_callback: FatalErrorCallback | None = None,
+    preflight_errors: Sequence[str] = (),
+    expected_count: int | None = None,
+    spectra_filename: str | None = None,
+    related_files: Sequence[str] | None = None,
+    preflight_warnings: Sequence[str] = (),
 ) -> PreprocessingOperationResult:
     """Correct frames sequentially, retaining legacy messages and partial outputs."""
-    expected_count = len(run.frames)
+    expected_count = len(run.frames) if expected_count is None else expected_count
     processed = 0
     outputs: list[ProducedOutput] = []
     errors: list[str] = []
     warnings: list[str] = []
     failed_frames: list[str] = []
+    warnings.extend(str(warning) for warning in preflight_warnings)
 
     def emit(message: str) -> None:
         if message_callback is not None:
@@ -127,13 +134,66 @@ def correct_loaded_image_run(
             else normalized_path
         )
 
+        if preflight_errors:
+            return abort("\n".join(str(error) for error in preflight_errors))
+        if not images_dict:
+            return abort("No images found in the run. Aborting.")
+
+        if spectra_data is None:
+            selected = spectra_filename or "not selected"
+            return abort(
+                f"Overlap Correction: folder='{folder_path}', images={expected_count}, "
+                f"ToF rows=unknown, Spectra='{selected}': Spectra data is unavailable."
+            )
+
         try:
+            spectra_data = np.asarray(spectra_data)
+            if spectra_data.ndim != 2 or spectra_data.shape[0] == 0 or spectra_data.shape[1] == 0:
+                raise ValueError("expected at least one row and one column")
+            if not np.isfinite(spectra_data).all():
+                raise ValueError("contains non-finite values")
             if spectra_data.dtype != np.float32:
                 spectra_data = spectra_data.astype(np.float32)
             tof_values = spectra_data[:, 0]
             emit("Extracted ToF values from Spectra data.")
         except Exception as exc:
             return abort(f"Error extracting ToF values: {exc}. Aborting run.")
+
+        sorted_suffixes, identity_errors = validate_frame_suffixes(tuple(images_dict))
+        if identity_errors:
+            selected = spectra_filename or "not selected"
+            return abort(
+                f"Overlap Correction: folder='{folder_path}', images={expected_count}, "
+                f"ToF rows={len(tof_values)}, Spectra='{selected}': "
+                + " ".join(identity_errors)
+            )
+
+        if expected_count != len(tof_values):
+            if expected_count > len(tof_values) and len(sorted_suffixes) > len(tof_values):
+                problem = (
+                    f"extra/unmatched image suffix '{sorted_suffixes[len(tof_values)]}'"
+                )
+            else:
+                problem = f"missing image for ToF row {min(expected_count, len(tof_values)) + 1}"
+            selected = spectra_filename or "not selected"
+            return abort(
+                f"Overlap Correction: folder='{folder_path}', images={expected_count}, "
+                f"ToF rows={len(tof_values)}, Spectra='{selected}': {problem}."
+            )
+
+        if shutter_count_data is None:
+            selected = spectra_filename or "not selected"
+            return abort(
+                f"Overlap Correction: folder='{folder_path}', images={expected_count}, "
+                f"ToF rows={len(tof_values)}, Spectra='{selected}': "
+                "ShutterCount data is unavailable."
+            )
+        try:
+            shutter_count_data = np.asarray(shutter_count_data)
+            if shutter_count_data.size and not np.isfinite(shutter_count_data).all():
+                raise ValueError("contains non-finite or nonnumeric values")
+        except Exception as exc:
+            return abort(f"Error processing shutter counts: {exc}. Aborting run.")
 
         try:
             tof_intervals = np.diff(tof_values)
@@ -187,10 +247,14 @@ def correct_loaded_image_run(
             return abort(f"Error initializing cumulative arrays: {exc}. Aborting.")
 
         try:
-            sorted_suffixes = sorted(images_dict.keys(), key=_numeric_key)
             sorted_images = [images_dict[suf] for suf in sorted_suffixes]
         except Exception as exc:
             return abort(f"Error sorting images: {exc}. Aborting run.")
+
+        try:
+            os.makedirs(output_folder, exist_ok=True)
+        except OSError as exc:
+            return abort(f"Cannot create overlap output folder '{output_folder}': {exc}")
 
         emit("--- Starting Overlap Correction ---")
         total_imgs = len(sorted_suffixes)
@@ -277,29 +341,48 @@ def correct_loaded_image_run(
         try:
             spectra_suffix = "_Spectra.txt"
             shuttercount_suffix = "_ShutterCount.txt"
-            spectra_files = [f for f in os.listdir(folder_path) if f.endswith(spectra_suffix)]
+            if related_files is not None:
+                selected_related_files = list(related_files)
+                spectra_files = [
+                    path for path in selected_related_files
+                    if os.path.basename(path).endswith(spectra_suffix)
+                ]
+                shuttercount_files = [
+                    path for path in selected_related_files
+                    if os.path.basename(path).endswith(shuttercount_suffix)
+                ]
+            else:
+                spectra_files = [f for f in os.listdir(folder_path) if f.endswith(spectra_suffix)]
+                shuttercount_files = [
+                    f for f in os.listdir(folder_path) if f.endswith(shuttercount_suffix)
+                ]
             if not spectra_files:
                 emit(f"No files ending with '{spectra_suffix}' found in \\{short_path}.")
             else:
                 for spectra_file in spectra_files:
-                    source_path = os.path.join(folder_path, spectra_file)
-                    dest_path = os.path.join(output_folder, spectra_file)
+                    source_path = (
+                        spectra_file if related_files is not None
+                        else os.path.join(folder_path, spectra_file)
+                    )
+                    spectra_name = os.path.basename(spectra_file)
+                    dest_path = os.path.join(output_folder, spectra_name)
                     shutil.copyfile(source_path, dest_path)
                     outputs.append(ProducedOutput(dest_path, "related_file_copy"))
-                    emit(f"'{spectra_file}' copied to output folder.")
+                    emit(f"'{spectra_name}' copied to output folder.")
 
-            shuttercount_files = [
-                f for f in os.listdir(folder_path) if f.endswith(shuttercount_suffix)
-            ]
             if not shuttercount_files:
                 emit(f"No files ending with '{shuttercount_suffix}' found in \\{short_path}.")
             else:
                 for shuttercount_file in shuttercount_files:
-                    source_path = os.path.join(folder_path, shuttercount_file)
-                    dest_path = os.path.join(output_folder, shuttercount_file)
+                    source_path = (
+                        shuttercount_file if related_files is not None
+                        else os.path.join(folder_path, shuttercount_file)
+                    )
+                    shutter_name = os.path.basename(shuttercount_file)
+                    dest_path = os.path.join(output_folder, shutter_name)
                     shutil.copyfile(source_path, dest_path)
                     outputs.append(ProducedOutput(dest_path, "related_file_copy"))
-                    emit(f"'{shuttercount_file}' copied to output folder.")
+                    emit(f"'{shutter_name}' copied to output folder.")
         except Exception as exc:
             warning = f"Error copying spectra or shuttercount files: {exc}"
             warnings.append(warning)
