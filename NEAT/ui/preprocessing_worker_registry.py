@@ -17,6 +17,10 @@ from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 Callback = Callable[..., None]
 
 
+class PreprocessingWorkerStartRejected(RuntimeError):
+    """Signal an explicit synchronous rejection before Qt accepted a start."""
+
+
 @dataclass
 class _Generation:
     family: str
@@ -37,6 +41,7 @@ class _WorkerRecord:
     handlers: dict[str, Callback]
     start_invoked: bool = False
     start_acknowledged: bool = False
+    finished_before_start: bool | None = None
     public_completion: bool = False
     payload_handoff_settled: bool = False
     completion_settle_scheduled: bool = False
@@ -45,9 +50,13 @@ class _WorkerRecord:
     exit_confirmed: bool = False
     retired: bool = False
     start_error: str | None = None
+    start_rejected: bool = False
+    startup_diagnostic_emitted: bool = False
+    ambiguity_diagnostic_emitted: bool = False
     startup_timer: QTimer | None = None
     grace_timer: QTimer | None = None
     proxy: "_WorkerSignalProxy | None" = None
+    on_retired: Callback | None = None
 
 
 class _WorkerSignalProxy(QObject):
@@ -55,36 +64,41 @@ class _WorkerSignalProxy(QObject):
 
     def __init__(self, registry: "PreprocessingWorkerRegistry", record: _WorkerRecord):
         super().__init__(registry)
-        self._registry = registry
-        self._record = record
+        self._registry: PreprocessingWorkerRegistry | None = registry
+        self._record: _WorkerRecord | None = record
+
+    def _dispatch(self, method: str, *args) -> None:
+        registry, record = self._registry, self._record
+        if registry is not None and record is not None:
+            getattr(registry, method)(record, *args)
 
     @pyqtSlot()
     def started(self):
-        self._registry._acknowledge_start(self._record)
+        self._dispatch("_acknowledge_start")
 
     @pyqtSlot()
     def finished(self):
-        self._registry._public_finished(self._record)
+        self._dispatch("_public_finished")
 
     @pyqtSlot(int)
     def progress(self, value):
-        self._registry._forward(self._record, "progress_updated", value)
+        self._dispatch("_forward", "progress_updated", value)
 
     @pyqtSlot(str)
     def message(self, value):
-        self._registry._forward(self._record, "message", value)
+        self._dispatch("_forward", "message", value)
 
     @pyqtSlot(str, dict)
     def run_loaded(self, folder, images):
-        self._registry._forward(self._record, "run_loaded", folder, images)
+        self._dispatch("_forward", "run_loaded", folder, images)
 
     @pyqtSlot(str, dict)
     def open_beam_loaded(self, folder, images):
-        self._registry._forward(self._record, "open_beam_loaded", folder, images)
+        self._dispatch("_forward", "open_beam_loaded", folder, images)
 
     @pyqtSlot(int)
     def load_progress(self, value):
-        self._registry._forward(self._record, "load_progress_updated", value)
+        self._dispatch("_forward", "load_progress_updated", value)
 
 
 class PreprocessingWorkerRegistry(QObject):
@@ -159,6 +173,7 @@ class PreprocessingWorkerRegistry(QObject):
         generation: _Generation,
         handlers: dict[str, Callback] | None = None,
         completion: Callback | None = None,
+        on_retired: Callback | None = None,
     ) -> bool:
         """Register, connect GUI-thread gates, then start one owned worker."""
         if (
@@ -173,6 +188,7 @@ class PreprocessingWorkerRegistry(QObject):
             generation=generation,
             completion=completion,
             handlers=dict(handlers or {}),
+            on_retired=on_retired,
         )
         proxy = _WorkerSignalProxy(self, record)
         record.proxy = proxy
@@ -190,10 +206,19 @@ class PreprocessingWorkerRegistry(QObject):
             if name in record.handlers and hasattr(worker, name):
                 self._connect(getattr(worker, name), slot)
 
+        try:
+            record.finished_before_start = worker.isFinished()
+        except RuntimeError:
+            record.finished_before_start = None
         record.start_invoked = True
         try:
             worker.start()
+        except PreprocessingWorkerStartRejected as exc:
+            record.start_error = str(exc)
+            record.start_rejected = True
         except Exception as exc:
+            # An override may raise after delegating to QThread.start(). Keep
+            # ownership until Qt provides evidence either way.
             record.start_error = str(exc)
         record.startup_timer = QTimer(self)
         record.startup_timer.setSingleShot(True)
@@ -288,7 +313,6 @@ class PreprocessingWorkerRegistry(QObject):
         record.completion_handled = True
         if record.grace_timer is not None:
             record.grace_timer.stop()
-        self._retire(record)
         try:
             if not self.is_cancelled(record.generation) and record.completion is not None:
                 try:
@@ -298,6 +322,10 @@ class PreprocessingWorkerRegistry(QObject):
                         record.generation, f"GUI completion handling failed: {exc}"
                     )
         finally:
+            # Public completion may need the convenience attribute to read the
+            # structured result. Release that attribute only after the callback
+            # has consumed it, and only if it still points at this worker.
+            self._retire(record)
             self._drain_generation_if_ready(record.generation)
 
     def _poll_workers(self) -> None:
@@ -321,7 +349,7 @@ class PreprocessingWorkerRegistry(QObject):
             if record.startup_timer is not None:
                 record.startup_timer.stop()
             return
-        if record.start_invoked and finished:
+        if self._has_post_start_exit_evidence(record, finished):
             # A fast thread may finish before the GUI observes isRunning()/started.
             record.start_acknowledged = True
         if not record.start_acknowledged:
@@ -403,26 +431,48 @@ class PreprocessingWorkerRegistry(QObject):
         except RuntimeError:
             self._ambiguous(record, "could not verify whether the worker started")
             return
-        if running or finished:
-            if finished and not running:
-                # A post-start finished state proves the fast-exit race.
-                record.start_acknowledged = True
-                self._poll_record(record)
+        if running or self._has_post_start_exit_evidence(record, finished):
+            self._poll_record(record)
             return
-        self.diagnostic.emit(
-            "[WARN] Preprocessing worker failed to start; the operation was not run."
-        )
-        self._retire(record)
-        generation = record.generation
-        generation.abnormal = True
-        generation.closing = True
-        self._drain_generation_if_ready(generation)
+        if record.start_rejected and not record.start_acknowledged:
+            try:
+                no_thread_started = not running and record.worker.wait(0)
+            except RuntimeError:
+                no_thread_started = False
+            # A nonblocking wait is not proof on its own. It is used only with
+            # an explicit rejection contract and unchanged pre-start state.
+            if no_thread_started and finished == record.finished_before_start:
+                self.diagnostic.emit(
+                    "[WARN] Preprocessing worker failed to start; the operation was not run."
+                )
+                generation = record.generation
+                generation.abnormal = True
+                generation.closing = True
+                self._retire(record)
+                self._drain_generation_if_ready(generation)
+                return
+        if not record.startup_diagnostic_emitted:
+            record.startup_diagnostic_emitted = True
+            detail = "Preprocessing worker startup is still unacknowledged; retaining ownership"
+            if record.start_error:
+                detail += f" ({record.start_error})"
+            self.diagnostic.emit(f"[WARN] {detail}.")
 
     def _ambiguous(self, record: _WorkerRecord, detail: str) -> None:
         if record.retired:
             return
-        self.diagnostic.emit(f"[WARN] Preprocessing worker lifetime is uncertain: {detail}.")
+        if not record.ambiguity_diagnostic_emitted:
+            record.ambiguity_diagnostic_emitted = True
+            self.diagnostic.emit(f"[WARN] Preprocessing worker lifetime is uncertain: {detail}.")
         # Keep the strong reference. An ambiguous QThread must never be deleted.
+
+    @staticmethod
+    def _has_post_start_exit_evidence(record: _WorkerRecord, finished: bool) -> bool:
+        return (
+            record.start_invoked
+            and finished
+            and record.finished_before_start is False
+        )
 
     def _retire(self, record: _WorkerRecord) -> None:
         if record.retired:
@@ -431,14 +481,33 @@ class PreprocessingWorkerRegistry(QObject):
         for timer in (record.startup_timer, record.grace_timer):
             if timer is not None:
                 timer.stop()
+                try:
+                    timer.timeout.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
                 timer.deleteLater()
+        record.startup_timer = None
+        record.grace_timer = None
         key = id(record.worker)
         self._records.pop(key, None)
         record.generation.workers.discard(key)
         record.pending_payloads.clear()
+        if record.on_retired is not None:
+            try:
+                record.on_retired(record.worker)
+            except Exception as exc:
+                self.diagnostic.emit(
+                    f"[WARN] Preprocessing worker reference cleanup failed: {exc}."
+                )
+            record.on_retired = None
+        record.completion = None
+        record.handlers.clear()
         if record.proxy is not None:
-            record.proxy.deleteLater()
+            proxy = record.proxy
             record.proxy = None
+            proxy._record = None
+            proxy._registry = None
+            proxy.deleteLater()
         if not self._records:
             self._poll_timer.stop()
 
@@ -458,4 +527,4 @@ class PreprocessingWorkerRegistry(QObject):
             self._poll_timer.start()
 
 
-__all__ = ["PreprocessingWorkerRegistry"]
+__all__ = ["PreprocessingWorkerRegistry", "PreprocessingWorkerStartRejected"]

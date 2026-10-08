@@ -70,6 +70,14 @@ class PreprocessingMixin:
     def _begin_preprocessing_workflow(self, family):
         """Allocate one mutually exclusive generation for a workflow family."""
         registry = self._preprocessing_worker_registry
+        button_family = (
+            "normalisation"
+            if family.startswith("normalisation_open_beam_")
+            else family
+        )
+        run_name = self._PREPROCESSING_RUN_BUTTONS.get(button_family, (None, None))[0]
+        run_button = getattr(self, run_name, None) if run_name else None
+        was_enabled = run_button.isEnabled() if run_button is not None else None
         holder = {}
 
         def on_drained(abnormal):
@@ -83,6 +91,9 @@ class PreprocessingMixin:
             return None
         holder["generation"] = generation
         self._preprocessing_workflow_generations[family] = generation
+        if not hasattr(self, "_preprocessing_run_button_states"):
+            self._preprocessing_run_button_states = {}
+        self._preprocessing_run_button_states[id(generation)] = was_enabled
         return generation
 
     def _start_preprocessing_worker(
@@ -92,8 +103,18 @@ class PreprocessingMixin:
         if generation is None:
             return False
         return self._preprocessing_worker_registry.start_worker(
-            worker, generation, handlers=handlers, completion=completion
+            worker,
+            generation,
+            handlers=handlers,
+            completion=completion,
+            on_retired=self._clear_preprocessing_worker_reference,
         )
+
+    def _clear_preprocessing_worker_reference(self, worker):
+        """Release stale convenience attributes without touching newer workers."""
+        for name, value in tuple(vars(self).items()):
+            if (name.endswith("worker") or name.startswith("_lazy_load_worker_")) and value is worker:
+                setattr(self, name, None)
 
     def _finish_preprocessing_workflow(self, family):
         generation = self._preprocessing_workflow_generations.get(family)
@@ -107,6 +128,9 @@ class PreprocessingMixin:
         if self._preprocessing_workflow_generations.get(family) is not generation:
             return
         self._preprocessing_workflow_generations.pop(family, None)
+        prior_run_enabled = getattr(self, "_preprocessing_run_button_states", {}).pop(
+            id(generation), None
+        )
 
         if family not in self._PREPROCESSING_RUN_BUTTONS:
             if family.startswith("normalisation_open_beam_"):
@@ -118,7 +142,11 @@ class PreprocessingMixin:
                     for name in self._preprocessing_worker_registry.active_families
                 )
                 if not another_load and "normalisation" not in self._preprocessing_worker_registry.active_families:
-                    self.normalisation_normalise_button.setEnabled(True)
+                    if generation.cancelled or abnormal:
+                        enabled = bool(prior_run_enabled)
+                    else:
+                        enabled = bool(getattr(self, "normalisation_open_beam_runs", ()))
+                    self.normalisation_normalise_button.setEnabled(enabled)
                     self.normalisation_stop_button.setEnabled(False)
             return
 
@@ -127,8 +155,12 @@ class PreprocessingMixin:
         run_name, stop_name = self._PREPROCESSING_RUN_BUTTONS[family]
         run_button = getattr(self, run_name, None)
         stop_button = getattr(self, stop_name, None)
+        related_open_beam_load = family == "normalisation" and any(
+            name.startswith("normalisation_open_beam_")
+            for name in self._preprocessing_worker_registry.active_families
+        )
         if run_button is not None:
-            run_button.setEnabled(True)
+            run_button.setEnabled(bool(prior_run_enabled) and not related_open_beam_load)
         if stop_button is not None:
             stop_button.setEnabled(False)
         if generation.cancelled or abnormal:
