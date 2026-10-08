@@ -10,17 +10,17 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import numpy as np
-from PyQt5.QtCore import QEventLoop, QThread, QTimer, Qt, pyqtSignal
-from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QDialog, QMainWindow, QSlider, QTextEdit
-
 from NEAT.ui import main_window as main_window_module
 from NEAT.ui.assistant_panel import AssistantDockWidget
 from NEAT.ui.main_window import FitsViewer
 from NEAT.ui.preprocessing_worker_registry import PreprocessingWorkerRegistry
 from NEAT.ui.assistant_settings_dialog import AssistantSettingsDialog
 from tools.assistant_providers import AssistantSettings
+
+import numpy as np
+from PyQt5.QtCore import QEventLoop, QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QApplication, QDialog, QMainWindow, QSlider, QTextEdit
 
 
 class _ControlledThread(QThread):
