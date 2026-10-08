@@ -5,7 +5,7 @@ doc_type: technical_reference
 functional_area: architecture
 audience: [developer, support]
 neat_version: 4.8.0
-verified_commit: c138fc5804912984b4665821f4c4bea55c9a5b28
+verified_commit: 9a8568d516181ec7c98a25301888a280a4167167
 status: code-verified
 instrument_applicability: [general]
 scientific_review: not-required
