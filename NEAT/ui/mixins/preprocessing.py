@@ -58,6 +58,131 @@ from ..dialogs import MaskGeneratorDialog, OpenBeamPlotDialog
 
 
 class PreprocessingMixin:
+    _PREPROCESSING_RUN_BUTTONS = {
+        "summation": ("summation_sum_button", "summation_stop_button"),
+        "clean": ("outlier_process_button", "outlier_stop_button"),
+        "overlap": ("overlap_correction_correct_button", "overlap_correction_stop_button"),
+        "normalisation": ("normalisation_normalise_button", "normalisation_stop_button"),
+        "filtering": ("filtering_filter_button", "filtering_stop_button"),
+        "full_process": ("full_process_start_button", "full_process_stop_button"),
+    }
+
+    def _begin_preprocessing_workflow(self, family):
+        """Allocate one mutually exclusive generation for a workflow family."""
+        registry = self._preprocessing_worker_registry
+        button_family = (
+            "normalisation"
+            if family.startswith("normalisation_open_beam_")
+            else family
+        )
+        run_name = self._PREPROCESSING_RUN_BUTTONS.get(button_family, (None, None))[0]
+        run_button = getattr(self, run_name, None) if run_name else None
+        was_enabled = run_button.isEnabled() if run_button is not None else None
+        holder = {}
+
+        def on_drained(abnormal):
+            self._preprocessing_family_drained(family, holder["generation"], abnormal)
+
+        generation = registry.begin(family, on_drained=on_drained)
+        if generation is registry.FAMILY_BUSY:
+            self.preproc_message_box.append(
+                f"A {family.replace('_', ' ')} workflow is still retiring; please wait before starting another."
+            )
+            return None
+        holder["generation"] = generation
+        self._preprocessing_workflow_generations[family] = generation
+        if not hasattr(self, "_preprocessing_run_button_states"):
+            self._preprocessing_run_button_states = {}
+        self._preprocessing_run_button_states[id(generation)] = was_enabled
+        return generation
+
+    def _start_preprocessing_worker(
+        self, worker, family, handlers=None, completion=None
+    ):
+        generation = self._preprocessing_workflow_generations.get(family)
+        if generation is None:
+            return False
+        return self._preprocessing_worker_registry.start_worker(
+            worker,
+            generation,
+            handlers=handlers,
+            completion=completion,
+            on_retired=self._clear_preprocessing_worker_reference,
+        )
+
+    def _clear_preprocessing_worker_reference(self, worker):
+        """Release stale convenience attributes without touching newer workers."""
+        for name, value in tuple(vars(self).items()):
+            if (name.endswith("worker") or name.startswith("_lazy_load_worker_")) and value is worker:
+                setattr(self, name, None)
+
+    def _finish_preprocessing_workflow(self, family):
+        generation = self._preprocessing_workflow_generations.get(family)
+        if generation is not None:
+            self._preprocessing_worker_registry.complete_generation(generation)
+
+    def _cancel_preprocessing_workflow(self, family):
+        return self._preprocessing_worker_registry.cancel_family(family)
+
+    def _preprocessing_family_drained(self, family, generation, abnormal):
+        if self._preprocessing_workflow_generations.get(family) is not generation:
+            return
+        self._preprocessing_workflow_generations.pop(family, None)
+        prior_run_enabled = getattr(self, "_preprocessing_run_button_states", {}).pop(
+            id(generation), None
+        )
+
+        if family not in self._PREPROCESSING_RUN_BUTTONS:
+            if family.startswith("normalisation_open_beam_"):
+                another_load = any(
+                    name.startswith("normalisation_open_beam_")
+                    for name in self._preprocessing_workflow_generations
+                ) or any(
+                    name.startswith("normalisation_open_beam_")
+                    for name in self._preprocessing_worker_registry.active_families
+                )
+                if not another_load and "normalisation" not in self._preprocessing_worker_registry.active_families:
+                    if generation.cancelled or abnormal:
+                        enabled = bool(prior_run_enabled)
+                    else:
+                        enabled = bool(getattr(self, "normalisation_open_beam_runs", ()))
+                    self.normalisation_normalise_button.setEnabled(enabled)
+                    self.normalisation_stop_button.setEnabled(False)
+            return
+
+        # A cancelled or abnormal workflow gets a retryable idle UI only after
+        # every owned worker in that family has actually exited.
+        run_name, stop_name = self._PREPROCESSING_RUN_BUTTONS[family]
+        run_button = getattr(self, run_name, None)
+        stop_button = getattr(self, stop_name, None)
+        related_open_beam_load = family == "normalisation" and any(
+            name.startswith("normalisation_open_beam_")
+            for name in self._preprocessing_worker_registry.active_families
+        )
+        if run_button is not None:
+            run_button.setEnabled(bool(prior_run_enabled) and not related_open_beam_load)
+        if stop_button is not None:
+            stop_button.setEnabled(False)
+        if generation.cancelled or abnormal:
+            if family == "summation":
+                self._summation_cancelled = True
+                self._combined_run_2 = None
+                self._combined_run_3 = None
+            elif family == "clean":
+                self._current_outlier_run = None
+            elif family == "overlap":
+                self._current_overlap_run = None
+            elif family == "normalisation":
+                self._current_loaded_run = None
+
+    def _stop_preprocessing_family(self, family):
+        stopped = self._cancel_preprocessing_workflow(family)
+        run_name, stop_name = self._PREPROCESSING_RUN_BUTTONS[family]
+        stop_button = getattr(self, stop_name, None)
+        if stop_button is not None:
+            stop_button.setEnabled(False)
+        return stopped
+
     def setup_preprocessing_tab(self):
         # Main layout for the tab
         main_layout = QVBoxLayout(self.PreProcessingTab)
@@ -546,6 +671,12 @@ class PreprocessingMixin:
             if worker is not None and hasattr(worker, "isRunning") and worker.isRunning():
                 active_workers.append(attr)
 
+        registry = getattr(self, "_preprocessing_worker_registry", None)
+        if registry is not None and registry.workers:
+            active_workers.extend(
+                f"registered:{type(worker).__name__}" for worker in registry.workers
+            )
+
         if active_workers:
             QMessageBox.warning(
                 self,
@@ -713,6 +844,9 @@ class PreprocessingMixin:
             self.preproc_message_box.append(str(exc))
             return
 
+        if self._begin_preprocessing_workflow("full_process") is None:
+            return
+
         # Disable the button to prevent duplicates; enable the Stop button
         self.full_process_start_button.setEnabled(False)
         self.full_process_stop_button.setEnabled(True)
@@ -728,25 +862,16 @@ class PreprocessingMixin:
             window_half,
             adjacent_sum
         )
-        # # Connect worker signals to your existing “universal” slots (or create new ones).
-        # self.full_process_worker.message.connect(self.preproc_message_box.append)
-        # self.full_process_worker.finished.connect(self._full_process_finished)
-        # self.full_process_worker.progress_updated.connect(self._full_process_progress_update)
-        # self.full_process_worker.load_progress_updated.connect(self._full_process_load_progress_update)
-
-        self.full_process_worker.message.connect(
-        self.preproc_message_box.append, Qt.QueuedConnection
+        self._start_preprocessing_worker(
+            self.full_process_worker,
+            "full_process",
+            handlers={
+                "message": self.preproc_message_box.append,
+                "progress_updated": self._full_process_progress_update,
+                "load_progress_updated": self._full_process_load_progress_update,
+            },
+            completion=self._full_process_finished,
         )
-        self.full_process_worker.progress_updated.connect(
-            self._full_process_progress_update, Qt.QueuedConnection
-        )
-        self.full_process_worker.load_progress_updated.connect(
-            self._full_process_load_progress_update, Qt.QueuedConnection
-        )
-        self.full_process_worker.finished.connect(self._full_process_finished, Qt.QueuedConnection)
-
-
-        self.full_process_worker.start()
 
     def _full_process_progress_update(self, value: int):
         """
@@ -760,8 +885,7 @@ class PreprocessingMixin:
 
     def stop_full_process(self):
         if hasattr(self, 'full_process_worker') and self.full_process_worker:
-            self.full_process_worker.stop()
-            # Optionally also call self.full_process_worker.quit() and wait() if you like
+            self._stop_preprocessing_family("full_process")
             self.full_process_stop_button.setEnabled(False)
             self.preproc_message_box.append("Stop signal sent to Full Process.")
         else:
@@ -771,6 +895,7 @@ class PreprocessingMixin:
         """Handle the finishing of the full process, re-enabling buttons as needed."""
         self.full_process_start_button.setEnabled(True)
         self.full_process_stop_button.setEnabled(False)
+        self._finish_preprocessing_workflow("full_process")
 
     def add_outlier_images(self):
         folder_path = QFileDialog.getExistingDirectory(
@@ -812,6 +937,8 @@ class PreprocessingMixin:
             return
 
         # Store parameters and initialize batch index
+        if self._begin_preprocessing_workflow("clean") is None:
+            return
         self._outlier_output_folder = output_folder
         self._outlier_base_name = base_name
         self._current_outlier_index = 0
@@ -826,10 +953,14 @@ class PreprocessingMixin:
         """
         Process the next dataset folder in the outlier removal batch.
         """
+        generation = self._preprocessing_workflow_generations.get("clean")
+        if generation is None or self._preprocessing_worker_registry.is_cancelled(generation):
+            return
         if self._current_outlier_index >= len(self._outlier_batch_paths):
             self.preproc_message_box.append("Batch outlier removal completed.")
             self.outlier_process_button.setEnabled(True)
             self.outlier_stop_button.setEnabled(False)
+            self._finish_preprocessing_workflow("clean")
             return
 
         current_folder = self._outlier_batch_paths[self._current_outlier_index]
@@ -846,11 +977,16 @@ class PreprocessingMixin:
         self.preproc_message_box.append("Loading dataset from folder: \\" + short_path)
         # Start an ImageLoadWorker to load images from the current dataset folder.
         self._outlier_data_load_worker = ImageLoadWorker(current_folder)
-        self._outlier_data_load_worker.progress_updated.connect(self.update_outlier_load_progress)
-        self._outlier_data_load_worker.message.connect(self.preproc_message_box.append)
-        self._outlier_data_load_worker.run_loaded.connect(self._on_outlier_dataset_loaded)
-        self._outlier_data_load_worker.finished.connect(self._on_outlier_data_load_finished)
-        self._outlier_data_load_worker.start()
+        self._start_preprocessing_worker(
+            self._outlier_data_load_worker,
+            "clean",
+            handlers={
+                "progress_updated": self.update_outlier_load_progress,
+                "message": self.preproc_message_box.append,
+                "run_loaded": self._on_outlier_dataset_loaded,
+            },
+            completion=self._on_outlier_data_load_finished,
+        )
 
     def _on_outlier_dataset_loaded(self, folder_path, run_dict):
         if run_dict:
@@ -865,6 +1001,9 @@ class PreprocessingMixin:
         """
         After loading images from the current dataset, start outlier removal for that dataset.
         """
+        generation = self._preprocessing_workflow_generations.get("clean")
+        if generation is None or self._preprocessing_worker_registry.is_cancelled(generation):
+            return
         if not self._current_outlier_run:
             self.preproc_message_box.append("Failed to load dataset; skipping...")
             self._current_outlier_index += 1
@@ -891,10 +1030,15 @@ class PreprocessingMixin:
             output_folder_run,
             self._outlier_base_name
         )
-        self.outlier_worker.progress_updated.connect(self.update_outlier_progress)
-        self.outlier_worker.message.connect(self.preproc_message_box.append)
-        self.outlier_worker.finished.connect(self._on_outlier_removal_finished)
-        self.outlier_worker.start()
+        self._start_preprocessing_worker(
+            self.outlier_worker,
+            "clean",
+            handlers={
+                "progress_updated": self.update_outlier_progress,
+                "message": self.preproc_message_box.append,
+            },
+            completion=self._on_outlier_removal_finished,
+        )
 
     def _on_outlier_removal_finished(self):
         self.preproc_message_box.append(
@@ -943,8 +1087,7 @@ class PreprocessingMixin:
         self.outlier_load_progress.setValue(value)
 
     def stop_outlier_removal(self):
-        if hasattr(self, 'outlier_worker') and self.outlier_worker:
-            self.outlier_worker.stop()
+        if self._stop_preprocessing_family("clean"):
             self.outlier_stop_button.setEnabled(False)
             self.preproc_message_box.append("Outlier removal stopped.")
         else:
@@ -1034,6 +1177,8 @@ class PreprocessingMixin:
             return
 
         # Store parameters and initialize batch index
+        if self._begin_preprocessing_workflow("overlap") is None:
+            return
         self._overlap_output_folder = overall_output_folder
         self._overlap_base_name = base_name
         self._current_overlap_index = 0
@@ -1049,10 +1194,14 @@ class PreprocessingMixin:
         """
         Load and process the next dataset folder in the overlap correction batch.
         """
+        generation = self._preprocessing_workflow_generations.get("overlap")
+        if generation is None or self._preprocessing_worker_registry.is_cancelled(generation):
+            return
         if self._current_overlap_index >= len(self._overlap_batch_paths):
             self.preproc_message_box.append("Batch overlap correction completed.")
             self.overlap_correction_correct_button.setEnabled(True)
             self.overlap_correction_stop_button.setEnabled(False)
+            self._finish_preprocessing_workflow("overlap")
             return
 
         current_folder = self._overlap_batch_paths[self._current_overlap_index]
@@ -1068,11 +1217,16 @@ class PreprocessingMixin:
         self.preproc_message_box.append("Loading dataset from folder: " + short_path)
         # Start an ImageLoadWorker for the current folder
         self._overlap_data_load_worker = ImageLoadWorker(current_folder)
-        self._overlap_data_load_worker.progress_updated.connect(self.update_overlap_correction_load_progress)
-        self._overlap_data_load_worker.message.connect(self.preproc_message_box.append)
-        self._overlap_data_load_worker.run_loaded.connect(self._on_overlap_dataset_loaded)
-        self._overlap_data_load_worker.finished.connect(self._on_overlap_data_load_finished)
-        self._overlap_data_load_worker.start()
+        self._start_preprocessing_worker(
+            self._overlap_data_load_worker,
+            "overlap",
+            handlers={
+                "progress_updated": self.update_overlap_correction_load_progress,
+                "message": self.preproc_message_box.append,
+                "run_loaded": self._on_overlap_dataset_loaded,
+            },
+            completion=self._on_overlap_data_load_finished,
+        )
 
     def _on_overlap_dataset_loaded(self, folder_path, run_dict):
         # Store the loaded dataset along with placeholders for spectra and shutter count data.
@@ -1090,6 +1244,9 @@ class PreprocessingMixin:
         """
         After loading images from the current dataset folder, load required text files.
         """
+        generation = self._preprocessing_workflow_generations.get("overlap")
+        if generation is None or self._preprocessing_worker_registry.is_cancelled(generation):
+            return
         if not self._current_overlap_run:
             self.preproc_message_box.append("Failed to load dataset; skipping...")
             self._current_overlap_index += 1
@@ -1163,10 +1320,15 @@ class PreprocessingMixin:
         self.overlap_correction_worker = OverlapCorrectionWorker(
             self._current_overlap_run, self._overlap_base_name, output_folder_run
         )
-        self.overlap_correction_worker.progress_updated.connect(self.update_overlap_correction_progress)
-        self.overlap_correction_worker.message.connect(self.preproc_message_box.append)
-        self.overlap_correction_worker.finished.connect(self._on_overlap_correction_finished)
-        self.overlap_correction_worker.start()
+        self._start_preprocessing_worker(
+            self.overlap_correction_worker,
+            "overlap",
+            handlers={
+                "progress_updated": self.update_overlap_correction_progress,
+                "message": self.preproc_message_box.append,
+            },
+            completion=self._on_overlap_correction_finished,
+        )
 
     def _on_overlap_correction_finished(self):
         """
@@ -1198,15 +1360,8 @@ class PreprocessingMixin:
         """
         Stop the ongoing Overlap Correction process.
         """
-        if hasattr(self, 'overlap_correction_worker') and self.overlap_correction_worker:
-            self.overlap_correction_worker.stop()
+        if self._stop_preprocessing_family("overlap"):
             self.preproc_message_box.append("Stop signal sent to Overlap Correction process.")
-            # logging.info("Stop signal sent to Overlap Correction process.")
-            # Disable the stop button to prevent multiple stop signals
-            self.overlap_correction_stop_button.setEnabled(False)
-            self.overlap_correction_worker.quit()
-            self.overlap_correction_worker.wait(1000)
-            self.overlap_correction_worker = None
         else:
             self.preproc_message_box.append("No active Overlap Correction process to stop.")
 
@@ -1265,6 +1420,7 @@ class PreprocessingMixin:
                 self.summation_sum_button.setEnabled(False)
                 self.summation_stop_button.setEnabled(False)
             QMessageBox.information(self, "Summation", "Summation process completed successfully!")
+            self._finish_preprocessing_workflow("summation")
 
     def update_summation_progress(self, value):
         self.summation_progress.setValue(value)
@@ -1351,14 +1507,21 @@ class PreprocessingMixin:
             self.preproc_message_box.append("Please enter a base name for the summed images.")
             return
 
+        if self._begin_preprocessing_workflow("summation") is None:
+            return
         self.summation_sum_button.setEnabled(False)
         self._summation_cancelled = False
         self.summation_stop_button.setEnabled(True)
         self.summation_worker = SummationWorker(self.summation_image_runs, base_name, output_folder)
-        self.summation_worker.progress_updated.connect(self.update_summation_progress)
-        self.summation_worker.message.connect(self.preproc_message_box.append)
-        self.summation_worker.finished.connect(self.summation_finished)
-        self.summation_worker.start()
+        self._start_preprocessing_worker(
+            self.summation_worker,
+            "summation",
+            handlers={
+                "progress_updated": self.update_summation_progress,
+                "message": self.preproc_message_box.append,
+            },
+            completion=self.summation_finished,
+        )
 
     def _init_summation_3level(self):
         self._expected_suffix_set = None       # <-- NEW
@@ -1382,6 +1545,8 @@ class PreprocessingMixin:
                 "summed: " + ", ".join(map(os.path.basename, bad_samples)))
             return   
 
+        if self._begin_preprocessing_workflow("summation") is None:
+            return
         self._batch_sum_output_folder = output_folder
         self._batch_sum_base_name = base_name
         self._summation_sample_keys_3 = list(self._summation_samples_3level.keys())
@@ -1393,7 +1558,9 @@ class PreprocessingMixin:
         self._process_next_sample_3level()
 
     def _process_next_sample_3level(self):
-        if self._summation_cancelled:              # <-- NEW
+        if self._summation_cancelled or self._preprocessing_worker_registry.is_cancelled(
+            self._preprocessing_workflow_generations.get("summation")
+        ):              # <-- NEW
             return
 
         if self._current_sample_index_3 >= len(self._summation_sample_keys_3):
@@ -1401,6 +1568,7 @@ class PreprocessingMixin:
             self.summation_sum_button.setEnabled(True)
             self.summation_stop_button.setEnabled(False)
             QMessageBox.information(self, "Summation", "Batch summation (3-level) completed successfully!")
+            self._finish_preprocessing_workflow("summation")
             return
 
         self._current_sample_folder_3 = self._summation_sample_keys_3[self._current_sample_index_3]
@@ -1434,13 +1602,16 @@ class PreprocessingMixin:
             f"Loading run {self._current_run_index_3+1} of sample {os.path.basename(self._current_sample_folder_3_short)}: {current_run_folder_short}"
         )
         self._lazy_load_worker_3 = ImageLoadWorker(current_run_folder)
-        self._lazy_load_worker_3.progress_updated.connect(self.update_summation_load_progress)
-        self._lazy_load_worker_3.message.connect(self.preproc_message_box.append)
-        self._lazy_load_worker_3.run_loaded.connect(
-            lambda folder, run_dict: self._on_run_loaded_3level(folder, run_dict)
+        self._start_preprocessing_worker(
+            self._lazy_load_worker_3,
+            "summation",
+            handlers={
+                "progress_updated": self.update_summation_load_progress,
+                "message": self.preproc_message_box.append,
+                "run_loaded": self._on_run_loaded_3level,
+            },
+            completion=self._on_run_finished_3level,
         )
-        self._lazy_load_worker_3.finished.connect(self._on_run_finished_3level)
-        self._lazy_load_worker_3.start()
 
     def _on_run_loaded_3level(self, folder, run_dict):
         if not run_dict or self._summation_cancelled:
@@ -1501,10 +1672,15 @@ class PreprocessingMixin:
             self._batch_sum_base_name,
             output_folder_run
         )
-        self.summation_worker.progress_updated.connect(self.update_summation_progress)
-        self.summation_worker.message.connect(self.preproc_message_box.append)
-        self.summation_worker.finished.connect(self._on_sample_summation_finished_3level)
-        self.summation_worker.start()
+        self._start_preprocessing_worker(
+            self.summation_worker,
+            "summation",
+            handlers={
+                "progress_updated": self.update_summation_progress,
+                "message": self.preproc_message_box.append,
+            },
+            completion=self._on_sample_summation_finished_3level,
+        )
 
     def _on_sample_summation_finished_3level(self):
         self.preproc_message_box.append(f"Finished summation for sample '{self._current_sample_folder_3_short}'.")
@@ -1538,6 +1714,8 @@ class PreprocessingMixin:
                 "❌  Need at least two sub‑folders (runs) for 2‑level summation.")
             return
 
+        if self._begin_preprocessing_workflow("summation") is None:
+            return
         self._two_level_output_folder = output_folder
         self._two_level_base_name = base_name
         self._two_level_subfolders = list(self._summation_samples_2level)
@@ -1568,13 +1746,16 @@ class PreprocessingMixin:
 
         self.preproc_message_box.append(f"Loading subfolder {self._two_level_index+1}: \\{current_run_folder_short}")
         self._lazy_load_worker_2 = ImageLoadWorker(current_run_folder)
-        self._lazy_load_worker_2.progress_updated.connect(self.update_summation_load_progress)
-        self._lazy_load_worker_2.message.connect(self.preproc_message_box.append)
-        self._lazy_load_worker_2.run_loaded.connect(
-            lambda folder, run_dict: self._on_run_loaded_2level(folder, run_dict)
+        self._start_preprocessing_worker(
+            self._lazy_load_worker_2,
+            "summation",
+            handlers={
+                "progress_updated": self.update_summation_load_progress,
+                "message": self.preproc_message_box.append,
+                "run_loaded": self._on_run_loaded_2level,
+            },
+            completion=self._on_run_finished_2level,
         )
-        self._lazy_load_worker_2.finished.connect(self._on_run_finished_2level)
-        self._lazy_load_worker_2.start()
 
     def _on_run_loaded_2level(self, folder, run_dict):
         if not run_dict or self._summation_cancelled:
@@ -1630,6 +1811,7 @@ class PreprocessingMixin:
                 self.preproc_message_box.append(f"Failed to create output folder \\{short_path}: {e}")
                 self.summation_sum_button.setEnabled(True)
                 self.summation_stop_button.setEnabled(False)
+                self._finish_preprocessing_workflow("summation")
                 return
 
         self.summation_worker = SummationWorker(
@@ -1637,10 +1819,15 @@ class PreprocessingMixin:
             self._two_level_base_name,
             final_folder
         )
-        self.summation_worker.progress_updated.connect(self.update_summation_progress)
-        self.summation_worker.message.connect(self.preproc_message_box.append)
-        self.summation_worker.finished.connect(self._on_two_level_summation_finished)
-        self.summation_worker.start()
+        self._start_preprocessing_worker(
+            self.summation_worker,
+            "summation",
+            handlers={
+                "progress_updated": self.update_summation_progress,
+                "message": self.preproc_message_box.append,
+            },
+            completion=self._on_two_level_summation_finished,
+        )
 
     def _on_two_level_summation_finished(self):
         self.preproc_message_box.append("Finished summation for two-level folder structure.")
@@ -1650,21 +1837,14 @@ class PreprocessingMixin:
         self.summation_sum_button.setEnabled(True)
         self.summation_stop_button.setEnabled(False)
         QMessageBox.information(self, "Summation", "Summation process (2-level) completed successfully!")
+        self._finish_preprocessing_workflow("summation")
 
     def stop_summation(self):
         self._summation_cancelled = True
-        if getattr(self, 'summation_worker', None):
-            self.summation_worker.stop()
-        if getattr(self, '_lazy_load_worker_3', None):
-            self._lazy_load_worker_3.requestInterruption()
-            self._lazy_load_worker_3.wait(1000)
-        if getattr(self, '_lazy_load_worker_2', None):
-            self._lazy_load_worker_2.requestInterruption()
-            self._lazy_load_worker_2.wait(1000)
-        self._summation_cancelled = True           # <-- NEW
-        self.summation_sum_button.setEnabled(True)
-        self.summation_stop_button.setEnabled(False)
-        self.preproc_message_box.append("Stop signal sent – aborting all processes.")
+        if self._stop_preprocessing_family("summation"):
+            self.preproc_message_box.append("Stop signal sent – aborting all processes.")
+        else:
+            self.preproc_message_box.append("No active Summation process to stop.")
 
     def add_normalisation_data_images(self):
         folder_path = QFileDialog.getExistingDirectory(
@@ -1741,6 +1921,14 @@ class PreprocessingMixin:
             self.preproc_message_box.append("No normalisation open beam images to remove.")
 
     def normalise_images(self):
+        if any(
+            family.startswith("normalisation_open_beam_")
+            for family in self._preprocessing_worker_registry.active_families
+        ):
+            self.preproc_message_box.append(
+                "Wait for open-beam image loading to finish before starting normalisation."
+            )
+            return
         # Ensure a sample dataset folder (or folders) has been selected.
         if not hasattr(self, '_normalisation_batch_paths') or not self._normalisation_batch_paths:
             self.preproc_message_box.append("No sample dataset folder selected. Please add data images first.")
@@ -1771,6 +1959,8 @@ class PreprocessingMixin:
         self._base_name = self.normalisation_basename_input.text().strip() or "normalised"
         self._overall_output_folder = overall_output_folder
 
+        if self._begin_preprocessing_workflow("normalisation") is None:
+            return
         # Prepare to process the batch sequentially.
         self._current_dataset_index = 0
 
@@ -1786,10 +1976,14 @@ class PreprocessingMixin:
         Process the next sample dataset in the batch.
         Loads the dataset, then normalises it with the open beam dataset.
         """
+        generation = self._preprocessing_workflow_generations.get("normalisation")
+        if generation is None or self._preprocessing_worker_registry.is_cancelled(generation):
+            return
         if self._current_dataset_index >= len(self._normalisation_batch_paths):
             self.preproc_message_box.append("<b>Normalisation completed.</b>")
             self.normalisation_normalise_button.setEnabled(True)
             self.normalisation_stop_button.setEnabled(False)
+            self._finish_preprocessing_workflow("normalisation")
             return
 
         current_run = self._normalisation_batch_paths[self._current_dataset_index]
@@ -1817,11 +2011,16 @@ class PreprocessingMixin:
         self.preproc_message_box.append(f"Loading dataset from folder: <b> {short_path} </b>")
         # Launch the data loading worker for the current folder.
         self._data_load_worker = ImageLoadWorker(current_folder)
-        self._data_load_worker.progress_updated.connect(self.update_normalisation_load_progress)
-        self._data_load_worker.message.connect(self.preproc_message_box.append)
-        self._data_load_worker.run_loaded.connect(self._on_dataset_loaded)
-        self._data_load_worker.finished.connect(self._on_data_load_finished)
-        self._data_load_worker.start()
+        self._start_preprocessing_worker(
+            self._data_load_worker,
+            "normalisation",
+            handlers={
+                "progress_updated": self.update_normalisation_load_progress,
+                "message": self.preproc_message_box.append,
+                "run_loaded": self._on_dataset_loaded,
+            },
+            completion=self._on_data_load_finished,
+        )
 
     def _start_raden_normalisation(self, sample_run, open_beam_run):
         folder_path = sample_run["folder_path"]
@@ -1844,10 +2043,15 @@ class PreprocessingMixin:
             self._window_half,
             adjacent_sum=self._adjacent_sum,
         )
-        self.normalisation_worker.progress_updated.connect(self.update_normalisation_progress)
-        self.normalisation_worker.message.connect(self.preproc_message_box.append)
-        self.normalisation_worker.finished.connect(self._on_normalisation_finished)
-        self.normalisation_worker.start()
+        self._start_preprocessing_worker(
+            self.normalisation_worker,
+            "normalisation",
+            handlers={
+                "progress_updated": self.update_normalisation_progress,
+                "message": self.preproc_message_box.append,
+            },
+            completion=self._on_normalisation_finished,
+        )
 
     def _on_dataset_loaded(self, folder_path, run_dict):
         # Store the loaded dataset temporarily.
@@ -1862,6 +2066,9 @@ class PreprocessingMixin:
 
     def _on_data_load_finished(self):
         # Once data loading is finished, start normalisation for the loaded dataset.
+        generation = self._preprocessing_workflow_generations.get("normalisation")
+        if generation is None or self._preprocessing_worker_registry.is_cancelled(generation):
+            return
         if not self._current_loaded_run:
             self.preproc_message_box.append("Failed to load dataset, skipping...")
             self._current_dataset_index += 1
@@ -1902,10 +2109,15 @@ class PreprocessingMixin:
             self._window_half,
             adjacent_sum=self._adjacent_sum
         )
-        self.normalisation_worker.progress_updated.connect(self.update_normalisation_progress)
-        self.normalisation_worker.message.connect(self.preproc_message_box.append)
-        self.normalisation_worker.finished.connect(self._on_normalisation_finished)
-        self.normalisation_worker.start()
+        self._start_preprocessing_worker(
+            self.normalisation_worker,
+            "normalisation",
+            handlers={
+                "progress_updated": self.update_normalisation_progress,
+                "message": self.preproc_message_box.append,
+            },
+            completion=self._on_normalisation_finished,
+        )
 
     def _on_normalisation_finished(self):
         """
@@ -1939,10 +2151,14 @@ class PreprocessingMixin:
         Start normalisation for the next sample dataset in batch mode.
         Creates an output folder named "normalised_<foldername>" under the overall output folder.
         """
+        generation = self._preprocessing_workflow_generations.get("normalisation")
+        if generation is None or self._preprocessing_worker_registry.is_cancelled(generation):
+            return
         if self._current_normalisation_index >= len(self._normalisation_batch_runs):
             self.preproc_message_box.append("Batch normalisation completed.")
             self.normalisation_normalise_button.setEnabled(True)
             self.normalisation_stop_button.setEnabled(False)
+            self._finish_preprocessing_workflow("normalisation")
             return
 
         sample_run = self._normalisation_batch_runs[self._current_normalisation_index]
@@ -1966,10 +2182,15 @@ class PreprocessingMixin:
             self._window_half,
             adjacent_sum=self._adjacent_sum
         )
-        self.normalisation_worker.progress_updated.connect(self.update_normalisation_progress)
-        self.normalisation_worker.message.connect(self.preproc_message_box.append)
-        self.normalisation_worker.finished.connect(self._on_individual_normalisation_finished)
-        self.normalisation_worker.start()
+        self._start_preprocessing_worker(
+            self.normalisation_worker,
+            "normalisation",
+            handlers={
+                "progress_updated": self.update_normalisation_progress,
+                "message": self.preproc_message_box.append,
+            },
+            completion=self._on_individual_normalisation_finished,
+        )
 
     def _on_individual_normalisation_finished(self):
         """
@@ -1989,15 +2210,12 @@ class PreprocessingMixin:
         """
         Stop the ongoing normalisation process.
         """
-        if hasattr(self, 'normalisation_worker') and self.normalisation_worker:
-            self.normalisation_worker.stop()
+        stopped = self._stop_preprocessing_family("normalisation")
+        for family in tuple(self._preprocessing_worker_registry.active_families):
+            if family.startswith("normalisation_open_beam_"):
+                stopped = self._preprocessing_worker_registry.cancel_family(family) or stopped
+        if stopped:
             self.preproc_message_box.append("Stop signal sent to Normalisation process.")
-            # logging.info("Stop signal sent to normalisation process.")
-            # Disable the stop button to prevent multiple stop signals
-            self.normalisation_stop_button.setEnabled(False)
-            self.normalisation_worker.quit()
-            self.normalisation_worker.wait(1000)
-            self.normalisation_worker = None
         else:
             self.preproc_message_box.append("No active Normalisation process to stop.")
 
@@ -2016,20 +2234,57 @@ class PreprocessingMixin:
         # Open a folder, start OpenBeamLoadWorker, connect signals
         folder_path = QFileDialog.getExistingDirectory(self, "Select Folder Containing Open Beam Images", "")
         if folder_path:
+            if "normalisation" in self._preprocessing_worker_registry.active_families:
+                self.preproc_message_box.append(
+                    "Wait for the active normalisation workflow to finish before loading another open-beam dataset."
+                )
+                return
+            selection_id = getattr(self, "_open_beam_selection_id", 0) + 1
+            self._open_beam_selection_id = selection_id
             run = self._classify_normalisation_folder(folder_path)
             if run["kind"] == "raden_tiff_stack":
                 self.normalisation_open_beam_runs = [run]
                 self.normalisation_load_progress.setValue(100)
                 self.preproc_message_box.append(self._format_raden_detection_message("open-beam", run["info"]))
                 return
+            family = f"normalisation_open_beam_{selection_id}"
+            if self._begin_preprocessing_workflow(family) is None:
+                return
+
+            self.normalisation_normalise_button.setEnabled(False)
+            self.normalisation_stop_button.setEnabled(True)
 
             # Create and start the worker
             self.open_beam_load_worker = OpenBeamLoadWorker(folder_path, area_x=(10, 500), area_y=(10, 500))
-            self.open_beam_load_worker.progress_updated.connect(self.update_normalisation_load_progress)
-            self.open_beam_load_worker.message.connect(self.preproc_message_box.append)
-            self.open_beam_load_worker.open_beam_loaded.connect(self.handle_normalisation_open_beam_loaded)
-            self.open_beam_load_worker.finished.connect(self.open_beam_loading_finished)
-            self.open_beam_load_worker.start()
+            worker = self.open_beam_load_worker
+            self._start_preprocessing_worker(
+                worker,
+                family,
+                handlers={
+                    "progress_updated": lambda value, sid=selection_id: self._open_beam_progress_for_selection(sid, value),
+                    "message": lambda value, sid=selection_id: self._open_beam_message_for_selection(sid, value),
+                    "open_beam_loaded": lambda path, images, sid=selection_id: self._open_beam_loaded_for_selection(sid, path, images),
+                },
+                completion=lambda selected_worker=worker, selected_family=family: self._open_beam_loading_finished_for_selection(selected_worker, selected_family),
+            )
+
+    def _open_beam_progress_for_selection(self, selection_id, value):
+        if selection_id == getattr(self, "_open_beam_selection_id", None):
+            self.update_normalisation_load_progress(value)
+
+    def _open_beam_message_for_selection(self, selection_id, value):
+        if selection_id == getattr(self, "_open_beam_selection_id", None):
+            self.preproc_message_box.append(value)
+
+    def _open_beam_loaded_for_selection(self, selection_id, folder_path, summed_intensities):
+        if selection_id == getattr(self, "_open_beam_selection_id", None):
+            self.handle_normalisation_open_beam_loaded(folder_path, summed_intensities)
+
+    def _open_beam_loading_finished_for_selection(self, worker, family):
+        if getattr(self, "open_beam_load_worker", None) is worker:
+            self.open_beam_load_worker = None
+            self.preproc_message_box.append("Normalisation open beam image loading thread has finished.")
+        self._finish_preprocessing_workflow(family)
 
     def handle_normalisation_open_beam_loaded(self, folder_path, summed_intensities):
         if not summed_intensities:
@@ -2088,6 +2343,9 @@ class PreprocessingMixin:
             self.preproc_message_box.append("Please enter a base name for filtered images.")
             return
 
+        if self._begin_preprocessing_workflow("filtering") is None:
+            return
+
         # Disable the filter button to prevent multiple concurrent filtering operations
         self.filtering_filter_button.setEnabled(False)
         # Enable the stop button
@@ -2102,27 +2360,23 @@ class PreprocessingMixin:
             base_name=base_name
         )
 
-        # Connect signals
-        self.filtering_worker.progress_updated.connect(self.update_filtering_progress)
-        self.filtering_worker.message.connect(self.preproc_message_box.append)
-        self.filtering_worker.finished.connect(self.filtering_finished)
-
-        self.filtering_worker.start()
+        self._start_preprocessing_worker(
+            self.filtering_worker,
+            "filtering",
+            handlers={
+                "progress_updated": self.update_filtering_progress,
+                "message": self.preproc_message_box.append,
+            },
+            completion=self.filtering_finished,
+        )
         self.preproc_message_box.append("--- Starting Filtering ---")
 
     def stop_filtering(self):
         """
         Stop the ongoing Filtering process, if running.
         """
-        if hasattr(self, 'filtering_worker') and self.filtering_worker:
-            self.filtering_worker.stop()
+        if self._stop_preprocessing_family("filtering"):
             self.preproc_message_box.append("Stop signal sent to Filtering process.")
-            # logging.info("Stop signal sent to Filtering process.")
-            self.filtering_worker.quit()
-            self.filtering_worker.wait(1000)
-            self.filtering_worker = None
-            if hasattr(self, 'filtering_stop_button'):
-                self.filtering_stop_button.setEnabled(False)
         else:
             self.preproc_message_box.append("No active Filtering process to stop.")
 
@@ -2148,17 +2402,25 @@ class PreprocessingMixin:
         self.filtering_filter_button.setEnabled(True)
         if hasattr(self, 'filtering_stop_button'):
             self.filtering_stop_button.setEnabled(False)
+        self._finish_preprocessing_workflow("filtering")
 
     def add_filter_data_images(self):
         folder_path = QFileDialog.getExistingDirectory(self, "Select Folder Containing FITS Data Images", "")
         if folder_path:
+            if self._begin_preprocessing_workflow("filtering") is None:
+                return
             # Similar to your normalisation worker approach:
             self.filtering_data_load_worker = ImageLoadWorker(folder_path)
-            self.filtering_data_load_worker.progress_updated.connect(self.update_filtering_load_progress)
-            self.filtering_data_load_worker.message.connect(self.preproc_message_box.append)
-            self.filtering_data_load_worker.run_loaded.connect(self.handle_filtering_data_run_loaded)
-            self.filtering_data_load_worker.finished.connect(self.filtering_data_loading_finished)
-            self.filtering_data_load_worker.start()
+            self._start_preprocessing_worker(
+                self.filtering_data_load_worker,
+                "filtering",
+                handlers={
+                    "progress_updated": self.update_filtering_load_progress,
+                    "message": self.preproc_message_box.append,
+                    "run_loaded": self.handle_filtering_data_run_loaded,
+                },
+                completion=self.filtering_data_loading_finished,
+            )
 
     def handle_filtering_data_run_loaded(self, folder_path, run_dict):
         # run_dict is suffix -> 2D numpy array
@@ -2171,6 +2433,7 @@ class PreprocessingMixin:
 
     def filtering_data_loading_finished(self):
         self.filtering_data_load_worker = None
+        self._finish_preprocessing_workflow("filtering")
 
     def remove_filter_data_images(self):
         if hasattr(self, 'filtering_image_runs') and self.filtering_image_runs:

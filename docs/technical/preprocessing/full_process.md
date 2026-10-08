@@ -5,13 +5,13 @@ doc_type: technical_reference
 functional_area: preprocessing
 audience: [user, scientist, developer]
 neat_version: 4.8.0
-verified_commit: 51e65cdade5fb2b9bd89f9aa4a7ddd02c523f7e5
+verified_commit: d3de8d15895fa577a6a8bfcd060ea0f48c56f94f
 status: code-verified
 instrument_applicability: [classic image folders]
 scientific_review: pending
-source_paths: [NEAT/ui/mixins/preprocessing.py, NEAT/workers/preprocessing.py, NEAT/services/preprocessing_full_process.py, NEAT/services/image_io.py]
-source_symbols: [PreprocessingMixin.run_full_process, FullProcessWorker, FullProcessPipeline, load_full_process_run, run_full_process]
-test_paths: [tests/test_preprocessing_full_process.py, tests/test_preprocessing_tiff.py, tests/test_preprocessing_layout.py, tests/test_image_io_orientation.py]
+source_paths: [NEAT/ui/preprocessing_worker_registry.py, NEAT/ui/mixins/preprocessing.py, NEAT/workers/preprocessing.py, NEAT/services/preprocessing_full_process.py, NEAT/services/image_io.py]
+source_symbols: [PreprocessingMixin.run_full_process, PreprocessingMixin.stop_full_process, PreprocessingWorkerRegistry, FullProcessWorker, FullProcessPipeline, load_full_process_run, run_full_process]
+test_paths: [tests/test_preprocessing_worker_ownership.py, tests/test_preprocessing_full_process.py, tests/test_preprocessing_tiff.py, tests/test_preprocessing_layout.py, tests/test_image_io_orientation.py]
 ---
 
 # Full Process preprocessing pipeline
@@ -124,6 +124,26 @@ starts, setup and the loader continue; a service reached afterward receives a
 fresh, non-cancelled token and may complete. The next parent boundary then
 stops the pipeline. No forceful thread termination is used. Pre-stopped runs
 still reach the first historical stage boundary and report its stop message.
+
+When launched from the GUI, `FullProcessWorker` is registered with the
+window-owned preprocessing worker registry before start. The GUI Stop handler
+delegates to the worker's existing `stop()` and returns without waiting; the
+registry retains the QThread until native exit and completion handling are
+both confirmed. Structured results remain available through normal completion
+handling; after that, or after a cancelled/abnormal worker exits, the registry
+clears a convenience reference only if it still points to the retiring worker.
+As with other preprocessing families, no subsequent GUI run can reuse that
+family while its worker is still retiring. If Qt does not acknowledge startup,
+the registry retains ownership and reports the ambiguity instead of treating
+the startup timeout as proof of failure. This changes only GUI ownership and
+interactive Stop; the pipeline's stage order, one-child Summation behavior,
+cancellation safe points, outputs and progress streams are unchanged.
+
+This is not application-close coordination. The current
+`closeEvent()`/`cleanup_resources()` path can still accept a close after its
+legacy 1000 ms wait while a registry-owned thread remains alive. Safe
+close-during-processing remains a follow-up release blocker for the next
+Workstream E shutdown issue.
 
 ## Known implementation risks
 
