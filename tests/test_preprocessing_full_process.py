@@ -20,6 +20,7 @@ from NEAT.domain import (
     ProducedOutput,
 )
 from NEAT.services import preprocessing_full_process as full_process
+from NEAT.services import preprocessing_normalisation as normalisation
 from NEAT.services.image_io import load_image_file
 from NEAT.workers.preprocessing import FullProcessWorker
 
@@ -374,6 +375,30 @@ class TestFullProcessPipeline(FullProcessFixture):
         self.assertIsNotNone(overlap.operation_result)
         self.assertEqual(overlap.operation_result.outputs, ())
 
+    def test_no_summation_rejects_duplicate_source_sidecars_before_clean(self):
+        self.make_input()
+        duplicate_spectra = np.array([[1.0, 1.0], [2.0, 2.0]])
+        np.savetxt(self.sample / "other_Spectra.txt", duplicate_spectra + 0.25)
+        np.savetxt(self.sample / "other_ShutterCount.txt", [[0, 3500], [1, 3500]])
+
+        standalone = full_process.prepare_overlap_inputs(str(self.sample))
+        self.assertTrue(any("ambiguous Spectra sidecars" in x for x in standalone.errors))
+        self.assertTrue(any("ambiguous ShutterCount sidecars" in x for x in standalone.errors))
+
+        result, _messages, _progress, _load = self.run_pipeline()
+
+        self.assertEqual(result.status, PreprocessingStatus.FAILED)
+        self.assertEqual(
+            result.failed_stage, full_process.FullProcessStage.SAMPLE_SUMMATION
+        )
+        self.assertTrue(any("ambiguous source Spectra sidecars" in x.message for x in result.errors))
+        self.assertTrue(any("ambiguous source ShutterCount sidecars" in x.message for x in result.errors))
+        self.assertFalse((self.output / "1_cleaned_sample_data").exists())
+        self.assertNotIn(
+            full_process.FullProcessStage.SAMPLE_CLEAN,
+            [stage.stage for stage in result.stages],
+        )
+
     def test_clean_setup_failure_has_no_artifact_folder(self):
         self.sample.mkdir(parents=True)
         self.beam.mkdir(parents=True)
@@ -466,6 +491,95 @@ class TestFullProcessPipeline(FullProcessFixture):
                 if output.role == "normalised_image"
             ]),
             2,
+        )
+
+    def test_normalisation_rerun_uses_current_sidecars_and_prunes_stale_outputs(self):
+        self.make_input()
+        first_result, _messages, _progress, _load = self.run_pipeline()
+        self.assertEqual(first_result.status, PreprocessingStatus.SUCCEEDED)
+
+        (self.sample / "sample_Spectra.txt").rename(
+            self.sample / "renamed_sample_Spectra.txt"
+        )
+        (self.sample / "sample_ShutterCount.txt").rename(
+            self.sample / "renamed_sample_ShutterCount.txt"
+        )
+        (self.beam / "beam_Spectra.txt").rename(
+            self.beam / "renamed_beam_Spectra.txt"
+        )
+        (self.beam / "beam_ShutterCount.txt").rename(
+            self.beam / "renamed_beam_ShutterCount.txt"
+        )
+        np.savetxt(
+            self.sample / "renamed_sample_ShutterCount.txt",
+            [[0, 1500], [1, 1500]],
+            fmt="%d\t%d",
+        )
+        np.savetxt(
+            self.beam / "renamed_beam_ShutterCount.txt",
+            [[0, 3000], [1, 3000]],
+            fmt="%d\t%d",
+        )
+
+        corrected_sample = self.output / "2_corrected_1_cleaned_sample_data"
+        corrected_beam = self.output / "2_corrected_1_cleaned_openbeam_data"
+        real_listdir = os.listdir
+        stale_was_first = set()
+
+        def stale_first(folder):
+            names = real_listdir(folder)
+            normalized = os.path.normcase(os.path.abspath(folder))
+            if normalized == os.path.normcase(os.path.abspath(corrected_sample)):
+                stale = [name for name in names if name == "Run1_sample_ShutterCount.txt"]
+                if stale:
+                    stale_was_first.add("sample")
+                    return stale + [name for name in names if name not in stale]
+            if normalized == os.path.normcase(os.path.abspath(corrected_beam)):
+                stale = [name for name in names if name == "Run1_beam_ShutterCount.txt"]
+                if stale:
+                    stale_was_first.add("open_beam")
+                    return stale + [name for name in names if name not in stale]
+            return names
+
+        scales = []
+        normalised_frames = []
+        original_normalise = normalisation.normalise_classic_frame
+
+        def capture_normalisation(*args, **kwargs):
+            scales.append(float(args[-1]))
+            result = original_normalise(*args, **kwargs)
+            normalised_frames.append(result.copy())
+            return result
+
+        with (
+            patch.object(full_process.os, "listdir", side_effect=stale_first),
+            patch.object(
+                normalisation,
+                "normalise_classic_frame",
+                side_effect=capture_normalisation,
+            ),
+        ):
+            result, _messages, _progress, _load = self.run_pipeline()
+
+        self.assertEqual(result.status, PreprocessingStatus.SUCCEEDED)
+        self.assertEqual(stale_was_first, {"sample", "open_beam"})
+        self.assertEqual(scales, [2.0] * 4)
+        self.assertEqual(len(normalised_frames), 4)
+        final_folder = self.output / "3_normalised_original"
+        final_sidecars = {
+            path.name for path in final_folder.iterdir()
+            if path.name.endswith(("_Spectra.txt", "_ShutterCount.txt"))
+        }
+        self.assertEqual(
+            final_sidecars,
+            {
+                "Run1_Run1_renamed_sample_Spectra.txt",
+                "Run1_Run1_renamed_sample_ShutterCount.txt",
+            },
+        )
+        np.testing.assert_array_equal(
+            load_image_file(str(final_folder / "normalised_00000.fits")),
+            normalised_frames[0],
         )
 
     def test_missing_current_metadata_fails_even_when_stale_sidecar_remains(self):

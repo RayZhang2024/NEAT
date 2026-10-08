@@ -337,7 +337,26 @@ class FullProcessPipeline:
             )
             builder.outcome = FullProcessStageOutcome.SKIPPED
             builder.propagation_folder = folder
-            self._stage_sidecar_manifests[_path_key(folder)] = _list_sidecar_paths(folder)
+            sidecar_paths = _list_sidecar_paths(folder)
+            ambiguities = []
+            for suffix, kind in (
+                ("_Spectra.txt", "Spectra"),
+                ("_ShutterCount.txt", "ShutterCount"),
+            ):
+                matches = [
+                    os.path.basename(path)
+                    for path in sidecar_paths
+                    if os.path.basename(path).endswith(suffix)
+                ]
+                if len(matches) > 1:
+                    ambiguities.append(
+                        f"ambiguous source {kind} sidecars: {', '.join(matches)}"
+                    )
+            if ambiguities:
+                raise RuntimeError(
+                    f"0_summation_{label}: {'; '.join(ambiguities)} in '{short}'."
+                )
+            self._stage_sidecar_manifests[_path_key(folder)] = sidecar_paths
             self._record(builder)
             return folder
 
@@ -609,6 +628,12 @@ class FullProcessPipeline:
                 "Normalisation cannot start because one or more input frames "
                 "could not be loaded."
             )
+        sample_sidecars = self._stage_sidecar_manifests.get(
+            _path_key(sample_folder), ()
+        )
+        open_beam_sidecars = self._stage_sidecar_manifests.get(
+            _path_key(open_beam_folder), ()
+        )
         out_folder = os.path.join(self.output_folder, "3_normalised_original")
         os.makedirs(out_folder, exist_ok=True)
         builder.artifact_folder = out_folder
@@ -630,6 +655,8 @@ class FullProcessPipeline:
                 fatal_error_callback=lambda exc: self._message(
                     f"Fatal error in normalisation: {exc}"
                 ),
+                sample_sidecars_by_run=(sample_sidecars,),
+                open_beam_sidecars_by_run=(open_beam_sidecars,),
             )
         except Exception as exc:
             operation_error = exc
