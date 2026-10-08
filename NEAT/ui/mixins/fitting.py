@@ -199,6 +199,27 @@ class FittingMixin:
     BRAGG_REGION3_MIN_COL = 6
     BRAGG_REGION3_MAX_COL = 7
 
+    # Lightweight defaults keep the mixin usable by focused legacy adapters
+    # that do not compose FitsViewer. The real window overrides these with its
+    # ownership inventory and callback guards.
+    def _track_shutdown_worker(self, worker, role):
+        return None
+
+    def _connect_shutdown_worker_signal(
+        self, worker, signal, callback, *, current_attribute=None
+    ):
+        signal.connect(callback)
+
+    def _suppress_shutdown_worker_callbacks(self, worker):
+        return None
+
+    def _request_shutdown_worker_stop(self, worker, *, suppress_callbacks=False):
+        stop = getattr(worker, "stop", None)
+        if not callable(stop):
+            return False
+        stop()
+        return True
+
     @staticmethod
     def _default_bragg_edge_windows(x_hkl, lower_midpoint=None, upper_midpoint=None):
         """Return default edge windows, clamped by adjacent-edge midpoints."""
@@ -1488,6 +1509,10 @@ class FittingMixin:
         Initiates the batch fitting process over the ROI using the 'fit_region' approach
         for each row in the bragg_table. Similar to 'batch_fit' but calls 'fit_region'.
         """
+        if getattr(self, "_shutdown_close_pending", False) or getattr(
+            self, "_shutdown_committed", False
+        ):
+            return
         if getattr(self, "fitting_data_source", "images") == "profile":
             self.message_box.append("Mapping is not available for imported intensity profiles.")
             return
@@ -1606,11 +1631,25 @@ class FittingMixin:
             fix_t=fix_t,
             fix_eta=fix_eta
         )
-        self.batch_fit_edges_worker.progress_updated.connect(self.update_progress_bar)
-        self.batch_fit_edges_worker.message.connect(self.append_message)
-        self.batch_fit_edges_worker.finished.connect(self.batch_fit_edges_finished)
-        self.batch_fit_edges_worker.current_box_changed.connect(self.update_current_box)
-        self.batch_fit_edges_worker.start()
+        worker = self.batch_fit_edges_worker
+        self._track_shutdown_worker(worker, "batch_fit_edges")
+        self._connect_shutdown_worker_signal(
+            worker, worker.progress_updated, self.update_progress_bar,
+            current_attribute="batch_fit_edges_worker",
+        )
+        self._connect_shutdown_worker_signal(
+            worker, worker.message, self.append_message,
+            current_attribute="batch_fit_edges_worker",
+        )
+        self._connect_shutdown_worker_signal(
+            worker, worker.finished, self.batch_fit_edges_finished,
+            current_attribute="batch_fit_edges_worker",
+        )
+        self._connect_shutdown_worker_signal(
+            worker, worker.current_box_changed, self.update_current_box,
+            current_attribute="batch_fit_edges_worker",
+        )
+        worker.start()
 
         # Start the periodic display updates
         self.update_timer.start()
@@ -2276,7 +2315,8 @@ class FittingMixin:
             return
 
         worker.requestInterruption()
-        worker.stop()
+        if not self._request_shutdown_worker_stop(worker):
+            worker.stop()
         worker.wait(3000)
         if worker.isRunning():
             self.message_box.append("Stopping image loader...")
@@ -2304,22 +2344,19 @@ class FittingMixin:
         Handle the completion of the image loading process.
         Reset the progress bar and re-enable the load button.
         """
-        worker = getattr(self, "fits_image_load_worker", None)
-        if worker is not None:
-            if worker.isRunning():
-                worker.wait(3000)
-            if worker.isRunning():
-                self.message_box.append("Image loader is still running; cleanup deferred.")
-                return
-            self.fits_image_load_worker = None
+        # Keep the convenience reference until the window-owned inventory has
+        # confirmed native exit and dispatched queued loader callbacks.
         self._hide_load_progress_dialog()
         self._set_fits_image_button_states(is_loading=False)
 
     def clear_loaded_fits_images(self):
         worker = getattr(self, "fits_image_load_worker", None)
+        if worker is not None:
+            self._suppress_shutdown_worker_callbacks(worker)
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
-            worker.stop()
+            if not self._request_shutdown_worker_stop(worker, suppress_callbacks=True):
+                worker.stop()
             worker.wait(3000)
         self.fits_image_load_worker = None
 
@@ -2537,9 +2574,12 @@ class FittingMixin:
     def _clear_loaded_images_for_profile_import(self):
         """Release image-stack state before using an imported intensity profile."""
         worker = getattr(self, "fits_image_load_worker", None)
+        if worker is not None:
+            self._suppress_shutdown_worker_callbacks(worker)
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
-            worker.stop()
+            if not self._request_shutdown_worker_stop(worker, suppress_callbacks=True):
+                worker.stop()
             worker.wait(3000)
         self.fits_image_load_worker = None
 
@@ -3161,6 +3201,10 @@ class FittingMixin:
         Load image files by selecting a folder. Only images with suffixes from _00000 to _02924 are loaded.
         After loading, perform intensity check and scaling if necessary.
         """
+        if getattr(self, "_shutdown_close_pending", False) or getattr(
+            self, "_shutdown_committed", False
+        ):
+            return
         # Open a folder dialog to select a directory containing image files.
         folder_path = QFileDialog.getExistingDirectory(
             self, "Select Folder Containing Images", ""
@@ -3183,14 +3227,32 @@ class FittingMixin:
 
             # Start image loading in a separate thread using ImageLoadWorker
             self.fits_image_load_worker = ImageLoadWorker(folder_path)
-            self.fits_image_load_worker.progress_updated.connect(self.update_fits_load_progress)
-            self.fits_image_load_worker.message.connect(self.message_box.append)
-            self.fits_image_load_worker.run_loaded.connect(self.handle_fits_run_loaded)
-            self.fits_image_load_worker.finished.connect(self.fits_image_loading_finished)
-            self.fits_image_load_worker.start()
+            worker = self.fits_image_load_worker
+            self._track_shutdown_worker(worker, "fits_image_loader")
+            self._connect_shutdown_worker_signal(
+                worker, worker.progress_updated, self.update_fits_load_progress,
+                current_attribute="fits_image_load_worker",
+            )
+            self._connect_shutdown_worker_signal(
+                worker, worker.message, self.message_box.append,
+                current_attribute="fits_image_load_worker",
+            )
+            self._connect_shutdown_worker_signal(
+                worker, worker.run_loaded, self.handle_fits_run_loaded,
+                current_attribute="fits_image_load_worker",
+            )
+            self._connect_shutdown_worker_signal(
+                worker, worker.finished, self.fits_image_loading_finished,
+                current_attribute="fits_image_load_worker",
+            )
+            worker.start()
 
     def load_nexus_image_stack(self):
         """Load a NeXus file containing a detector-by-wavelength image stack."""
+        if getattr(self, "_shutdown_close_pending", False) or getattr(
+            self, "_shutdown_committed", False
+        ):
+            return
         file_name, _ = QFileDialog.getOpenFileName(
             self,
             "Select NeXus Image Stack",
@@ -3224,9 +3286,18 @@ class FittingMixin:
         self._show_load_progress_dialog("Loading NeXus Image Stack", "Loading NeXus image stack...")
 
         self.fits_image_load_worker = NexusImageStackLoadWorker(file_name, flight_path)
-        self.fits_image_load_worker.progress_updated.connect(self.update_fits_load_progress)
-        self.fits_image_load_worker.message.connect(self.message_box.append)
-        self.fits_image_load_worker.stack_loaded.connect(
+        worker = self.fits_image_load_worker
+        self._track_shutdown_worker(worker, "fits_image_loader")
+        self._connect_shutdown_worker_signal(
+            worker, worker.progress_updated, self.update_fits_load_progress,
+            current_attribute="fits_image_load_worker",
+        )
+        self._connect_shutdown_worker_signal(
+            worker, worker.message, self.message_box.append,
+            current_attribute="fits_image_load_worker",
+        )
+        self._connect_shutdown_worker_signal(
+            worker, worker.stack_loaded,
             lambda path, images, wavelengths, used_path, stack_info: self.handle_nexus_stack_loaded(
                 path,
                 images,
@@ -3236,8 +3307,11 @@ class FittingMixin:
                 source_label,
             )
         )
-        self.fits_image_load_worker.finished.connect(self.fits_image_loading_finished)
-        self.fits_image_load_worker.start()
+        self._connect_shutdown_worker_signal(
+            worker, worker.finished, self.fits_image_loading_finished,
+            current_attribute="fits_image_load_worker",
+        )
+        worker.start()
 
     @staticmethod
     def _format_byte_size(num_bytes):
@@ -3250,6 +3324,10 @@ class FittingMixin:
 
     def load_raden_tiff_stack(self):
         """Load a RADEN multi-page TIFF stack with sidecar TOF metadata."""
+        if getattr(self, "_shutdown_close_pending", False) or getattr(
+            self, "_shutdown_committed", False
+        ):
+            return
         folder_path = QFileDialog.getExistingDirectory(
             self,
             "Select RADEN TIFF Stack Folder",
@@ -3306,9 +3384,18 @@ class FittingMixin:
         self._show_load_progress_dialog("Loading RADEN TIFF Stack", "Loading RADEN TIFF stack...")
 
         self.fits_image_load_worker = RadenTiffStackLoadWorker(info["file_path"], flight_path)
-        self.fits_image_load_worker.progress_updated.connect(self.update_fits_load_progress)
-        self.fits_image_load_worker.message.connect(self.message_box.append)
-        self.fits_image_load_worker.stack_loaded.connect(
+        worker = self.fits_image_load_worker
+        self._track_shutdown_worker(worker, "fits_image_loader")
+        self._connect_shutdown_worker_signal(
+            worker, worker.progress_updated, self.update_fits_load_progress,
+            current_attribute="fits_image_load_worker",
+        )
+        self._connect_shutdown_worker_signal(
+            worker, worker.message, self.message_box.append,
+            current_attribute="fits_image_load_worker",
+        )
+        self._connect_shutdown_worker_signal(
+            worker, worker.stack_loaded,
             lambda path, images, wavelengths, used_path, stack_info: self.handle_raden_stack_loaded(
                 path,
                 images,
@@ -3317,8 +3404,11 @@ class FittingMixin:
                 stack_info,
             )
         )
-        self.fits_image_load_worker.finished.connect(self.fits_image_loading_finished)
-        self.fits_image_load_worker.start()
+        self._connect_shutdown_worker_signal(
+            worker, worker.finished, self.fits_image_loading_finished,
+            current_attribute="fits_image_load_worker",
+        )
+        worker.start()
 
     def _choose_nexus_flight_path(self, info):
         app_flight_path = float(getattr(self, "flight_path", 0.0) or 0.0)
@@ -5498,6 +5588,10 @@ class FittingMixin:
         Initiates the batch fitting process over the ROI by calling the fit_full_pattern
         function for each box in the defined grid.
         """
+        if getattr(self, "_shutdown_close_pending", False) or getattr(
+            self, "_shutdown_committed", False
+        ):
+            return
         if getattr(self, "fitting_data_source", "images") == "profile":
             self.message_box.append("Mapping is not available for imported intensity profiles.")
             return
@@ -5601,11 +5695,25 @@ class FittingMixin:
             fix_t=fix_t,
             fix_eta=fix_eta
         )
-        self.batch_fit_worker.progress_updated.connect(self.update_progress_bar)
-        self.batch_fit_worker.message.connect(self.append_message)
-        self.batch_fit_worker.finished.connect(self.batch_fit_finished)
-        self.batch_fit_worker.current_box_changed.connect(self.update_current_box)
-        self.batch_fit_worker.start()
+        worker = self.batch_fit_worker
+        self._track_shutdown_worker(worker, "batch_fit")
+        self._connect_shutdown_worker_signal(
+            worker, worker.progress_updated, self.update_progress_bar,
+            current_attribute="batch_fit_worker",
+        )
+        self._connect_shutdown_worker_signal(
+            worker, worker.message, self.append_message,
+            current_attribute="batch_fit_worker",
+        )
+        self._connect_shutdown_worker_signal(
+            worker, worker.finished, self.batch_fit_finished,
+            current_attribute="batch_fit_worker",
+        )
+        self._connect_shutdown_worker_signal(
+            worker, worker.current_box_changed, self.update_current_box,
+            current_attribute="batch_fit_worker",
+        )
+        worker.start()
 
         # Start a timer for periodic display updates
         self.update_timer.start()
@@ -5620,13 +5728,13 @@ class FittingMixin:
 
         # Stop the standard batch-fit worker
         if hasattr(self, 'batch_fit_worker') and self.batch_fit_worker.isRunning():
-            self.batch_fit_worker.stop()
+            self._request_shutdown_worker_stop(self.batch_fit_worker)
             self.message_box.append("Stop requested for BatchFitWorker. Please wait...")
             stopped_any = True
 
         # Stop the edges batch-fit worker
         if hasattr(self, 'batch_fit_edges_worker') and self.batch_fit_edges_worker.isRunning():
-            self.batch_fit_edges_worker.stop()
+            self._request_shutdown_worker_stop(self.batch_fit_edges_worker)
             self.message_box.append("Stop requested for BatchFitEdgesWorker. Please wait...")
             stopped_any = True
 

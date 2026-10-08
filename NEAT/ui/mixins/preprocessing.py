@@ -69,6 +69,10 @@ class PreprocessingMixin:
 
     def _begin_preprocessing_workflow(self, family):
         """Allocate one mutually exclusive generation for a workflow family."""
+        if getattr(self, "_shutdown_close_pending", False) or getattr(
+            self, "_shutdown_committed", False
+        ):
+            return None
         registry = self._preprocessing_worker_registry
         button_family = (
             "normalisation"

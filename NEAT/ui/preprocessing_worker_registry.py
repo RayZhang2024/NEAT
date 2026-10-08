@@ -57,6 +57,7 @@ class _WorkerRecord:
     grace_timer: QTimer | None = None
     proxy: "_WorkerSignalProxy | None" = None
     on_retired: Callback | None = None
+    shutdown_stop_attempted: bool = False
 
 
 class _WorkerSignalProxy(QObject):
@@ -105,6 +106,7 @@ class PreprocessingWorkerRegistry(QObject):
     """Strongly retain GUI preprocessing workers through verified QThread exit."""
 
     diagnostic = pyqtSignal(str)
+    state_changed = pyqtSignal()
     FAMILY_BUSY = object()
     STARTUP_GRACE_MS = 500
     POLL_INTERVAL_MS = 25
@@ -136,6 +138,7 @@ class PreprocessingWorkerRegistry(QObject):
         self._next_generation[family] = number
         generation = _Generation(family, number, on_drained=on_drained)
         self._families[family] = generation
+        self.state_changed.emit()
         return generation
 
     def is_current(self, generation: _Generation) -> bool:
@@ -152,20 +155,55 @@ class PreprocessingWorkerRegistry(QObject):
 
     def cancel_family(self, family: str) -> bool:
         generation = self._families.get(family)
-        if generation is None or generation.cancelled or generation.closing:
+        if generation is None:
             return False
+        changed = not generation.cancelled or not generation.closing
         generation.cancelled = True
         generation.closing = True
         for record in tuple(self._records.values()):
             if record.generation is not generation:
                 continue
-            stop = getattr(record.worker, "stop", None)
-            if callable(stop):
-                try:
-                    stop()
-                except RuntimeError:
-                    pass
-        return True
+            self._request_worker_stop(record)
+        self._drain_generation_if_ready(generation)
+        if changed:
+            self.state_changed.emit()
+        return changed
+
+    def request_shutdown(self) -> tuple[QThread, ...]:
+        """Cancel every extant generation and request each worker stop once.
+
+        The returned snapshot is useful to close preflight: its presence means
+        that this close event must be rejected even if cancellation drains
+        synchronously. Generations already marked closing are still cancelled
+        and drained when empty; live/ambiguous records remain owned normally.
+        """
+        workers_at_entry = tuple(record.worker for record in self._records.values())
+        for generation in tuple(self._families.values()):
+            generation.cancelled = True
+            generation.closing = True
+            for record in tuple(self._records.values()):
+                if record.generation is generation:
+                    self._request_worker_stop(record)
+            self._drain_generation_if_ready(generation)
+        self.state_changed.emit()
+        return workers_at_entry
+
+    def _request_worker_stop(self, record: _WorkerRecord) -> None:
+        if record.shutdown_stop_attempted:
+            return
+        record.shutdown_stop_attempted = True
+        stop = getattr(record.worker, "stop", None)
+        if not callable(stop):
+            return
+        try:
+            stop()
+        except Exception as exc:
+            record.generation.abnormal = True
+            if not record.generation.abnormal_diagnostic_emitted:
+                record.generation.abnormal_diagnostic_emitted = True
+                self.diagnostic.emit(
+                    f"[WARN] Could not request preprocessing worker stop: {type(exc).__name__}: {exc}."
+                )
 
     def start_worker(
         self,
@@ -194,6 +232,7 @@ class PreprocessingWorkerRegistry(QObject):
         record.proxy = proxy
         self._records[key] = record
         generation.workers.add(key)
+        self.state_changed.emit()
         self._connect(worker.started, proxy.started)
         self._connect(worker.finished, proxy.finished)
         for name, slot in (
@@ -510,6 +549,7 @@ class PreprocessingWorkerRegistry(QObject):
             proxy.deleteLater()
         if not self._records:
             self._poll_timer.stop()
+        self.state_changed.emit()
 
     def _drain_generation_if_ready(self, generation: _Generation) -> None:
         if not generation.closing or generation.workers:
@@ -521,6 +561,7 @@ class PreprocessingWorkerRegistry(QObject):
         generation.on_drained = None
         if callback is not None:
             callback(generation.abnormal)
+        self.state_changed.emit()
 
     def _ensure_polling(self) -> None:
         if not self._poll_timer.isActive():
