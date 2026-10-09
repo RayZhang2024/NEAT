@@ -4,7 +4,7 @@ doc_id: neat-tech-support-updates-packaging-errors
 doc_type: technical_reference
 functional_area: support
 audience: [user, developer, support]
-neat_version: 4.8.2
+neat_version: 4.8.3
 verified_commit: 5eb4a4b419f9a301b502502706fa04e0436b8e0a
 status: code-verified
 instrument_applicability: [general]
@@ -34,7 +34,7 @@ tests are not treated as proof that either artifact is complete.
 
 ## Source installation and entry points
 
-The package version is `4.8.2`. Core installation declares PyQt5, Matplotlib,
+The package version is `4.8.3`. Core installation declares PyQt5, Matplotlib,
 NumPy, SciPy, Astropy, pandas, openpyxl, h5py, psutil and Pillow. The assistant
 dependencies are optional:
 

@@ -1,6 +1,6 @@
 # NEAT Assistant FAQ
 
-Knowledge-base version: NEAT 4.8.2
+Knowledge-base version: NEAT 4.8.3
 Approved source: `User manual.md`
 
 This file contains concise answers for common NEAT usage questions. Answers describe documented NEAT behaviour only. Dataset-specific scientific interpretation should be reviewed by an experienced Bragg-edge imaging scientist.

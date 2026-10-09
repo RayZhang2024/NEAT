@@ -97,6 +97,7 @@ jobs:
       - name: Smoke test packaged imports and knowledge
         shell: pwsh
         run: |
+          $env:NEAT_EXPECTED_RELEASE_VERSION = $env:RELEASE_VERSION
           $result = Join-Path $env:RUNNER_TEMP "neat-release-smoke.txt"
           $env:NEAT_RELEASE_SMOKE_RESULT = $result
           $process = Start-Process -FilePath "dist\NEAT\NEAT.exe" -ArgumentList "--release-smoke-test" -Wait -PassThru -WindowStyle Hidden
@@ -133,6 +134,7 @@ jobs:
       - name: Validate silent MSI lifecycle
         shell: pwsh
         run: |
+          $env:NEAT_EXPECTED_RELEASE_VERSION = $env:RELEASE_VERSION
           ./tools/windows_msi_smoke.ps1 -MsiPath "dist\$env:RELEASE_MSI" `
             -ManifestPath "dist\NEAT-payload-manifest.json" `
             -LogDirectory (Join-Path $env:RUNNER_TEMP "neat-msi-smoke-logs")

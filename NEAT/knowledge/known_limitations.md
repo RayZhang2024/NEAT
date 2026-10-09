@@ -1,6 +1,6 @@
 # NEAT Assistant — Known Limitations and Escalation Boundaries
 
-Knowledge-base version: NEAT 4.8.2
+Knowledge-base version: NEAT 4.8.3
 Approval: user-safe limitations derived from reviewed technical documentation
 
 ## A successful fit is not scientific validation
