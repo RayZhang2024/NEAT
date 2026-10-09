@@ -52,6 +52,7 @@ from matplotlib.patches import Rectangle
 from scipy.optimize import curve_fit, least_squares
 
 from .. import __version__
+from ..build_info import development_commit
 from ..core import (
     PHASE_DATA,
     calculate_theoretical_bragg_edges,
@@ -140,10 +141,14 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.fitting_parameter_bounds = normalize_fitting_parameter_bounds()
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.app_version = str(__version__).strip()
+        self.development_commit = development_commit()
         
         self.tof_array = None
         self.setMinimumSize(800, 600)
-        self.setWindowTitle(f"NEAT Neutron Bragg Edge Analysis Toolkit v{self.app_version}")
+        dev_suffix = f" [dev {self.development_commit}]" if self.development_commit else ""
+        self.setWindowTitle(
+            f"NEAT Neutron Bragg Edge Analysis Toolkit v{self.app_version}{dev_suffix}"
+        )
         # self.setGeometry(100, 100, window_width, window_height)  # Increased size to accommodate new layout
 
         # Phase storage (built-ins + user-defined)
@@ -690,11 +695,17 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         QDesktopServices.openUrl(QUrl("https://www.youtube.com/@RayOnNeutrons"))
 
     def show_about_dialog(self):
+        commit_line = (
+            f"<p><b>Development commit:</b> <code>{self.development_commit}</code></p>"
+            if getattr(self, "development_commit", None)
+            else ""
+        )
         QMessageBox.about(
             self,
             "About NEAT",
             (
                 f"<h2>NEAT Neutron Bragg Edge Analysis Toolkit v{self.app_version}</h2>"
+                f"{commit_line}"
                 "<p><b>Developed by:</b><br>"
                 "Engineering and imaging group<br>"
                 "ISIS Neutron and Muon Source<br>"
