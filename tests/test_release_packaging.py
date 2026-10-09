@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 import sys
+import tempfile
 import unittest
-import re
 from importlib.metadata import version
 from pathlib import Path
 
@@ -42,27 +44,63 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn(f"`{supported}`", (PROJECT_ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_source_release_smoke_test_loads_all_approved_knowledge(self) -> None:
+        project = tomllib.loads(
+            (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        expected_version = project["project"]["version"]
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "release-smoke.txt"
+            environment = os.environ.copy()
+            environment["NEAT_EXPECTED_RELEASE_VERSION"] = expected_version
+            environment["NEAT_RELEASE_SMOKE_RESULT"] = str(result_path)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from NEAT.app import _run_release_smoke_test; "
+                        "print(_run_release_smoke_test())"
+                    ),
+                ],
+                cwd=PROJECT_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+            self.assertGreater(int(completed.stdout.strip()), 0)
+            smoke_result = result_path.read_text(encoding="utf-8")
+        self.assertIn(
+            f"OK package version={expected_version}", smoke_result
+        )
+
+    def test_release_smoke_rejects_an_unexpected_package_version(self) -> None:
+        environment = os.environ.copy()
+        environment["NEAT_EXPECTED_RELEASE_VERSION"] = "0.0.0"
         completed = subprocess.run(
             [
                 sys.executable,
                 "-c",
                 (
                     "from NEAT.app import _run_release_smoke_test; "
-                    "print(_run_release_smoke_test())"
+                    "_run_release_smoke_test()"
                 ),
             ],
             cwd=PROJECT_ROOT,
+            env=environment,
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
-        self.assertEqual(
-            completed.returncode,
-            0,
-            msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
-        )
-        self.assertGreater(int(completed.stdout.strip()), 0)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("expected release version", completed.stderr.lower())
 
     def test_release_workflow_installs_assistant_extras_and_smoke_tests(self) -> None:
         workflow = (PROJECT_ROOT / ".github/workflows/release.yml").read_text(
@@ -74,6 +112,7 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("NEAT_RELEASE_SMOKE_RESULT", workflow)
         self.assertIn("tools.prepare_public_shared_access", workflow)
         self.assertIn("NEAT_SHARED_PUBLIC_ACCESS_TOKEN", workflow)
+        self.assertIn("NEAT_EXPECTED_RELEASE_VERSION = $env:RELEASE_VERSION", workflow)
         self.assertRegex(normalized, r"runs-on:\s*windows-latest")
         self.assertRegex(normalized, r"python-version:\s*['\"]?3\.13")
         self.assertIn("python -m unittest discover -s tests -v", workflow)

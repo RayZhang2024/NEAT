@@ -105,6 +105,7 @@ jobs:
       - name: Run direct frozen-payload smoke test
         shell: pwsh
         run: |
+          $env:NEAT_EXPECTED_RELEASE_VERSION = $env:RELEASE_VERSION
           $result = Join-Path $env:RUNNER_TEMP "neat-direct-smoke.txt"
           $env:NEAT_RELEASE_SMOKE_RESULT = $result
           $process = Start-Process -FilePath "dist\NEAT\NEAT.exe" `
@@ -146,6 +147,7 @@ jobs:
       - name: Validate silent MSI install, launch, and uninstall
         shell: pwsh
         run: |
+          $env:NEAT_EXPECTED_RELEASE_VERSION = $env:RELEASE_VERSION
           ./tools/windows_msi_smoke.ps1 -MsiPath "dist\$env:DISTRIBUTION_MSI" `
             -ManifestPath "dist\NEAT-payload-manifest.json" `
             -LogDirectory (Join-Path $env:RUNNER_TEMP "neat-msi-smoke-logs")

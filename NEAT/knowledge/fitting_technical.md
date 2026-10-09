@@ -1,6 +1,6 @@
 # NEAT Assistant — Reviewed Wavelength and Fitting Details
 
-Knowledge-base version: NEAT 4.8.2
+Knowledge-base version: NEAT 4.8.3
 Approval: reviewed technical guidance for user support
 
 ## Time-of-flight to wavelength conversion

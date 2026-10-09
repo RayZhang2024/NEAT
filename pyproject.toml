@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "NEAT"
-version = "4.8.2"
+version = "4.8.3"
 description = "Bragg edge imaging data analysis."
 authors = [
     { name = "Ruiyao Zhang", email = "ruiyao.zhang@stfc.ac.uk" }

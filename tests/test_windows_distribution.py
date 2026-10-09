@@ -476,6 +476,9 @@ Resolve-NeatMsiProductContext -ProductCode '{{01234567-89AB-CDEF-0123-456789ABCD
 
     def test_dedicated_distribution_workflow_is_python313_and_non_publishing(self) -> None:
         workflow = (PROJECT_ROOT / ".github/workflows/distribution.yml").read_text(encoding="utf-8")
+        self.assertRegex(workflow, r"(?m)^  pull_request:")
+        self.assertIn('      - "pyproject.toml"', workflow)
+        self.assertIn('      - "docs/RELEASE_CHECKLIST.md"', workflow)
         self.assertIn('python-version: "3.13"', workflow)
         self.assertIn("New-Item -ItemType Directory -Path $env:BRIEFCASE_HOME -Force", workflow)
         self.assertIn("briefcase==0.4.5", workflow)
@@ -487,9 +490,19 @@ Resolve-NeatMsiProductContext -ProductCode '{{01234567-89AB-CDEF-0123-456789ABCD
         self.assertIn("tools/windows_user_data_safety.psm1", workflow)
         self.assertIn('-MsiPath "dist\\$env:DISTRIBUTION_MSI"', workflow)
         self.assertIn("issue18-dummy-only", workflow)
+        self.assertIn("https://ci.invalid", workflow)
         self.assertIn("NEAT-v${{ env.RELEASE_VERSION }}-portable.zip", workflow)
+        self.assertIn('$filename = "NEAT-v$version.msi"', workflow)
+        self.assertIn("dist/${{ env.DISTRIBUTION_MSI }}", workflow)
+        self.assertIn("python -m unittest discover -s tests -v", workflow)
+        self.assertIn("python -m ruff check NEAT tests tools --select E9,F63,F7,F82", workflow)
+        self.assertIn("python -m mypy NEAT/core NEAT/domain NEAT/services", workflow)
+        self.assertIn("python -m pip check", workflow)
+        self.assertIn("python -m build --wheel --sdist", workflow)
         self.assertNotIn("action-gh-release", workflow)
         self.assertNotIn("contents: write", workflow)
+        self.assertIn("NEAT_EXPECTED_RELEASE_VERSION = $env:RELEASE_VERSION", workflow)
+        self.assertIn("Upload validated distribution artifacts", workflow)
         msi_smoke = (PROJECT_ROOT / "tools/windows_msi_smoke.ps1").read_text(encoding="utf-8")
         for marker in (
             '"/i"',

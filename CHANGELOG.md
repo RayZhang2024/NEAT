@@ -2,6 +2,20 @@
 
 All notable user-facing changes to NEAT are recorded here.
 
+## 4.8.3 - 2026-10-09
+
+### Changed
+
+- Improved preprocessing reliability by validating frame, time-of-flight and
+  sidecar alignment, selecting current-run outputs, and excluding auxiliary
+  `_SummedImg.fits` files from overlap correction.
+- Reduced Clean processing time while preserving invalid pixels in mapping
+  masks.
+- Improved the handling of long-running preprocessing and fitting operations,
+  including cooperative cancellation and safe application shutdown.
+- Added Windows portable ZIP and per-user MSI installer packages built from
+  the same validated standalone application payload.
+
 ## 4.8.2 - 2026-08-20
 
 - Added shared user-configurable lower and upper bounds for fitting parameters

@@ -4,13 +4,13 @@ doc_id: neat-tech-preprocessing-full-process
 doc_type: technical_reference
 functional_area: preprocessing
 audience: [user, scientist, developer]
-neat_version: 4.8.0
-verified_commit: d3de8d15895fa577a6a8bfcd060ea0f48c56f94f
+neat_version: 4.8.3
+verified_commit: 63197e33bb850cc95605159672abf9aeb2779a9f
 status: code-verified
 instrument_applicability: [classic image folders]
 scientific_review: pending
-source_paths: [NEAT/ui/preprocessing_worker_registry.py, NEAT/ui/mixins/preprocessing.py, NEAT/workers/preprocessing.py, NEAT/services/preprocessing_full_process.py, NEAT/services/image_io.py]
-source_symbols: [PreprocessingMixin.run_full_process, PreprocessingMixin.stop_full_process, PreprocessingWorkerRegistry, FullProcessWorker, FullProcessPipeline, load_full_process_run, run_full_process]
+source_paths: [NEAT/ui/main_window.py, NEAT/ui/preprocessing_worker_registry.py, NEAT/ui/mixins/preprocessing.py, NEAT/workers/preprocessing.py, NEAT/services/preprocessing_full_process.py, NEAT/services/preprocessing_overlap_inputs.py, NEAT/services/image_io.py]
+source_symbols: [FitsViewer.closeEvent, PreprocessingMixin.run_full_process, PreprocessingMixin.stop_full_process, PreprocessingWorkerRegistry, FullProcessWorker, FullProcessPipeline, load_full_process_run, prepare_overlap_inputs, run_full_process]
 test_paths: [tests/test_preprocessing_worker_ownership.py, tests/test_preprocessing_full_process.py, tests/test_preprocessing_tiff.py, tests/test_preprocessing_layout.py, tests/test_image_io_orientation.py]
 ---
 
@@ -55,8 +55,10 @@ directories. One child still invokes Summation. Clean always runs for sample
 and open beam; Overlap is required for both; then classic Normalisation uses
 the selected `n` and `m`.
 
-The headless Full Process loader uses raw `os.listdir()` order and selects
-case-insensitive `.fits`, `.fit`, `.tiff`, and `.tif` files. It excludes `.fts`
+For an initial source folder, the headless Full Process loader uses
+`os.listdir()` order and selects case-insensitive `.fits`, `.fit`, `.tiff`,
+and `.tif` files. Later stage loaders use current-run producer manifests,
+ignoring stale/unmanifested images left in reused output folders. It excludes `.fts`
 even though the generic image reader continues to support that extension. The
 final underscore-delimited filename component is stripped and used as a
 nonempty frame suffix; it need not be numeric. Duplicate suffixes and
@@ -81,12 +83,19 @@ As names include the previous stage's folder name, repeated prefixes can
 accumulate. The final frames are named `normalised_<suffix>.fits`; the overall
 base-name field does not control them.
 
-Directories are created with `exist_ok=True` and are not cleared. Stale
-eligible images may therefore be loaded by later stages, but stale files are
-not included in the current result unless an operation service reports them.
-Accumulated prefixes such as `0_summed_`, `1_cleaned_0_summed_`, and
-`2_corrected_1_cleaned_0_summed_` are intentional. The overall base name
-remains unused.
+Directories are created with `exist_ok=True` and are not wholesale cleared.
+Current-run producer image manifests prevent later Full Process stages from
+loading stale frames left in intermediate folders, and unmanifested files are
+reported. Successful completion also removes obsolete `normalised_*.fits`
+frames from the Full Process-owned final normalisation folder; unrelated
+auxiliary files are not deleted. Accumulated prefixes such as `0_summed_`,
+`1_cleaned_0_summed_`, and `2_corrected_1_cleaned_0_summed_` are
+intentional. The overall base name remains unused.
+
+Overlap Correction selects only supported FITS/TIFF files with a final
+underscore-separated 1–10 digit ASCII frame suffix. Nonnumeric auxiliary
+images, including `*_SummedImg.fits`, are excluded with a warning; duplicate
+numeric IDs, numeric gaps, and frame/ToF count mismatches remain fatal.
 
 When Summation is skipped, Full Process rejects duplicate source Spectra or
 ShutterCount sidecars before Clean applies its first-match copy rule. Sidecar
@@ -146,20 +155,24 @@ the startup timeout as proof of failure. This changes only GUI ownership and
 interactive Stop; the pipeline's stage order, one-child Summation behavior,
 cancellation safe points, outputs and progress streams are unchanged.
 
-This is not application-close coordination. The current
-`closeEvent()`/`cleanup_resources()` path can still accept a close after its
-legacy 1000 ms wait while a registry-owned thread remains alive. Safe
-close-during-processing remains a follow-up release blocker for the next
-Workstream E shutdown issue.
+Application-close coordination now uses the two-phase shutdown lifecycle
+introduced in PR #46 (Issue #45). A close request with unsettled window-owned
+workers requests cooperative cancellation but does not destroy the window,
+release worker ownership, or clear scientific state. The user can retry closing
+after verified worker retirement; the normal close and cleanup proceed only
+when the shutdown preflight is safe. The AI Assistant's existing close veto
+is preserved.
 
 ## Known implementation risks
 
 - One child folder triggers Full Process Summation even though standalone
   Summation requires at least two.
-- Partial output from a prior run is not cleared before `exist_ok=True` folders
-  are reused; stale eligible files may affect later loaders.
-- Worker success remains an in-memory result, not a persistent manifest of
-  expected and produced files.
+- Intermediate folders may still contain partial files from failed or earlier
+  runs, although current-run manifests prevent downstream Full Process loaders
+  from selecting them. Initial user-provided source folders without manifests
+  still require the correct input dataset.
+- Worker success remains an in-memory result; current-run producer manifests
+  are not durable manifests across separate application sessions.
 - The workflow has exact-array regression evidence, but its overlap-correction
   scientific assumptions remain pending domain review.
 

@@ -180,6 +180,24 @@ def _run_release_smoke_test() -> int:
     """Validate packaged assistant imports and approved knowledge without an API call."""
 
     _write_release_smoke_result("START")
+    from importlib.metadata import version as distribution_version
+
+    from NEAT import __version__
+
+    installed_version = distribution_version("NEAT")
+    expected_version = os.environ.get("NEAT_EXPECTED_RELEASE_VERSION", "").strip()
+    if installed_version != __version__:
+        raise RuntimeError(
+            "Installed distribution version does not match NEAT.__version__: "
+            f"{installed_version} != {__version__}"
+        )
+    if expected_version and installed_version != expected_version:
+        raise RuntimeError(
+            "Packaged NEAT version does not match the expected release version: "
+            f"{installed_version} != {expected_version}"
+        )
+    _write_release_smoke_result(f"OK package version={installed_version}")
+
     import anthropic  # noqa: F401
     _write_release_smoke_result("OK anthropic")
     import chromadb  # noqa: F401

@@ -1,6 +1,6 @@
 # NEAT Assistant Parameter Reference
 
-Knowledge-base version: NEAT 4.8.2
+Knowledge-base version: NEAT 4.8.3
 Approved sources: `User manual.md` and documented NEAT GUI behaviour
 
 ## Preprocessing parameters
