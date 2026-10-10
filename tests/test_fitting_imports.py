@@ -6,7 +6,6 @@ import textwrap
 import unittest
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -33,6 +32,20 @@ class TestFittingImports(unittest.TestCase):
             from NEAT.services.fitting_engine import FittingEngine
 
             assert FittingEngine is not None
+            assert not any(
+                name == "PyQt5" or name.startswith("PyQt5.")
+                for name in sys.modules
+            )
+            """
+        )
+
+    def test_observation_service_import_does_not_load_pyqt_in_fresh_process(self):
+        self.run_fresh_python(
+            """
+            import sys
+            from NEAT.services.scientific_observation import create_dataset_handle
+
+            assert create_dataset_handle is not None
             assert not any(
                 name == "PyQt5" or name.startswith("PyQt5.")
                 for name in sys.modules
