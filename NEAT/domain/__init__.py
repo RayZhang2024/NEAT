@@ -20,6 +20,24 @@ from .preprocessing import (
     ProducedOutput,
 )
 from .preprocessing_inputs import LoadedImageRun
+from .observation import (
+    DatasetCapabilities,
+    DatasetMode,
+    DatasetObservation,
+    DatasetProvenance,
+    DatasetRevisionClock,
+    ImageObservation,
+    ImageViewSpec,
+    ObservationError,
+    ObservationStatus,
+    PixelCoordinateMapping,
+    PlotObservation,
+    RoiBounds,
+    RoiClipPolicy,
+    SpectrumObservation,
+    SpectrumPlotSpec,
+    WavelengthAxisStatus,
+)
 
 __all__ = [
     "FittingParameterBounds",
@@ -36,4 +54,20 @@ __all__ = [
     "PreprocessingStatus",
     "ProducedOutput",
     "LoadedImageRun",
+    "DatasetCapabilities",
+    "DatasetMode",
+    "DatasetObservation",
+    "DatasetProvenance",
+    "DatasetRevisionClock",
+    "ImageObservation",
+    "ImageViewSpec",
+    "ObservationError",
+    "ObservationStatus",
+    "PixelCoordinateMapping",
+    "PlotObservation",
+    "RoiBounds",
+    "RoiClipPolicy",
+    "SpectrumObservation",
+    "SpectrumPlotSpec",
+    "WavelengthAxisStatus",
 ]

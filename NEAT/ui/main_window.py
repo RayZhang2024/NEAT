@@ -65,6 +65,7 @@ from .mixins.postprocessing import PostProcessingMixin
 from .mixins.preprocessing import PreprocessingMixin
 from .dialogs import UncertaintyEstimatorDialog
 from .assistant_panel import AssistantDockWidget, collect_neat_context
+from .scientific_observation_adapter import ScientificObservationAdapter
 from .preprocessing_worker_registry import PreprocessingWorkerRegistry
 from .window_thread_inventory import WindowThreadInventory
 from .utils import update_all_widget_fonts
@@ -283,6 +284,10 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
 
         self.config_path = os.path.join(os.path.expanduser("~"), ".neat_gui_settings.json")
         self.load_user_settings()
+
+        # The observation adapter is optional for GUI workflows and captures
+        # data only when explicitly called by an authorized local consumer.
+        self.scientific_observation_api = ScientificObservationAdapter(self)
         
         # Set initial global font and Matplotlib settings
         self.setGlobalFont()
@@ -1283,6 +1288,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
 
         if hasattr(self, "image_slider"):
             self.image_slider.setEnabled(False)
+        self._invalidate_scientific_observation_dataset(replace_dataset=True)
         self.images = []
         self.intensities = np.array([])
         self.tof_array = None
