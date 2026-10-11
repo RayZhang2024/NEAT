@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (
 )
 
 from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
-from NEAT.domain.agent_planning import PlanningStatus
+from NEAT.domain.agent_planning import PlanningOutcome, PlanningStatus
 from NEAT.domain.observation import DatasetMode
 from NEAT.ui.agent_preflight_worker import PreflightWorker
 from NEAT.ui.agent_window import AgentWindow
@@ -199,6 +199,7 @@ class AgentPreflightTests(unittest.TestCase):
         self._wait_for(lambda: self.window.result is not None)
         self.assertEqual(self.window.result.assessment.readiness, PreflightReadiness.INVALID)
         self._wait_for(lambda: self.window._worker is None)
+        self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
         self.host.scientific_observation_api.invalidate_dataset(replace_dataset=True)
         self.host.images = [np.ones((6, 6)), np.ones((6, 6))]
         self.host.wavelengths = np.array([2.0, 2.0])
@@ -235,6 +236,7 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(self.window.result.assessment.readiness, PreflightReadiness.LIMITED)
         self.assertIsNone(self.window.result.spectrum)
         self._wait_for(lambda: self.window._worker is None)
+        self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
 
         self.host.scientific_observation_api.invalidate_dataset(replace_dataset=True)
         self.host.fitting_data_source = "profile"
@@ -383,6 +385,7 @@ class AgentPreflightTests(unittest.TestCase):
             lambda: self.window._planning_outcome is not None
             and self.window._planning_worker is None
             and self.window._worker is None
+            and not self.host._shutdown_worker_inventory.workers
         )
         outcome = self.window._planning_outcome
         self.assertIsNotNone(outcome)
@@ -429,6 +432,77 @@ class AgentPreflightTests(unittest.TestCase):
             release.set()
             self._wait_for(lambda: self.window._worker is None)
 
+    def test_stop_after_preflight_emits_success_before_callback_blocks_planning(self):
+        self.window.start_autonomous_analysis()
+        worker = self.window._worker
+        self.assertIsNotNone(worker)
+
+        # QThread.wait blocks this thread's Qt event loop. The worker can finish
+        # computation and queue both completion signals, but the window slots
+        # cannot run until after Stop below.
+        self.assertTrue(worker.wait(5000))
+        self.assertTrue(worker.isFinished())
+        self.assertIsNone(self.window._planning_worker)
+        self.assertFalse(self.window.start_autonomous_button.isEnabled())
+
+        self.window.stop_active_run()
+        self.assertIn("Stopping", self.window.status_label.text())
+        self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+
+        self.assertIsNone(self.window.result)
+        self.assertIsNone(self.window._planning_worker)
+        self.assertIsNone(self.window._planning_outcome)
+        self.assertEqual(self.window._stage, "cancelled")
+        self.assertIn("stopped", self.window.status_label.text().lower())
+        self.assertNotIn("Plan prepared", self.window.plan_text.toPlainText())
+        self.assertTrue(self.window.start_autonomous_button.isEnabled())
+
+    def test_stop_after_planning_emits_success_before_callback_keeps_stopped_status(self):
+        import NEAT.ui.agent_planning_worker as worker_module
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def successful_planning(context, **_kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release event-controlled planning")
+            return PlanningOutcome(
+                run_id=context.run_id,
+                preflight_run_id=context.preflight_run_id,
+                dataset_id=context.dataset_id,
+                revision=context.revision,
+                status=PlanningStatus.READY_PLAN,
+                transitions=("validate_preflight", "propose_read_only_plan", "terminal"),
+            )
+
+        with patch.object(worker_module, "run_planning", side_effect=successful_planning):
+            self.window.start_autonomous_analysis()
+            self._wait_for(
+                lambda: entered.is_set() and self.window._planning_worker is not None
+            )
+            worker = self.window._planning_worker
+            self.assertIsNotNone(worker)
+
+            # Release the controlled computation, then block this thread's Qt
+            # event loop until its success signal is queued and the worker exits.
+            release.set()
+            self.assertTrue(worker.wait(5000))
+            self.assertTrue(worker.isFinished())
+            self.assertNotIn("Plan prepared", self.window.plan_text.toPlainText())
+            self.window.stop_active_run()
+            self.assertIn("Stopping", self.window.status_label.text())
+            self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+
+        self.assertIsNone(self.window._planning_outcome)
+        self.assertEqual(self.window._stage, "cancelled")
+        self.assertEqual(
+            self.window.status_label.text(),
+            "Autonomous analysis stopped during planning.",
+        )
+        self.assertNotIn("Plan prepared", self.window.plan_text.toPlainText())
+        self.assertTrue(self.window.start_autonomous_button.isEnabled())
+
     def test_tracked_planning_worker_stop_and_dataset_invalidation(self):
         import NEAT.ui.agent_planning_worker as worker_module
         from NEAT.services.agent_planning import PlanningCancelled
@@ -468,9 +542,10 @@ class AgentPreflightTests(unittest.TestCase):
         ):
             self.window.start_autonomous_analysis()
             self._wait_for(
-                lambda: self.window._planning_outcome is not None
-                and self.window._planning_worker is None
-                and self.window._worker is None
+            lambda: self.window._planning_outcome is not None
+            and self.window._planning_worker is None
+            and self.window._worker is None
+            and not self.host._shutdown_worker_inventory.workers
             )
         self.assertEqual(self.window._planning_outcome.status, PlanningStatus.UNAVAILABLE)
         self.assertIsNotNone(self.window.result)

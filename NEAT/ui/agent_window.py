@@ -59,6 +59,7 @@ class AgentWindow(QMainWindow):
         self._preflight_completion_received = False
         self._awaiting_preflight_completion = False
         self._pending_planning_context: PlanningContext | None = None
+        self._cancellation_requested = False
 
         self.setWindowTitle("NEAT AI Agent — Autonomous Analysis (M3)")
         self.setMinimumSize(820, 520)
@@ -218,10 +219,36 @@ class AgentWindow(QMainWindow):
         self._update_controls()
 
     def _has_active_worker(self) -> bool:
+        inventory = getattr(self._main_window, "_shutdown_worker_inventory", None)
+        tracked_worker = bool(
+            inventory is not None
+            and any(
+                inventory.has_role(role)
+                for role in ("agent_preflight", "agent_planning")
+            )
+        )
         return bool(
             self._worker is not None
             or self._planning_worker is not None
             or self._awaiting_preflight_completion
+            or self._pending_planning_context is not None
+            or tracked_worker
+        )
+
+    def _can_stop_active_run(self) -> bool:
+        if self._cancellation_requested:
+            return False
+        return bool(
+            self._awaiting_preflight_completion
+            or self._pending_planning_context is not None
+            or (
+                self._worker is not None
+                and not self._preflight_completion_received
+            )
+            or (
+                self._planning_worker is not None
+                and self._planning_outcome is None
+            )
         )
 
     def _update_controls(self) -> None:
@@ -233,8 +260,10 @@ class AgentWindow(QMainWindow):
         can_start = not active and not self._parent_closing and not host_closing
         self.start_button.setEnabled(can_start)
         self.start_autonomous_button.setEnabled(can_start)
-        self.stop_button.setEnabled(active and not self._parent_closing)
-        if not active:
+        self.stop_button.setEnabled(
+            self._can_stop_active_run() and not self._parent_closing
+        )
+        if not self._can_stop_active_run():
             self.stop_button.setText("Stop")
 
     def start_autonomous_analysis(self) -> None:
@@ -258,6 +287,7 @@ class AgentWindow(QMainWindow):
             return
         self._result = None
         self._stale = False
+        self._cancellation_requested = False
         self._dataset_token = None
         self._preflight_completion_received = False
         self._awaiting_preflight_completion = True
@@ -335,22 +365,27 @@ class AgentWindow(QMainWindow):
         self.stop_active_run()
 
     def stop_active_run(self) -> None:
-        worker = self._worker or self._planning_worker
-        if worker is None:
+        if not self._can_stop_active_run():
             return
-        try:
-            worker.stop()
-        except RuntimeError:
-            if worker is self._worker:
-                self._worker = None
-            if worker is self._planning_worker:
-                self._planning_worker = None
-            self._update_controls()
-            return
+        # Record cancellation for the whole run before asking a worker to stop.
+        # The worker may already have emitted a successful result whose queued
+        # Qt callback has not reached this window yet.
+        self._cancellation_requested = True
+        self._pending_planning_context = None
+        for worker in (self._worker, self._planning_worker):
+            if worker is not None:
+                try:
+                    worker.stop()
+                except RuntimeError:
+                    # Keep the reference until the shutdown inventory confirms
+                    # retirement; clearing it here could allow overlapping runs.
+                    pass
         self.stop_button.setEnabled(False)
         self.stop_button.setText("Stopping…")
+        self._stage = "cancellation_requested"
         if not self._stale:
             self._set_status("Stopping — waiting for the current bounded operation to finish safely.")
+        self._update_controls()
 
     def _on_progress(self, run_id: str, percent: int, message: str) -> None:
         if run_id != self._active_run_id or self._parent_closing or self._stale:
@@ -371,6 +406,24 @@ class AgentWindow(QMainWindow):
             return
         self._preflight_completion_received = True
         self._awaiting_preflight_completion = False
+        if self._cancellation_requested:
+            self._pending_planning_context = None
+            self._result = None
+            self._planning_outcome = None
+            self._stage = "cancelled"
+            message = (
+                "Autonomous analysis stopped during preflight."
+                if self._agent_run_id is not None
+                else "Preflight cancelled."
+            )
+            self._set_status(message)
+            self.assessment_text.setPlainText(
+                "The preflight result was discarded because Stop was requested."
+            )
+            self.plan_text.setPlainText(message)
+            self._show_evidence_message(message)
+            self._update_controls()
+            return
         self._check_revision()
         if self._stale or self._dataset_token != (outcome.dataset_id, outcome.revision):
             self._mark_stale()
@@ -413,7 +466,14 @@ class AgentWindow(QMainWindow):
 
     def _start_pending_planning(self) -> None:
         context = self._pending_planning_context
-        if context is None:
+        if (
+            context is None
+            or self._cancellation_requested
+            or self._stale
+            or self._parent_closing
+            or getattr(self._main_window, "_shutdown_close_pending", False)
+            or getattr(self._main_window, "_shutdown_committed", False)
+        ):
             return
         self._pending_planning_context = None
         self._start_planning(context)
@@ -423,6 +483,7 @@ class AgentWindow(QMainWindow):
             self._agent_run_id != context.run_id
             or self._worker is not None
             or self._stale
+            or self._cancellation_requested
             or self._parent_closing
         ):
             return
@@ -511,6 +572,16 @@ class AgentWindow(QMainWindow):
             or getattr(self._main_window, "_shutdown_close_pending", False)
         ):
             return
+        if self._cancellation_requested:
+            self._planning_outcome = (
+                outcome if outcome.status is PlanningStatus.CANCELLED else None
+            )
+            self._stage = "cancelled"
+            message = "Autonomous analysis stopped during planning."
+            self._set_status(message)
+            self.plan_text.setPlainText(message)
+            self._update_controls()
+            return
         self._check_revision()
         if self._stale or self._dataset_token != (outcome.dataset_id, outcome.revision):
             self._mark_stale()
@@ -569,7 +640,11 @@ class AgentWindow(QMainWindow):
             self._planning_worker = None
         if getattr(self._main_window, "agent_planning_worker", None) is worker:
             self._main_window.agent_planning_worker = None
-        if run_id == self._agent_run_id and not self._parent_closing:
+        if (
+            run_id == self._agent_run_id
+            and not self._parent_closing
+            and not self._cancellation_requested
+        ):
             if self._planning_outcome is None and not self._stale:
                 self._stage = "failed"
                 self._set_status("Planning stopped before a result was received.")
@@ -585,12 +660,7 @@ class AgentWindow(QMainWindow):
             self._main_window.agent_preflight_worker = None
         if (
             run_id == self._active_run_id
-            and not self._parent_closing
-            and self._pending_planning_context is not None
-        ):
-            self._start_pending_planning()
-        elif (
-            run_id == self._active_run_id
+            and not self._cancellation_requested
             and self._preflight_completion_received
             and self._stage == "preflight_running"
             and self._agent_run_id is None
@@ -602,27 +672,50 @@ class AgentWindow(QMainWindow):
 
     def worker_retired(self, worker: PreflightWorker, callbacks_suppressed: bool) -> None:
         """Clear the window reference even when shutdown suppressed signal slots."""
-        if self._worker is not worker:
-            return
-        self._worker = None
-        self._awaiting_preflight_completion = False
-        self._pending_planning_context = None
+        if self._worker is worker:
+            self._worker = None
+        if getattr(worker, "run_id", None) == self._active_run_id:
+            self._awaiting_preflight_completion = False
         if not self._parent_closing:
-            if callbacks_suppressed and not self._stale:
+            if self._cancellation_requested and not self._stale:
+                self._pending_planning_context = None
+                self._result = None
+                self._planning_outcome = None
+                if self._stage == "cancellation_requested":
+                    self._set_status(
+                        "Autonomous analysis stopped during preflight."
+                        if self._agent_run_id is not None
+                        else "Preflight cancelled."
+                    )
+                self._stage = "cancelled"
+            elif callbacks_suppressed and not self._stale:
+                self._pending_planning_context = None
                 self._result = None
                 self._revision_timer.stop()
                 self._set_status("Preflight stopped while NEAT was closing. Start again if NEAT remains open.")
+            elif self._pending_planning_context is not None:
+                self._start_pending_planning()
             self._update_controls()
 
     def planning_worker_retired(
         self, worker: PlanningWorker, callbacks_suppressed: bool
     ) -> None:
         """Clear window ownership when shutdown retires the planning QThread."""
-        if self._planning_worker is not worker:
-            return
-        self._planning_worker = None
+        if self._planning_worker is worker:
+            self._planning_worker = None
         if not self._parent_closing:
-            if callbacks_suppressed and not self._stale:
+            if self._cancellation_requested and not self._stale:
+                if (
+                    self._planning_outcome is None
+                    or self._planning_outcome.status is not PlanningStatus.CANCELLED
+                ):
+                    self._planning_outcome = None
+                if self._stage == "cancellation_requested":
+                    message = "Autonomous analysis stopped during planning."
+                    self._set_status(message)
+                    self.plan_text.setPlainText(message)
+                self._stage = "cancelled"
+            elif callbacks_suppressed and not self._stale:
                 self._planning_outcome = None
                 self.plan_text.clear()
                 self._set_status(

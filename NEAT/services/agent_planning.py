@@ -321,15 +321,25 @@ def _default_proposal(state: GraphState) -> tuple[PlanStep, ...]:
     )
 
     if state["mode"] == DatasetMode.IMAGES.value and image_evidence:
+        image_rationale = (
+            "Review the existing bounded image previews and their selected ROI overlay."
+            if state["roi_available"]
+            else "Review the existing bounded image previews."
+        )
         add(
             PlanStepType.REVIEW_IMAGE_PREVIEWS,
-            "Review the existing bounded image previews and their selected ROI overlay.",
+            image_rationale,
             image_evidence,
         )
     if spectrum_evidence:
+        spectrum_rationale = (
+            "Review the existing measured spectrum and its rendered plot."
+            if "spectrum:plot" in spectrum_evidence
+            else "Review the existing measured spectrum data; a rendered plot is unavailable."
+        )
         add(
             PlanStepType.REVIEW_MEASURED_SPECTRUM,
-            "Review the existing measured spectrum and its rendered plot.",
+            spectrum_rationale,
             spectrum_evidence,
         )
 

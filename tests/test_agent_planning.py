@@ -28,6 +28,7 @@ from NEAT.services.agent_planning import (
     PlanningCancelled,
     PlanningDependencyUnavailable,
     PlanningStale,
+    _default_proposal,
     run_planning,
 )
 
@@ -72,6 +73,34 @@ def _context(
         observations=observations,
         warnings=warnings,
     )
+
+
+class AgentPlanningEvidenceWordingTests(unittest.TestCase):
+    def test_roi_overlay_and_spectrum_plot_wording_requires_matching_evidence(self):
+        context = _context(
+            roi=False,
+            evidence=("image:frame:0", "spectrum:full-source"),
+        )
+        steps = _default_proposal(context_to_state(context))
+        rationales = {step.step_type: step.rationale for step in steps}
+
+        self.assertIn(PlanStepType.REVIEW_IMAGE_PREVIEWS, rationales)
+        self.assertNotIn("overlay", rationales[PlanStepType.REVIEW_IMAGE_PREVIEWS].lower())
+        self.assertIn(PlanStepType.REVIEW_MEASURED_SPECTRUM, rationales)
+        self.assertIn("unavailable", rationales[PlanStepType.REVIEW_MEASURED_SPECTRUM].lower())
+
+        context_with_visual_evidence = _context(
+            roi=True,
+            evidence=("image:frame:0", "spectrum:full-source", "spectrum:plot"),
+        )
+        steps_with_visual_evidence = _default_proposal(
+            context_to_state(context_with_visual_evidence)
+        )
+        visual_rationales = {
+            step.step_type: step.rationale for step in steps_with_visual_evidence
+        }
+        self.assertIn("overlay", visual_rationales[PlanStepType.REVIEW_IMAGE_PREVIEWS].lower())
+        self.assertIn("rendered plot", visual_rationales[PlanStepType.REVIEW_MEASURED_SPECTRUM].lower())
 
 
 @unittest.skipUnless(_HAS_LANGGRAPH, "requires the optional NEAT [agent] extra")
