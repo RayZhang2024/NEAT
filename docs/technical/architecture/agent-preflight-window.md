@@ -1,80 +1,125 @@
-# AI Agent window: local Step 0 preflight
+# AI Agent window: one-click preflight and planning (M3)
 
-## Boundary and data flow
+## User-visible behaviour
 
-The independent, non-modal AI Agent window is opened from the application-wide
-AI Agent menu. It is owned by one NEAT main window and does not replace the AI
-Assistant dock. Opening the window performs no analysis. The user explicitly
-starts a local, read-only preflight.
+The independent, non-modal AI Agent window keeps its Overview and Visual
+Evidence panels side by side and does not replace the AI Assistant dock.
+Opening the window is side-effect-free. **Start Autonomous Analysis** creates
+one parent run and automatically advances through the existing local Step 0
+preflight and the offline deterministic LangGraph plan. No second preview or
+continue action is required. **Start Preflight** remains a separate diagnostic
+action. The window permits only one active stage at a time; Stop applies to
+whichever stage is running.
 
-The Qt owner thread captures a versioned `ScientificDatasetHandle` and, when
-valid, the already-selected fitting ROI. The ROI is read only: it is never
-created, moved, or written to NEAT's fitting controls. A tracked `QThread`
-uses Issue #53's observation service for metadata, at most three 512-pixel
-image previews, and a measured ROI or imported-profile spectrum and plot.
-The worker does not access QWidgets. `NEAT.domain.agent_preflight` classifies
-only observed capabilities and quality conditions. The assessment contains
-safe evidence references, not images or local file paths. Unknown companion
-metadata and calibration sources remain explicit warnings.
+M3's terminal success message is **“Plan prepared — scientific execution is
+not yet implemented.”** The plan is a read-only proposal. M3 performs no LLM
+reasoning, edge fitting, mapping, phase identification, physical
+interpretation, report generation, or source-data changes. A missing optional
+dependency, invalid dataset, insufficient evidence, stale revision,
+cancellation, and internal failure each have explicit non-success outcomes.
 
-The Agent window presents Overview and Visual Evidence together in two
-resizable side-by-side panels. Overview shows the run and dataset tokens,
-status, capabilities, provenance, warnings, and unsupported operations.
-Visual Evidence shows actual preview PNGs, original-grid ROI overlays, and a
-rendered measured spectrum where available. Frame wavelengths appear only for
-a valid aligned axis. The full source spectrum count is separate from the plot
-display window. The two panels share one companion window; the AI Assistant
-dock remains in the main NEAT window.
+## Components and data boundary
 
-## Worker and window lifetime
+- `NEAT.domain.agent_planning` defines typed plan contracts, terminal states,
+  allowlisted proposal types, and explicit state/text/evidence bounds.
+- `NEAT.services.agent_planning` builds and runs the actual LangGraph
+  `StateGraph` with nodes `validate_preflight -> propose_read_only_plan ->
+  validate_plan -> terminal`. Invalid preflight and missing evidence take a
+  finite blocked route. The built-in proposal is deterministic and offline.
+  A future proposal seam cannot dispatch tools: plan validation rejects
+  unsupported step names, unsupported status, oversized output, inconsistent
+  permission classification, and evidence IDs not issued by that preflight.
+- `NEAT.ui.agent_planning_worker` is a tracked `QThread` that receives only a
+  bounded planning context. It never receives a dataset handle, image stack,
+  preview PNG, spectrum array, widget, source path, credential, or provider.
+- `NEAT.ui.agent_window` chains planning only after the preflight completion
+  callback is current and the preflight thread has finished. It guards every
+  callback with run identity, worker identity, dataset ID, and revision.
+- `NEAT.ui.main_window` registers the planner worker with the existing
+  `WindowThreadInventory`. Window Stop, dataset invalidation, and application
+  shutdown request cooperative cancellation and keep ownership until native
+  thread exit. A stale dataset clears displayed evidence and the plan.
 
-The main window registers the preflight thread in `WindowThreadInventory`
-before starting it. Progress and completion callbacks are guarded by the
-current worker attribute and run ID. The agent window checks the dataset ID
-and revision before displaying evidence and monitors the revision while a
-result is visible. Changed data discard prior evidence and request worker
-cancellation. Stop is cooperative between bounded service calls; a currently
-running preview or spectrum call finishes before cancellation completes.
-Start remains disabled until the worker's native run has finished.
+The graph receives only bounded JSON-compatible scalar values: parent and
+preflight run IDs, dataset ID and revision, mode/readiness/axis enums,
+capability booleans, evidence reference strings, summary/warning strings, and
+bounded typed plan steps. The context builder copies these from the successful
+Issue #55 preflight; it does not copy `PreflightResult` arrays or PNG data into
+the planning worker. Evidence references are opaque allowlisted IDs such as
+`image:frame:2` and `spectrum:plot`; they never identify a file or carry the
+evidence content.
 
-Closing the agent window requests cancellation and hides it for reuse. The
-main window's existing close veto requests shutdown of a still-running
-preflight and waits for inventory retirement before a later close can commit.
-On committed main-window close, the agent window is hidden and clears its
-result. The worker releases its captured handle before emitting completion;
-the result retains only bounded previews and derived spectrum arrays. Future
-consumers must similarly drop stale handles to release old frame stacks.
+LangGraph is loaded lazily from the separate `NEAT[agent]` extra. A baseline
+NEAT install can import the domain/service and open the Agent window without
+LangGraph. Its diagnostic preflight remains available. If the user starts the
+one-click run without the extra, preflight still completes and the window says
+that planning requires `[agent]`; it never reports a successful plan. The
+graph has no provider adapters or API-key access. Its invocation disables
+LangSmith tracing even if tracing was enabled globally for another process
+task. No graph state is persisted during ordinary runs. Tests may inject an
+in-memory checkpointer; SQLite durability and restart/resume are future work.
 
-## Scope and future controller policy
+## Worker, revision, and shutdown rules
 
-This milestone has no LLM, LangGraph, LangSmith, automated fitting or mapping,
-phase identification, model interpretation, report drafting, network upload,
-or ten-second checkpoint. The window says “Local Read-only Preflight (no LLM
-yet)” and never presents a heuristic as an AI conclusion.
+The Qt owner thread captures the scientific dataset handle and selected ROI
+for Step 0. The existing preflight worker releases its handle before
+completion. Only then is a safe planning context constructed and passed to a
+second tracked worker. The planner checks a cooperative stop event and the
+thread-safe dataset revision clock at graph-node boundaries and before
+publishing its result. It has a four-node fixed graph and no retry or
+refinement loop.
 
-A future controller should operate autonomously within granted permission,
-use a ten-second pre-authorised checkpoint only for noncritical decisions,
-limit refinement to three rounds per issue, leave cloud previews disabled by
-default, and seek explicit approval for critical decisions. These are policy
-requirements for later work, not behaviour implemented by this window.
+Starting again while either worker is active is ignored and the controls stay
+disabled. Starting diagnostic preflight during an autonomous run is also
+blocked. Closing the Agent window requests a stop, discards current displayed
+results, invalidates that run's callback IDs, and hides the reusable window.
+The main window's shutdown veto waits for both worker roles to retire before
+data cleanup. Planning results contain no references to old image stacks; the
+preflight result itself retains only the bounded evidence already displayed
+by the Agent window and is cleared on stale data or close.
+
+## Future autonomy and human checkpoints
+
+The binding future policy is designed for one initial action after the user
+sets a goal and permission envelope:
+
+- Routine operations already inside granted permissions advance without a
+  prompt. The controller may validate, evaluate, and replan within at most
+  three refinement rounds per identified issue.
+- A meaningful, pre-authorised noncritical decision offers a real ten-second
+  interruption window, then continues only if that exact operation is inside
+  the run-level permission grant. This is not a delay on every node or tool.
+- Critical scientific decisions, destructive or file-overwriting operations,
+  out-of-scope permissions, sensitive/cloud transmission, and unresolved
+  privacy or safety concerns always require explicit approval or stop. Silence
+  or a timeout never approves them. Cloud image/plot transmission is denied
+  by default.
+- Pause, Resume, and Stop belong to deterministic controller code. Stop is
+  cooperative and remains visibly in progress until safe termination.
+
+M3 neither grants permissions nor implements the ten-second timer,
+Pause/Resume, approval UI, durable checkpoints, autonomous execution, or live
+model reasoning. Those require later reviewed milestones. Scientific review
+of `d_fit` / CSV factor-of-two / HKL-denominator conventions remains a separate
+gate before fitting or physical claims can be automated.
 
 ## Manual smoke test
 
-1. Launch NEAT from this branch. On each top-level workflow tab, open
-   **AI Agent → Open AI Agent**. Confirm Overview and Visual Evidence are
-   visible together in the resizable panels, the companion window moves and
-   resizes independently, and the existing **AI Assistant** menu and dock
-   still work. Close and reopen AI Agent; it should reuse one window.
-2. With no data loaded, select **Start Preflight**. Overview should report
-   invalid or no data, and Visual Evidence should contain no invented images
-   or spectrum.
-3. Load an image stack. Select a valid fitting ROI in NEAT, then start a new
-   preflight. Overview should show real frame and wavelength metadata. Visual
-   Evidence should show first/midpoint/last frame previews, the selected ROI
-   overlay, and the measured spectrum and plot. Clear or reload images and
-   confirm the old evidence changes to “Dataset changed — rerun preflight”.
-4. Import a spectrum-only file and run preflight. The measured spectrum should
-   appear, while image previews and mapping are marked not applicable.
-5. Start a preflight and press **Stop**, or close AI Agent or NEAT while it is
-   running. The UI should remain responsive; NEAT may ask for another close
-   after the tracked worker has drained.
+1. On a normal install without `[agent]`, open **AI Agent** and confirm the
+   window is side by side, the AI Assistant remains available, and opening the
+   window starts no analysis. Run **Start Preflight** and confirm it still
+   shows observed local evidence.
+2. Install `NEAT[agent]`, load an image stack, select a valid ROI, and press
+   **Start Autonomous Analysis once**. Confirm the status advances from
+   preflight to planning without another click; the plan shows only
+   preflight-supported, read-only proposals and evidence IDs. It ends with the
+   explicit execution-unavailable message.
+3. Repeat with no ROI, invalid wavelength axis, empty data, or a spectrum-only
+   import. Confirm the plan says needs-input or blocked and does not invent an
+   image, spectrum, phase, or fitted value.
+4. Stop during either stage, reload or clear the dataset, and close/reopen the
+   Agent window. Confirm stale evidence is discarded, Stop drains safely, the
+   window can be reused, and NEAT shutdown waits for worker retirement.
+5. Confirm there is no model/provider/network request, fitting or mapping
+   action, ten-second countdown, fake approval control, or automatic source
+   data write.
