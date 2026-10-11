@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import threading
 import unittest
+import gc
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import psutil
@@ -40,6 +42,7 @@ from NEAT.ui.scientific_observation_adapter import (
     ObservationThreadError,
     ScientificObservationAdapter,
 )
+from NEAT.ui.mixins.fitting import FittingMixin
 
 
 class TestScientificObservation(unittest.TestCase):
@@ -149,6 +152,10 @@ class TestScientificObservation(unittest.TestCase):
             SpectrumPlotSpec(width_pixels=640, height_pixels=360, dpi=100),
         )
         self.assertEqual(plot.status, ObservationStatus.OK)
+        self.assertEqual(plot.dataset_id, spectrum.dataset_id)
+        self.assertEqual(plot.revision, spectrum.revision)
+        self.assertEqual(plot.mode, DatasetMode.PROFILE)
+        self.assertIsNone(plot.roi_effective)
         self.assertEqual(plot.plotted_point_count, 20)
         self.assertEqual(plot.mime_type, "image/png")
         self.assertEqual(Image.open(BytesIO(plot.png_bytes)).size, (640, 360))
@@ -157,6 +164,47 @@ class TestScientificObservation(unittest.TestCase):
                 spectrum,
                 SpectrumPlotSpec(width_pixels=1601, height_pixels=450),
             )
+
+    def test_plot_provenance_distinguishes_effective_image_rois(self):
+        handle = create_dataset_handle(
+            mode="images",
+            images=[np.arange(16).reshape(4, 4), np.arange(16).reshape(4, 4) + 2],
+            wavelengths=[1.0, 2.0],
+        )
+        first_roi = RoiBounds(0, 2, 0, 2)
+        second_roi = RoiBounds(2, 4, 2, 4)
+        first = render_spectrum_preview(get_roi_spectrum(handle, first_roi))
+        second = render_spectrum_preview(get_roi_spectrum(handle, second_roi))
+        self.assertEqual(first.dataset_id, second.dataset_id)
+        self.assertEqual(first.revision, second.revision)
+        self.assertEqual(first.mode, DatasetMode.IMAGES)
+        self.assertEqual(first.roi_effective, first_roi)
+        self.assertEqual(second.roi_effective, second_roi)
+        self.assertNotEqual(first.roi_effective, second.roi_effective)
+        clipped = get_roi_spectrum(
+            handle, RoiBounds(-1, 2, 0, 2, clip_policy=RoiClipPolicy.CLIP)
+        )
+        self.assertEqual(
+            render_spectrum_preview(clipped).roi_effective,
+            RoiBounds(0, 2, 0, 2),
+        )
+
+    def test_stale_handle_releases_old_frame_after_consumer_drops_it(self):
+        clock = DatasetRevisionClock()
+        frame = np.ones((32, 32), dtype=np.float64)
+        frame_ref = weakref.ref(frame)
+        handle = create_dataset_handle(
+            mode="images", images=[frame], wavelengths=[1.0], revision_clock=clock
+        )
+        del frame
+        clock.invalidate(replace_dataset=True)
+        gc.collect()
+        self.assertIsNotNone(frame_ref())
+        with self.assertRaises(StaleDatasetError):
+            handle.assert_current()
+        del handle
+        gc.collect()
+        self.assertIsNone(frame_ref())
 
     def test_profile_only_dataset_has_no_roi_or_image_preview(self):
         handle = create_dataset_handle(
@@ -393,6 +441,135 @@ class TestScientificObservationAdapter(unittest.TestCase):
             np.shares_memory(handle.profile_intensities, window.intensities)
         )
         self.assertFalse(handle.profile_intensities.flags.writeable)
+
+
+class TestLiveFittingDatasetInvalidation(unittest.TestCase):
+    """Exercise production fitting mutation methods with a Qt-owned window stub."""
+
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def text(self):
+            return self.value
+
+        def setText(self, value):
+            self.value = str(value)
+
+    class Window(QObject, FittingMixin):
+        def __init__(self):
+            QObject.__init__(self)
+            self.images = [np.full((4, 4), 10.0), np.full((4, 4), 20.0)]
+            self.wavelengths = np.array([1.0, 2.0])
+            self.intensities = np.array([])
+            self.fitting_data_source = "images"
+            self.current_fitting_input = "sample.nxs"
+            self.flight_path = 50.0
+            self.delay = 0.0
+            self.tof_array = None
+            self.manual_wavelength_mode = False
+            self.min_wavelength_input = TestLiveFittingDatasetInvalidation.Value("0.5")
+            self.max_wavelength_input = TestLiveFittingDatasetInvalidation.Value("2.5")
+            self.fits_image_load_worker = None
+            self._fits_progress_dialog = None
+            self.image_slider = Mock()
+            self.message_box = Mock()
+            self.bragg_table = Mock()
+            self.display_image = Mock()
+            self.apply_selected_area_from_inputs = Mock()
+            self._set_fits_image_button_states = Mock()
+            self._clear_fitting_canvases = Mock()
+            self._clear_image_canvas = Mock()
+            self.update_bragg_edge_table = Mock()
+            self.update_plots = Mock()
+            self._set_mapping_controls_enabled = Mock()
+            self.scientific_observation_api = ScientificObservationAdapter(self)
+
+    def _assert_stale(self, window, handle):
+        with self.assertRaises(StaleDatasetError):
+            window.scientific_observation_api.inspect_dataset(handle)
+
+    def test_image_replacement_and_clear_reload_stale_prior_handles(self):
+        window = self.Window()
+        adapter = window.scientific_observation_api
+        first = adapter.capture_dataset()
+        window.handle_nexus_stack_loaded(
+            "replacement.nxs",
+            [np.full((4, 4), 30.0), np.full((4, 4), 40.0)],
+            [1.2, 2.2],
+            50.0,
+            {"axis_centers": None, "axis_uses_flight_path": False},
+            "NeXus file",
+        )
+        self._assert_stale(window, first)
+        second = adapter.capture_dataset()
+        self.assertNotEqual(first.dataset_id, second.dataset_id)
+        window.clear_loaded_fits_images()
+        self._assert_stale(window, second)
+        empty = adapter.capture_dataset()
+        self.assertEqual(empty.mode, DatasetMode.EMPTY)
+        window.handle_nexus_stack_loaded(
+            "reloaded.nxs", [np.full((4, 4), 50.0)], [1.5], 50.0,
+            {"axis_centers": None, "axis_uses_flight_path": False}, "NeXus file",
+        )
+        self._assert_stale(window, empty)
+        self.assertEqual(adapter.capture_dataset().mode, DatasetMode.IMAGES)
+
+    def test_profile_import_stales_image_handle(self):
+        window = self.Window()
+        adapter = window.scientific_observation_api
+        image_handle = adapter.capture_dataset()
+        with (
+            patch("NEAT.ui.mixins.fitting.QFileDialog.getOpenFileName", return_value=("profile.csv", "")),
+            patch.object(FittingMixin, "_read_intensity_profile_file", return_value=(
+                np.array([1.0, 2.0, 3.0]), np.array([5.0, 6.0, 7.0])
+            )),
+        ):
+            window.import_intensity_profile()
+        self._assert_stale(window, image_handle)
+        profile = adapter.capture_dataset()
+        self.assertEqual(profile.mode, DatasetMode.PROFILE)
+        np.testing.assert_array_equal(adapter.get_roi_spectrum(handle=profile).intensities, [5, 6, 7])
+
+    def test_wavelength_recalculation_stales_handle_without_replacing_dataset(self):
+        window = self.Window()
+        adapter = window.scientific_observation_api
+        before = adapter.capture_dataset()
+        window.tof_array = np.array([0.02, 0.04])
+        window.update_wavelengths()
+        self._assert_stale(window, before)
+        after = adapter.capture_dataset()
+        self.assertEqual(before.dataset_id, after.dataset_id)
+        self.assertGreater(after.revision, before.revision)
+        np.testing.assert_array_equal(after.wavelengths, window.wavelengths)
+
+    def test_manual_calibration_stales_prior_handle(self):
+        window = self.Window()
+        adapter = window.scientific_observation_api
+        before = adapter.capture_dataset()
+        window.manual_wavelength_mode = True
+        window.manual_wavelength_anchors = [
+            {"index": 1, "value": 1.25},
+            {"index": 2, "value": 2.75},
+        ]
+        window.update_manual_wavelengths()
+        self._assert_stale(window, before)
+        after = adapter.capture_dataset()
+        self.assertEqual(after.dataset_id, before.dataset_id)
+        np.testing.assert_array_equal(after.wavelengths, [1.25, 2.75])
+
+    def test_display_adjustments_preserve_scientific_revision(self):
+        window = self.Window()
+        adapter = window.scientific_observation_api
+        handle = adapter.capture_dataset()
+        window.min_wavelength_input.setText("1.1")
+        window.max_wavelength_input.setText("1.9")
+        window.image_slider.setValue(1)
+        window.update_image()
+        window.update_current_box(0, 2, 0, 2)
+        self.assertEqual(adapter.revision_clock.current(), (handle.dataset_id, handle.revision))
+        self.assertEqual(adapter.inspect_dataset(handle).status, ObservationStatus.OK)
+        self.assertEqual(adapter.capture_dataset().display_window, (1.1, 1.9))
 
 
 if __name__ == "__main__":

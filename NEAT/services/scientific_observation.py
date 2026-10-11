@@ -234,8 +234,8 @@ def create_dataset_handle(
     """Build a coherent, read-only handle without copying the image stack."""
     mode = DatasetMode(mode)
     state_before = revision_clock.current() if revision_clock is not None else None
-    frames = None
-    image_shape = None
+    frames: tuple[np.ndarray, ...] | None = None
+    image_shape: tuple[int, int] | None = None
 
     if mode is DatasetMode.IMAGES:
         if images is None:
@@ -252,7 +252,10 @@ def create_dataset_handle(
                 for index, frame in enumerate(images)
             )
             if frame_views:
-                image_shape = tuple(int(v) for v in frame_views[0].shape)
+                image_shape = (
+                    int(frame_views[0].shape[0]),
+                    int(frame_views[0].shape[1]),
+                )
                 if any(tuple(frame.shape) != image_shape for frame in frame_views):
                     raise ObservationValidationError(
                         "Image frames do not all have the same dimensions."
@@ -283,6 +286,7 @@ def create_dataset_handle(
         dataset_id = uuid4().hex
         revision = 0
     else:
+        assert state_before is not None
         dataset_id, revision = state_before
 
     state_after = revision_clock.current() if revision_clock is not None else None
@@ -484,7 +488,7 @@ def get_image_preview(
         raise ObservationValidationError(
             "Specify both contrast limits or neither."
         )
-    if spec.vmin is not None:
+    if spec.vmin is not None and spec.vmax is not None:
         try:
             vmin_request = float(spec.vmin)
             vmax_request = float(spec.vmax)
@@ -500,7 +504,7 @@ def get_image_preview(
                 "Contrast limits must be finite and increasing."
             )
     else:
-        vmin_request = vmax_request = None
+        vmin_request, vmax_request = None, None
 
     if isinstance(frame_index, bool) or not isinstance(frame_index, Integral):
         raise ObservationValidationError("frame_index must be an integer.")
@@ -796,6 +800,8 @@ def render_spectrum_preview(
             status=ObservationStatus.INVALID,
             dataset_id=spectrum.dataset_id,
             revision=spectrum.revision,
+            mode=spectrum.mode,
+            roi_effective=spectrum.roi_effective,
             png_bytes=None,
             mime_type="image/png",
             width_pixels=spec.width_pixels,
@@ -839,6 +845,8 @@ def render_spectrum_preview(
             status=ObservationStatus.INVALID,
             dataset_id=spectrum.dataset_id,
             revision=spectrum.revision,
+            mode=spectrum.mode,
+            roi_effective=spectrum.roi_effective,
             png_bytes=None,
             mime_type="image/png",
             width_pixels=spec.width_pixels,
@@ -896,6 +904,8 @@ def render_spectrum_preview(
         status=ObservationStatus.OK,
         dataset_id=spectrum.dataset_id,
         revision=spectrum.revision,
+        mode=spectrum.mode,
+        roi_effective=spectrum.roi_effective,
         png_bytes=png_bytes,
         mime_type="image/png",
         width_pixels=spec.width_pixels,

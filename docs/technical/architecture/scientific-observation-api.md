@@ -51,7 +51,10 @@ read-only.
   preserved; invalid or non-monotonic axes are flagged rather than silently
   sorted by the observation layer.
 - Plot output uses Matplotlib's non-interactive Agg canvas. Rendering is
-  serialized because Matplotlib has process-wide configuration state.
+  serialized because Matplotlib has process-wide configuration state. Each
+  `PlotObservation` carries the dataset ID, revision, dataset mode, and the
+  effective image ROI. For an imported spectrum-only dataset, mode is
+  `profile` and the effective ROI is `None`.
 
 ## Privacy and resource limits
 
@@ -81,7 +84,13 @@ an image/profile dataset or changing its wavelength axis invalidates prior
 handles. Display-only contrast, selected-frame, and wavelength-window changes
 do not invalidate the scientific data revision. Consumers should capture once
 for a coherent series of observations and treat a stale-handle error as a
-request to recapture and retry.
+request to recapture and retry. A handle owns read-only views into the image
+stack. Invalidation makes a handle unusable but does not free its referenced
+frames. Consumers must drop stale handles and any stored references to their
+`frames` (for example, clear cached handles and replace the current handle)
+after a reload or clear. Once no other owner references the old stack, Python
+can release it. Derived previews and ROI spectra hold their own bounded arrays
+and do not keep the image stack alive.
 
 ## Future assistant architecture
 

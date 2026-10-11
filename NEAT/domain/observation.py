@@ -196,6 +196,8 @@ class PlotObservation:
     status: ObservationStatus
     dataset_id: str
     revision: int
+    mode: DatasetMode
+    roi_effective: RoiBounds | None
     png_bytes: bytes | None
     mime_type: str
     width_pixels: int
