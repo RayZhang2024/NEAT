@@ -29,6 +29,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[assistant,assistant-server,test]"
 
+      - name: Pin compatible ONNX runtime for newer Windows Python
+        if: matrix.python-version != '3.10'
+        run: python -m pip install "onnxruntime==1.29.0"
+
       - name: Run full unit suite
         run: python -m unittest discover -s tests -v
 
