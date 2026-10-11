@@ -20,6 +20,15 @@ from .preprocessing import (
     ProducedOutput,
 )
 from .preprocessing_inputs import LoadedImageRun
+from .agent_planning import (
+    FuturePermissionClass,
+    PlanStep,
+    PlanStepType,
+    PlanningContext,
+    PlanningErrorCode,
+    PlanningOutcome,
+    PlanningStatus,
+)
 from .observation import (
     DatasetCapabilities,
     DatasetMode,
@@ -54,6 +63,13 @@ __all__ = [
     "PreprocessingStatus",
     "ProducedOutput",
     "LoadedImageRun",
+    "FuturePermissionClass",
+    "PlanStep",
+    "PlanStepType",
+    "PlanningContext",
+    "PlanningErrorCode",
+    "PlanningOutcome",
+    "PlanningStatus",
     "DatasetCapabilities",
     "DatasetMode",
     "DatasetObservation",

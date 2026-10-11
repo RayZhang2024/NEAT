@@ -12,6 +12,7 @@ import tools
 from NEAT.domain import IndividualEdgeFitConfig, WavelengthRegion
 from NEAT.package_resources import assistant_knowledge_root, launch_splash_resource
 from NEAT.services.fitting_engine import FittingEngine
+import NEAT.services.agent_planning as agent_planning
 from tools.assistant_retrieval import (
     BM25Retriever,
     KNOWLEDGE_FILENAMES,
@@ -51,6 +52,14 @@ if not required_scripts <= scripts:
 
 if "PyQt5" in sys.modules:
     raise AssertionError("Headless domain/service imports loaded PyQt5")
+if "langgraph" in sys.modules or agent_planning.__name__ != "NEAT.services.agent_planning":
+    raise AssertionError("The baseline import path eagerly loaded optional planning code")
+try:
+    metadata.distribution("langgraph")
+except metadata.PackageNotFoundError:
+    pass
+else:
+    raise AssertionError("Baseline package smoke unexpectedly has the optional agent extra")
 if FittingEngine is None or IndividualEdgeFitConfig is None or WavelengthRegion is None:
     raise AssertionError("Scientific domain/service imports did not resolve")
 

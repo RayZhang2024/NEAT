@@ -197,6 +197,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.setup_assistant_dock()
         self.agent_window = None
         self.agent_preflight_worker = None
+        self.agent_planning_worker = None
         self.setup_menu_bar()
 
         # Variables for storing image data and auto-adjust parameters
@@ -1247,6 +1248,10 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             agent_window = getattr(self, "agent_window", None)
             if agent_window is not None:
                 agent_window.worker_retired(worker, callbacks_suppressed)
+        elif role == "agent_planning":
+            agent_window = getattr(self, "agent_window", None)
+            if agent_window is not None:
+                agent_window.planning_worker_retired(worker, callbacks_suppressed)
         if self._shutdown_close_pending and callbacks_suppressed:
             if role == "fits_image_loader":
                 self._hide_load_progress_dialog()
@@ -1296,6 +1301,9 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self._shutdown_close_pending = False
         self._shutdown_busy_message_shown = False
         self.statusBar().clearMessage()
+        agent_window = getattr(self, "agent_window", None)
+        if agent_window is not None:
+            agent_window._update_controls()
 
     def cleanup_resources(self):
         """Release data only after shutdown preflight proves every owner safe."""
@@ -1759,7 +1767,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         if work_at_entry:
             agent_window = getattr(self, "agent_window", None)
             if agent_window is not None:
-                agent_window.stop_preflight()
+                agent_window.stop_active_run()
             self._shutdown_close_pending = True
             for timer_name in ("update_timer", "remaining_time_timer"):
                 timer = getattr(self, timer_name, None)

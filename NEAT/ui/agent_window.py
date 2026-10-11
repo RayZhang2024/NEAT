@@ -24,12 +24,20 @@ from ..domain.agent_preflight import (
     PreflightResult,
     PreflightRunState,
 )
+from ..domain.agent_planning import (
+    PlanStep,
+    PlanningContext,
+    PlanningOutcome,
+    PlanningStatus,
+    context_from_preflight,
+)
 from ..domain.observation import DatasetMode, RoiBounds
 from ..services.scientific_observation import (
     DatasetUnavailableError,
     ObservationErrorBase,
 )
 from .agent_preflight_worker import PreflightWorker
+from .agent_planning_worker import PlanningWorker
 
 
 class AgentWindow(QMainWindow):
@@ -39,13 +47,20 @@ class AgentWindow(QMainWindow):
         super().__init__(main_window, Qt.Window)
         self._main_window = main_window
         self._worker: PreflightWorker | None = None
+        self._planning_worker: PlanningWorker | None = None
         self._active_run_id: str | None = None
+        self._agent_run_id: str | None = None
+        self._stage = "idle"
         self._dataset_token: tuple[str, int] | None = None
         self._result: PreflightResult | None = None
+        self._planning_outcome: PlanningOutcome | None = None
         self._stale = False
         self._parent_closing = False
+        self._preflight_completion_received = False
+        self._awaiting_preflight_completion = False
+        self._pending_planning_context: PlanningContext | None = None
 
-        self.setWindowTitle("NEAT AI Agent — Local Read-only Preflight")
+        self.setWindowTitle("NEAT AI Agent — Autonomous Analysis (M3)")
         self.setMinimumSize(820, 520)
         self.resize(1000, 720)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -61,8 +76,15 @@ class AgentWindow(QMainWindow):
         overview_heading = QLabel("Overview", self.overview_panel)
         overview_heading.setStyleSheet("font-size: 15px; font-weight: bold;")
         overview_layout.addWidget(overview_heading)
-        title = QLabel("Local Read-only Preflight (no LLM yet)", self.overview_panel)
+        title = QLabel("One-click Autonomous Analysis — M3", self.overview_panel)
         overview_layout.addWidget(title)
+        self.scope_label = QLabel(
+            "Local preflight + deterministic plan only; no LLM or scientific execution.",
+            self.overview_panel,
+        )
+        self.scope_label.setWordWrap(True)
+        self.scope_label.setObjectName("m3ScopeLimitLabel")
+        overview_layout.addWidget(self.scope_label)
         self.status_label = QLabel("No preflight has been run.", self.overview_panel)
         self.status_label.setAccessibleName("Preflight status")
         self.status_label.setWordWrap(True)
@@ -73,6 +95,13 @@ class AgentWindow(QMainWindow):
         self.progress_bar.setAccessibleName("Preflight progress")
         overview_layout.addWidget(self.progress_bar)
         controls = QHBoxLayout()
+        self.start_autonomous_button = QPushButton(
+            "Start Autonomous Analysis", self.overview_panel
+        )
+        self.start_autonomous_button.setAccessibleName("Start Autonomous Analysis")
+        self.start_autonomous_button.setObjectName("startAutonomousAnalysisButton")
+        self.start_autonomous_button.clicked.connect(self.start_autonomous_analysis)
+        controls.addWidget(self.start_autonomous_button)
         self.start_button = QPushButton("Start Preflight", self.overview_panel)
         self.start_button.setAccessibleName("Start local read-only preflight")
         self.start_button.clicked.connect(self.start_preflight)
@@ -88,10 +117,22 @@ class AgentWindow(QMainWindow):
         self.assessment_text.setReadOnly(True)
         self.assessment_text.setAccessibleName("Dataset assessment")
         self.assessment_text.setPlainText(
-            "Start Preflight to inspect the currently loaded dataset. "
-            "This local step does not identify a phase, fit an edge, or run mapping."
+            "Start Autonomous Analysis to run preflight and then prepare a "
+            "deterministic read-only plan in one action. Start Preflight remains "
+            "available as a diagnostic action."
         )
         overview_layout.addWidget(self.assessment_text)
+        plan_heading = QLabel("Read-only plan proposal", self.overview_panel)
+        plan_heading.setStyleSheet("font-weight: bold;")
+        overview_layout.addWidget(plan_heading)
+        self.plan_text = QPlainTextEdit(self.overview_panel)
+        self.plan_text.setReadOnly(True)
+        self.plan_text.setMaximumHeight(170)
+        self.plan_text.setAccessibleName("Deterministic plan proposal")
+        self.plan_text.setPlainText(
+            "The plan will appear automatically after a successful current preflight."
+        )
+        overview_layout.addWidget(self.plan_text)
 
         self.evidence_panel = QWidget(self.splitter)
         self.evidence_panel.setObjectName("preflightEvidencePanel")
@@ -112,7 +153,9 @@ class AgentWindow(QMainWindow):
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 2)
         self.splitter.setSizes([390, 610])
-        self._show_evidence_message("No visual evidence yet. Start Preflight to inspect the dataset.")
+        self._show_evidence_message(
+            "No visual evidence yet. Start Autonomous Analysis or Start Preflight to inspect the dataset."
+        )
 
         self._revision_timer = QTimer(self)
         self._revision_timer.setInterval(200)
@@ -151,44 +194,109 @@ class AgentWindow(QMainWindow):
             return
         self._stale = True
         self._result = None
+        self._planning_outcome = None
         if self._worker is not None:
             self._worker.stop()
-        self._set_status("Dataset changed — rerun preflight.")
+        if self._planning_worker is not None:
+            self._planning_worker.stop()
+        self._stage = "stale"
+        stale_message = (
+            "Dataset changed — rerun autonomous analysis."
+            if self._agent_run_id is not None
+            else "Dataset changed — rerun preflight."
+        )
+        self._set_status(stale_message)
+        self.plan_text.setPlainText(stale_message)
         self.assessment_text.setPlainText("Previous evidence was discarded because the dataset changed.")
-        self._show_evidence_message("Dataset changed — rerun preflight to see current evidence.")
-        if self._worker is None:
+        self._show_evidence_message(
+            "Dataset changed — rerun autonomous analysis to inspect current evidence."
+            if self._agent_run_id is not None
+            else "Dataset changed — rerun preflight to see current evidence."
+        )
+        if self._worker is None and self._planning_worker is None:
             self._revision_timer.stop()
+        self._update_controls()
 
-    def start_preflight(self) -> None:
-        """Capture live state only on the Qt owner thread, then start bounded work."""
-        if self._worker is not None or self._parent_closing:
+    def _has_active_worker(self) -> bool:
+        return bool(
+            self._worker is not None
+            or self._planning_worker is not None
+            or self._awaiting_preflight_completion
+        )
+
+    def _update_controls(self) -> None:
+        active = self._has_active_worker()
+        host_closing = bool(
+            getattr(self._main_window, "_shutdown_close_pending", False)
+            or getattr(self._main_window, "_shutdown_committed", False)
+        )
+        can_start = not active and not self._parent_closing and not host_closing
+        self.start_button.setEnabled(can_start)
+        self.start_autonomous_button.setEnabled(can_start)
+        self.stop_button.setEnabled(active and not self._parent_closing)
+        if not active:
+            self.stop_button.setText("Stop")
+
+    def start_autonomous_analysis(self) -> None:
+        """Run existing preflight and automatically continue to read-only planning."""
+        if self._has_active_worker() or self._parent_closing:
             return
-        if getattr(self._main_window, "_shutdown_close_pending", False) or getattr(
-            self._main_window, "_shutdown_committed", False
-        ):
+        run_id = uuid4().hex
+        self._agent_run_id = run_id
+        self._planning_outcome = None
+        self._stage = "preflight_running"
+        self.plan_text.clear()
+        self.plan_text.setPlainText("Waiting for the current dataset preflight.")
+        self.start_preflight(_agent_run_id=run_id)
+
+    def start_preflight(self, *, _agent_run_id: str | None = None) -> None:
+        """Capture live state only on the Qt owner thread, then start bounded work."""
+        if self._has_active_worker() or self._parent_closing:
+            return
+        if getattr(self._main_window, "_shutdown_close_pending", False) or getattr(self._main_window, "_shutdown_committed", False):
             self._set_status("NEAT is closing; retry after the close attempt finishes.")
             return
         self._result = None
         self._stale = False
         self._dataset_token = None
+        self._preflight_completion_received = False
+        self._awaiting_preflight_completion = True
+        self._pending_planning_context = None
+        self._planning_outcome = None
+        if _agent_run_id is None:
+            self._agent_run_id = None
+            self._stage = "preflight_running"
         self._revision_timer.stop()
         self.progress_bar.setValue(0)
         self._show_evidence_message("Preflight is preparing the observation snapshot.")
         self.assessment_text.clear()
+        if _agent_run_id is None:
+            self.plan_text.setPlainText(
+                "Diagnostic preflight only. Use Start Autonomous Analysis to run planning afterward."
+            )
         run_id = uuid4().hex
         self._active_run_id = run_id
         adapter = getattr(self._main_window, "scientific_observation_api", None)
         if adapter is None:
+            self._awaiting_preflight_completion = False
             self._set_status("Scientific observation API is unavailable.")
+            self._stage = "failed"
+            self._update_controls()
             return
         try:
             handle = adapter.capture_dataset()
             roi = adapter.capture_selected_roi(handle)
         except DatasetUnavailableError:
+            self._awaiting_preflight_completion = False
             self._set_status("Dataset loader is busy — retry preflight after loading finishes.")
+            self._stage = "busy_retry"
+            self._update_controls()
             return
         except (ObservationErrorBase, ValueError):
+            self._awaiting_preflight_completion = False
             self._set_status("Dataset capture is unavailable — check loaded data and retry.")
+            self._stage = "blocked_invalid_data"
+            self._update_controls()
             return
 
         self._dataset_token = (handle.dataset_id, handle.revision)
@@ -210,24 +318,39 @@ class AgentWindow(QMainWindow):
             lambda rid=run_id, current=worker: self._on_worker_finished(rid, current),
             current_attribute="agent_preflight_worker",
         )
+        self.start_autonomous_button.setEnabled(False)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self._set_status("Preflight running locally. No model or network request is used.")
+        self.stop_button.setText("Stop")
+        self._set_status(
+            "Preflight running locally. Planning will start automatically after current evidence is validated."
+            if _agent_run_id is not None
+            else "Preflight running locally. No model or network request is used."
+        )
         self._revision_timer.start()
         worker.start()
 
     def stop_preflight(self) -> None:
-        if self._worker is None:
+        """Keep the historical shutdown method name for existing callers."""
+        self.stop_active_run()
+
+    def stop_active_run(self) -> None:
+        worker = self._worker or self._planning_worker
+        if worker is None:
             return
         try:
-            self._worker.stop()
+            worker.stop()
         except RuntimeError:
-            # Qt can delete a thread after the shutdown inventory retires it.
-            self._worker = None
+            if worker is self._worker:
+                self._worker = None
+            if worker is self._planning_worker:
+                self._planning_worker = None
+            self._update_controls()
             return
         self.stop_button.setEnabled(False)
+        self.stop_button.setText("Stopping…")
         if not self._stale:
-            self._set_status("Cancelling — waiting for the current observation step to finish.")
+            self._set_status("Stopping — waiting for the current bounded operation to finish safely.")
 
     def _on_progress(self, run_id: str, percent: int, message: str) -> None:
         if run_id != self._active_run_id or self._parent_closing or self._stale:
@@ -240,8 +363,14 @@ class AgentWindow(QMainWindow):
             self._set_status(message)
 
     def _on_completed(self, outcome: PreflightOutcome) -> None:
-        if outcome.run_id != self._active_run_id or self._parent_closing:
+        if (
+            outcome.run_id != self._active_run_id
+            or self._parent_closing
+            or getattr(self._main_window, "_shutdown_close_pending", False)
+        ):
             return
+        self._preflight_completion_received = True
+        self._awaiting_preflight_completion = False
         self._check_revision()
         if self._stale or self._dataset_token != (outcome.dataset_id, outcome.revision):
             self._mark_stale()
@@ -250,22 +379,225 @@ class AgentWindow(QMainWindow):
             self._result = outcome.result
             self.progress_bar.setValue(100)
             self._render_result(outcome.result)
+            if self._agent_run_id is not None:
+                try:
+                    context = context_from_preflight(
+                        outcome.result, run_id=self._agent_run_id
+                    )
+                except (ValueError, TypeError):
+                    self._stage = "failed"
+                    self._set_status(
+                        "Preflight completed, but its safe planning summary was invalid."
+                    )
+                    self.plan_text.setPlainText(
+                        "Planning stopped because the preflight summary failed validation."
+                    )
+                else:
+                    self._pending_planning_context = context
+                    if self._worker is None:
+                        self._start_pending_planning()
         else:
             self._result = None
             self._show_evidence_message(outcome.message or "No evidence was produced.")
             self.assessment_text.setPlainText(outcome.message or "Preflight did not complete.")
             self._set_status(outcome.message or "Preflight did not complete.")
+            if outcome.state is PreflightRunState.STALE:
+                self._mark_stale()
+            elif outcome.state is PreflightRunState.CANCELLED:
+                self._stage = "cancelled"
+                self.plan_text.setPlainText("Autonomous analysis stopped during preflight.")
+            elif outcome.state is PreflightRunState.BUSY:
+                self._stage = "busy_retry"
+            else:
+                self._stage = "failed"
+
+    def _start_pending_planning(self) -> None:
+        context = self._pending_planning_context
+        if context is None:
+            return
+        self._pending_planning_context = None
+        self._start_planning(context)
+
+    def _start_planning(self, context: PlanningContext) -> None:
+        if (
+            self._agent_run_id != context.run_id
+            or self._worker is not None
+            or self._stale
+            or self._parent_closing
+        ):
+            return
+        adapter = getattr(self._main_window, "scientific_observation_api", None)
+        if adapter is None or adapter.revision_clock.current() != (
+            context.dataset_id,
+            context.revision,
+        ):
+            self._mark_stale()
+            return
+        worker = PlanningWorker(
+            context, adapter.revision_clock, parent=self._main_window
+        )
+        self._planning_worker = worker
+        self._main_window.agent_planning_worker = worker
+        self._main_window._track_shutdown_worker(worker, "agent_planning")
+        self._main_window._connect_shutdown_worker_signal(
+            worker,
+            worker.progress,
+            lambda percent, message, rid=context.run_id, current=worker: self._on_planning_progress(
+                rid, current, percent, message
+            ),
+            current_attribute="agent_planning_worker",
+        )
+        self._main_window._connect_shutdown_worker_signal(
+            worker,
+            worker.completed,
+            lambda outcome, rid=context.run_id, current=worker: self._on_planning_completed(
+                rid, current, outcome
+            ),
+            current_attribute="agent_planning_worker",
+        )
+        self._main_window._connect_shutdown_worker_signal(
+            worker,
+            worker.finished,
+            lambda rid=context.run_id, current=worker: self._on_planning_finished(
+                rid, current
+            ),
+            current_attribute="agent_planning_worker",
+        )
+        self._stage = "planning_running"
+        self.progress_bar.setValue(90)
+        self.plan_text.setPlainText(
+            "Preflight is current. The deterministic local LangGraph planner is preparing a read-only proposal."
+        )
+        self._set_status("Preflight complete — planning is advancing automatically.")
+        worker.start()
+
+    def _on_planning_progress(
+        self, run_id: str, worker: PlanningWorker, percent: int, message: str
+    ) -> None:
+        if (
+            run_id != self._agent_run_id
+            or worker is not self._planning_worker
+            or self._parent_closing
+            or self._stale
+            or getattr(self._main_window, "_shutdown_close_pending", False)
+        ):
+            return
+        self._check_revision()
+        if self._stale:
+            return
+        self.progress_bar.setValue(max(90, percent))
+        if self.stop_button.isEnabled():
+            self._set_status(message)
+
+    @staticmethod
+    def _format_plan_step(step: PlanStep, index: int) -> tuple[str, ...]:
+        evidence = ", ".join(step.evidence_ids) if step.evidence_ids else "none"
+        input_note = "Human input required" if step.requires_human_input else "Read-only proposal"
+        return (
+            f"{index}. {step.step_type.value}",
+            f"   {step.rationale}",
+            f"   Evidence: {evidence}",
+            f"   {input_note}; supported by current preflight: {step.supported}.",
+        )
+
+    def _on_planning_completed(
+        self, run_id: str, worker: PlanningWorker, outcome: PlanningOutcome
+    ) -> None:
+        if (
+            run_id != self._agent_run_id
+            or worker is not self._planning_worker
+            or outcome.run_id != run_id
+            or self._parent_closing
+            or getattr(self._main_window, "_shutdown_close_pending", False)
+        ):
+            return
+        self._check_revision()
+        if self._stale or self._dataset_token != (outcome.dataset_id, outcome.revision):
+            self._mark_stale()
+            return
+        if self._result is None or self._result.run_id != outcome.preflight_run_id:
+            self._mark_stale()
+            return
+        self._planning_outcome = outcome
+        self._stage = outcome.status.value
+        lines = [
+            f"Status: {outcome.status.value.replace('_', ' ')}",
+            f"Agent run: {outcome.run_id}",
+            f"Preflight run: {outcome.preflight_run_id}",
+            f"Dataset: {outcome.dataset_id} revision {outcome.revision}",
+            f"Graph transitions: {' → '.join(outcome.transitions) or 'none'}",
+        ]
+        if outcome.error_code is not None:
+            lines.append(f"Reason code: {outcome.error_code.value}")
+        if outcome.steps:
+            lines.extend(("", "Proposed steps (not executed):"))
+            for index, step in enumerate(outcome.steps, start=1):
+                lines.extend(self._format_plan_step(step, index))
+        if outcome.status is PlanningStatus.READY_PLAN:
+            lines.extend(
+                (
+                    "",
+                    "Plan prepared — scientific execution is not yet implemented.",
+                    "No fitting, mapping, phase identification, or source-data changes occurred.",
+                )
+            )
+            self._set_status(
+                "Plan prepared — scientific execution is not yet implemented."
+            )
+            self.progress_bar.setValue(100)
+        elif outcome.status is PlanningStatus.NEEDS_INPUT:
+            self._set_status("Plan needs user input before it can be considered ready.")
+        elif outcome.status is PlanningStatus.BLOCKED_INVALID_DATA:
+            self._set_status("Autonomous analysis stopped — preflight data or evidence is invalid.")
+        elif outcome.status is PlanningStatus.UNAVAILABLE:
+            self._set_status(
+                "Preflight complete — planning is unavailable; install the optional [agent] extra."
+            )
+        elif outcome.status is PlanningStatus.CANCELLED:
+            self._set_status("Autonomous analysis stopped during planning.")
+        elif outcome.status is PlanningStatus.STALE:
+            self._mark_stale()
+            return
+        else:
+            self._set_status("Planning failed safely; no scientific action was run.")
+        if outcome.message:
+            lines.extend(("", outcome.message))
+        self.plan_text.setPlainText("\n".join(lines))
+
+    def _on_planning_finished(self, run_id: str, worker: PlanningWorker) -> None:
+        if self._planning_worker is worker:
+            self._planning_worker = None
+        if getattr(self._main_window, "agent_planning_worker", None) is worker:
+            self._main_window.agent_planning_worker = None
+        if run_id == self._agent_run_id and not self._parent_closing:
+            if self._planning_outcome is None and not self._stale:
+                self._stage = "failed"
+                self._set_status("Planning stopped before a result was received.")
+                self.plan_text.setPlainText("No plan was produced.")
+        self._update_controls()
+        if not self._has_active_worker() and self._result is None:
+            self._revision_timer.stop()
 
     def _on_worker_finished(self, run_id: str, worker: PreflightWorker) -> None:
         if self._worker is worker:
             self._worker = None
         if getattr(self._main_window, "agent_preflight_worker", None) is worker:
             self._main_window.agent_preflight_worker = None
-        if run_id != self._active_run_id or self._parent_closing:
-            return
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        if self._result is None:
+        if (
+            run_id == self._active_run_id
+            and not self._parent_closing
+            and self._pending_planning_context is not None
+        ):
+            self._start_pending_planning()
+        elif (
+            run_id == self._active_run_id
+            and self._preflight_completion_received
+            and self._stage == "preflight_running"
+            and self._agent_run_id is None
+        ):
+            self._stage = "complete"
+        self._update_controls()
+        if self._result is None and self._planning_worker is None:
             self._revision_timer.stop()
 
     def worker_retired(self, worker: PreflightWorker, callbacks_suppressed: bool) -> None:
@@ -273,13 +605,30 @@ class AgentWindow(QMainWindow):
         if self._worker is not worker:
             return
         self._worker = None
-        self.stop_button.setEnabled(False)
+        self._awaiting_preflight_completion = False
+        self._pending_planning_context = None
         if not self._parent_closing:
-            self.start_button.setEnabled(True)
             if callbacks_suppressed and not self._stale:
                 self._result = None
                 self._revision_timer.stop()
                 self._set_status("Preflight stopped while NEAT was closing. Start again if NEAT remains open.")
+            self._update_controls()
+
+    def planning_worker_retired(
+        self, worker: PlanningWorker, callbacks_suppressed: bool
+    ) -> None:
+        """Clear window ownership when shutdown retires the planning QThread."""
+        if self._planning_worker is not worker:
+            return
+        self._planning_worker = None
+        if not self._parent_closing:
+            if callbacks_suppressed and not self._stale:
+                self._planning_outcome = None
+                self.plan_text.clear()
+                self._set_status(
+                    "Planning stopped while NEAT was closing. Start again if NEAT remains open."
+                )
+            self._update_controls()
 
     @staticmethod
     def _preview_pixmap(image, roi: RoiBounds | None) -> QPixmap:
@@ -391,13 +740,32 @@ class AgentWindow(QMainWindow):
     def shutdown_for_parent_close(self) -> None:
         """Called only after the main window's worker inventory has drained."""
         self._parent_closing = True
+        self._active_run_id = None
+        self._agent_run_id = None
+        self._pending_planning_context = None
+        self._awaiting_preflight_completion = False
         self._revision_timer.stop()
         self._result = None
+        self._planning_outcome = None
         self._dataset_token = None
+        self.plan_text.clear()
         self._show_evidence_message("NEAT is closing.")
         self.hide()
 
     def closeEvent(self, event) -> None:
-        self.stop_preflight()
+        self.stop_active_run()
+        self._active_run_id = None
+        self._agent_run_id = None
+        self._pending_planning_context = None
+        self._awaiting_preflight_completion = False
+        self._result = None
+        self._planning_outcome = None
+        self._dataset_token = None
+        self.plan_text.clear()
+        self._revision_timer.stop()
+        self.assessment_text.setPlainText(
+            "The Agent window was closed. Any active stage is stopping safely."
+        )
+        self._show_evidence_message("No current evidence is displayed.")
         self.hide()
         event.accept()

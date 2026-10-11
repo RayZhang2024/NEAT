@@ -120,6 +120,28 @@ jobs:
             Pop-Location
           }
 
+      - name: Smoke-test clean wheel install with optional agent extra
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist -Filter "*.whl" | Select-Object -First 1).FullName
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "neat-agent-wheel-smoke"
+          New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
+          python -m venv (Join-Path $smokeRoot ".venv")
+          $python = Join-Path $smokeRoot ".venv\Scripts\python.exe"
+          & $python -m pip install "${wheel}[agent]"
+          Copy-Item tools\installed_agent_smoke.py (Join-Path $smokeRoot "installed_agent_smoke.py")
+          $env:NEAT_CHECKOUT_ROOT = $env:GITHUB_WORKSPACE
+          $env:PYTHONPATH = ""
+          Push-Location $smokeRoot
+          try {
+            & $python .\installed_agent_smoke.py
+            if ($LASTEXITCODE -ne 0) { throw "Optional agent wheel smoke failed." }
+            & $python -m pip check
+            if ($LASTEXITCODE -ne 0) { throw "Optional agent wheel pip check failed." }
+          } finally {
+            Pop-Location
+          }
+
       - name: Smoke-test clean sdist install
         shell: pwsh
         run: |
@@ -141,3 +163,28 @@ jobs:
           } finally {
             Pop-Location
           }
+
+  linux-agent-planning:
+    name: Ubuntu / Python 3.13 / optional agent graph tests
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install clean package environment with optional agent extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[assistant,assistant-server,test,agent]"
+
+      - name: Run graph and one-click UI tests
+        run: |
+          python -m unittest discover -s tests -p "test_agent_planning.py" -v
+          python -m unittest discover -s tests -p "test_agent_preflight.py" -v
