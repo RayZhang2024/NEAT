@@ -17,11 +17,14 @@ only observed capabilities and quality conditions. The assessment contains
 safe evidence references, not images or local file paths. Unknown companion
 metadata and calibration sources remain explicit warnings.
 
-The Overview tab shows the run and dataset tokens, status, capabilities,
-provenance, warnings, and unsupported operations. Visual Evidence shows actual
-preview PNGs, original-grid ROI overlays, and a rendered measured spectrum
-where available. Frame wavelengths appear only for a valid aligned axis. The
-full source spectrum count is separate from the plot display window.
+The Agent window presents Overview and Visual Evidence together in two
+resizable side-by-side panels. Overview shows the run and dataset tokens,
+status, capabilities, provenance, warnings, and unsupported operations.
+Visual Evidence shows actual preview PNGs, original-grid ROI overlays, and a
+rendered measured spectrum where available. Frame wavelengths appear only for
+a valid aligned axis. The full source spectrum count is separate from the plot
+display window. The two panels share one companion window; the AI Assistant
+dock remains in the main NEAT window.
 
 ## Worker and window lifetime
 
@@ -58,9 +61,10 @@ requirements for later work, not behaviour implemented by this window.
 ## Manual smoke test
 
 1. Launch NEAT from this branch. On each top-level workflow tab, open
-   **AI Agent → Open AI Agent**. Confirm the separate window moves and resizes
-   independently, and that the existing **AI Assistant** menu and dock still
-   work. Close and reopen AI Agent; it should reuse one window.
+   **AI Agent → Open AI Agent**. Confirm Overview and Visual Evidence are
+   visible together in the resizable panels, the companion window moves and
+   resizes independently, and the existing **AI Assistant** menu and dock
+   still work. Close and reopen AI Agent; it should reuse one window.
 2. With no data loaded, select **Start Preflight**. Overview should report
    invalid or no data, and Visual Evidence should contain no invented images
    or spectrum.

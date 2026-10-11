@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
     QSlider,
+    QSplitter,
     QTabWidget,
     QTextEdit,
     QWidget,
@@ -148,6 +149,18 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertFalse(self.window.isVisible())
         self.host.open_ai_agent()
         self.assertIs(self.host.agent_window, self.window)
+        self.assertTrue(self.window.isVisible())
+
+    def test_overview_and_visual_evidence_are_visible_together(self):
+        self.assertIsInstance(self.window.centralWidget(), QSplitter)
+        self.assertEqual(self.window.splitter.orientation(), Qt.Horizontal)
+        self.assertEqual(self.window.splitter.count(), 2)
+        self.assertTrue(self.window.overview_panel.isVisible())
+        self.assertTrue(self.window.evidence_panel.isVisible())
+        self.assertTrue(self.window.assessment_text.isVisible())
+        self.assertTrue(self.window.evidence_scroll.isVisible())
+        self.assertGreater(self.window.splitter.sizes()[0], 0)
+        self.assertGreater(self.window.splitter.sizes()[1], 0)
 
     def test_agent_menu_survives_each_workflow_tab_rebuild(self):
         self.host.tabs = QTabWidget(self.host)
