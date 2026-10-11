@@ -213,6 +213,13 @@ class FittingMixin:
     def _suppress_shutdown_worker_callbacks(self, worker):
         return None
 
+    def _invalidate_scientific_observation_dataset(self, *, replace_dataset=False):
+        """Invalidate snapshots before a scientific data or axis mutation."""
+        adapter = getattr(self, "scientific_observation_api", None)
+        invalidate = getattr(adapter, "invalidate_dataset", None)
+        if callable(invalidate):
+            invalidate(replace_dataset=replace_dataset)
+
     def _request_shutdown_worker_stop(self, worker, *, suppress_callbacks=False):
         stop = getattr(worker, "stop", None)
         if not callable(stop):
@@ -1967,6 +1974,7 @@ class FittingMixin:
         prompt user for manual selection.
         """
         if run_dict:
+            self._invalidate_scientific_observation_dataset(replace_dataset=True)
             self.fitting_data_source = "images"
             self.flight_path_source = "App setting"
             self.current_fitting_input = folder_path
@@ -2064,6 +2072,7 @@ class FittingMixin:
             3       # Decimal places
         )
         if ok:
+            self._invalidate_scientific_observation_dataset()
             self.flight_path = new_flight_path
             self.message_box.append(f"Flight path updated to {self.flight_path}")
             if self._apply_instrument_settings_to_loaded_data():
@@ -2102,6 +2111,7 @@ class FittingMixin:
 
         centers = np.asarray(centers, dtype=float)
         adjusted_centers = centers + float(getattr(self, "delay", 0.0) or 0.0) * 1000.0
+        self._invalidate_scientific_observation_dataset()
         self.wavelengths = (adjusted_centers * 3.956) / flight_path / 1000.0
         if len(self.wavelengths) != len(getattr(self, "images", [])):
             self.message_box.append(
@@ -2154,6 +2164,7 @@ class FittingMixin:
 
         if self.tof_array is not None and len(self.tof_array) > 0:
             adjusted_tof = self.tof_array + getattr(self, 'delay', 0.0)
+            self._invalidate_scientific_observation_dataset()
             self.wavelengths = (adjusted_tof * 3.956) / self.flight_path * 1000
 
             if len(self.wavelengths) != len(self.images):
@@ -2170,6 +2181,7 @@ class FittingMixin:
         elif self._recalculate_wavelengths_from_tof_axis():
             return
         else:
+            self._invalidate_scientific_observation_dataset()
             self.wavelengths = np.array([])
             self.message_box.append("No valid ToF data to compute wavelengths.")
 
@@ -2179,6 +2191,7 @@ class FittingMixin:
             if enabled:
                 self.update_manual_wavelengths()
             return
+        self._invalidate_scientific_observation_dataset()
         self.manual_wavelength_mode = enabled
         if enabled:
             self.tof_array = None
@@ -2199,6 +2212,7 @@ class FittingMixin:
         """Compute wavelengths via interpolation when no spectra file is available."""
         if not getattr(self, "images", []):
             self.message_box.append("Load images before setting manual wavelength bounds.")
+            self._invalidate_scientific_observation_dataset()
             self.wavelengths = np.array([])
             return
 
@@ -2210,6 +2224,7 @@ class FittingMixin:
         delay = getattr(self, "delay", 0.0)
         if anchor_mode == "tof" and flight_path == 0:
             self.message_box.append("Flight path must be > 0 to convert time-of-flight anchors.")
+            self._invalidate_scientific_observation_dataset()
             self.wavelengths = np.array([])
             return
         anchor_map = {}
@@ -2236,11 +2251,13 @@ class FittingMixin:
         anchors = sorted(anchor_map.items())
         if not anchors:
             self.message_box.append("Provide at least two anchors in Manual Spectra Setting to compute manual wavelengths.")
+            self._invalidate_scientific_observation_dataset()
             self.wavelengths = np.array([])
             return
 
         if len(anchors) == 1:
             wl_value = anchors[0][1]
+            self._invalidate_scientific_observation_dataset()
             self.wavelengths = np.full(count, wl_value)
             self.start_wavelength = self.end_wavelength = wl_value
             self.message_box.append(
@@ -2254,6 +2271,7 @@ class FittingMixin:
         if anchors[-1][0] < count - 1:
             anchors.append((count - 1, anchors[-1][1]))
 
+        self._invalidate_scientific_observation_dataset()
         self.wavelengths = np.empty(count)
         for i in range(len(anchors) - 1):
             start_idx, start_wl = anchors[i]
@@ -2284,6 +2302,7 @@ class FittingMixin:
         )
 
         if ok:
+            self._invalidate_scientific_observation_dataset()
             self.delay = new_delay
             self.message_box.append(f"Time delay set to {self.delay} ")
 
@@ -2340,6 +2359,7 @@ class FittingMixin:
             self.message_box.append("Stopping image loader...")
             return
 
+        self._invalidate_scientific_observation_dataset(replace_dataset=True)
         self.fits_image_load_worker = None
         self.images = []
         self.image_slider.setEnabled(False)
@@ -2368,6 +2388,7 @@ class FittingMixin:
         self._set_fits_image_button_states(is_loading=False)
 
     def clear_loaded_fits_images(self):
+        self._invalidate_scientific_observation_dataset(replace_dataset=True)
         worker = getattr(self, "fits_image_load_worker", None)
         if worker is not None:
             self._suppress_shutdown_worker_callbacks(worker)
@@ -2591,6 +2612,7 @@ class FittingMixin:
 
     def _clear_loaded_images_for_profile_import(self):
         """Release image-stack state before using an imported intensity profile."""
+        self._invalidate_scientific_observation_dataset(replace_dataset=True)
         worker = getattr(self, "fits_image_load_worker", None)
         if worker is not None:
             self._suppress_shutdown_worker_callbacks(worker)
@@ -2855,6 +2877,7 @@ class FittingMixin:
         button_box.rejected.connect(dialog.reject)
 
         if dialog.exec_() == QDialog.Accepted:
+            self._invalidate_scientific_observation_dataset()
             self.flight_path = flight_spin.value()
             self.delay = delay_spin.value()
             self.message_box.append(f"Flight path set to {self.flight_path:.3f} m.")
@@ -3096,6 +3119,8 @@ class FittingMixin:
         _set_fix_state("t", "fix_t")
         _set_fix_state("eta", "fix_eta")
 
+        if "flight_path" in metadata or "delay" in metadata:
+            self._invalidate_scientific_observation_dataset()
         try:
             self.flight_path = float(metadata["flight_path"])
         except (KeyError, TypeError, ValueError):
@@ -3469,6 +3494,7 @@ class FittingMixin:
 
     def handle_raden_stack_loaded(self, file_path, images, wavelengths, flight_path, info):
         """Install a loaded RADEN TIFF stack into the standard fitting state."""
+        self._invalidate_scientific_observation_dataset(replace_dataset=True)
         self.fitting_data_source = "images"
         self.flight_path = float(flight_path)
         self.flight_path_source = "App setting"
@@ -3510,6 +3536,7 @@ class FittingMixin:
 
     def handle_nexus_stack_loaded(self, file_path, images, wavelengths, flight_path, info, source_label):
         """Install a loaded NeXus image stack into the standard fitting state."""
+        self._invalidate_scientific_observation_dataset(replace_dataset=True)
         self.fitting_data_source = "images"
         self.flight_path = float(flight_path)
         self.flight_path_source = source_label or "NeXus file"
