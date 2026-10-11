@@ -17,13 +17,15 @@ from ..domain.agent_planning import (
     MAX_SUMMARY_ITEMS,
     MAX_TEXT_LENGTH,
     FuturePermissionClass,
-    PlanStep,
-    PlanStepType,
+    PlannerSource,
     PlanningContext,
     PlanningErrorCode,
+    PlanningObjective,
     PlanningOutcome,
     PlanningStatus,
     PlanningValidationError,
+    PlanStep,
+    PlanStepType,
     context_to_state,
     validate_bounded_text,
 )
@@ -49,6 +51,7 @@ class GraphState(TypedDict):
     preflight_complete: bool
     dataset_id: str
     revision: int
+    objective: str
     readiness: str
     mode: str
     wavelength_axis_status: str
@@ -78,6 +81,7 @@ _STATE_KEYS = frozenset(
         "preflight_complete",
         "dataset_id",
         "revision",
+        "objective",
         "readiness",
         "mode",
         "wavelength_axis_status",
@@ -131,6 +135,7 @@ def _safe_state(state: Mapping[str, object]) -> GraphState:
             "run_id",
             "preflight_run_id",
             "dataset_id",
+            "objective",
             "readiness",
             "mode",
             "wavelength_axis_status",
@@ -195,6 +200,8 @@ def _safe_state(state: Mapping[str, object]) -> GraphState:
             item.value for item in WavelengthAxisStatus
         }:
             raise PlanningValidationError("Unknown wavelength-axis status.")
+        if state["objective"] not in {item.value for item in PlanningObjective}:
+            raise PlanningValidationError("Unknown planning objective.")
     except TypeError as exc:
         raise PlanningValidationError("Planning enum state is malformed.") from exc
     return cast(GraphState, dict(state))
@@ -208,6 +215,7 @@ def _assert_context_coherence(state: GraphState, context: PlanningContext) -> No
         "preflight_complete",
         "dataset_id",
         "revision",
+        "objective",
         "readiness",
         "mode",
         "wavelength_axis_status",
@@ -388,7 +396,35 @@ def _default_proposal(state: GraphState) -> tuple[PlanStep, ...]:
         return ()
     if len(steps) > MAX_PLAN_STEPS:
         raise PlanningValidationError("Deterministic proposal exceeded the step limit.")
-    return tuple(steps)
+    try:
+        objective = PlanningObjective(state["objective"])
+    except ValueError as exc:
+        raise PlanningValidationError("Unknown planning objective.") from exc
+    priority = {
+        PlanningObjective.DATASET_READINESS: (),
+        PlanningObjective.ROI_SPECTRUM_REVIEW: (
+            PlanStepType.REVIEW_MEASURED_SPECTRUM,
+            PlanStepType.REVIEW_IMAGE_PREVIEWS,
+        ),
+        PlanningObjective.EDGE_FITTING_READINESS: (
+            PlanStepType.REQUEST_CALIBRATION_REVIEW,
+            PlanStepType.REVIEW_MEASURED_SPECTRUM,
+        ),
+        PlanningObjective.MAPPING_FEASIBILITY_REVIEW: (
+            PlanStepType.REVIEW_IMAGE_PREVIEWS,
+            PlanStepType.REQUEST_ROI,
+            PlanStepType.REQUEST_CALIBRATION_REVIEW,
+        ),
+    }[objective]
+    by_type = {step.step_type: step for step in steps}
+    ordered_types = [PlanStepType.INSPECT_DATASET_SUMMARY]
+    ordered_types.extend(item for item in priority if item in by_type)
+    ordered_types.extend(
+        step.step_type
+        for step in steps
+        if step.step_type not in ordered_types
+    )
+    return tuple(by_type[item] for item in ordered_types)
 
 
 def _validate_steps(state: GraphState, steps: tuple[PlanStep, ...]) -> None:
@@ -409,6 +445,47 @@ def _validate_steps(state: GraphState, steps: tuple[PlanStep, ...]) -> None:
             raise PlanningValidationError("Unsupported proposals are not valid M3 plan steps.")
 
 
+def _apply_scientific_safety_gates(
+    state: GraphState, proposed: tuple[PlanStep, ...]
+) -> tuple[PlanStep, ...]:
+    """Inject trusted mandatory review steps the model is not allowed to omit."""
+    deterministic = _default_proposal(state)
+    safe_catalogue = {step.step_type: step for step in deterministic}
+    selected: list[PlanStep] = []
+    selected_types: set[PlanStepType] = set()
+    for step in proposed:
+        if step.step_type in selected_types:
+            raise PlanningValidationError("A plan cannot contain duplicate step types.")
+        if step.step_type not in safe_catalogue:
+            raise PlanningValidationError("A plan selected a step unsupported by preflight.")
+        selected.append(step)
+        selected_types.add(step.step_type)
+
+    mandatory_types = {PlanStepType.INSPECT_DATASET_SUMMARY}
+    mandatory_types.update(
+        step.step_type for step in deterministic if step.requires_human_input
+    )
+    selected = [step for step in selected if step.step_type not in mandatory_types]
+    required = [
+        step for step in deterministic if step.step_type in mandatory_types
+    ]
+    objective = PlanningObjective(state["objective"])
+    if objective is PlanningObjective.DATASET_READINESS:
+        output = required + selected
+    else:
+        # Preserve the objective-specific trusted order while retaining model
+        # preferences only among optional, already-supported review steps.
+        optional_order = [step.step_type for step in selected]
+        output = required + [
+            step for step in deterministic
+            if step.step_type not in mandatory_types
+            and step.step_type in optional_order
+        ]
+    if len(output) > MAX_PLAN_STEPS:
+        raise PlanningValidationError("Safety review exceeds the bounded plan size.")
+    return tuple(output)
+
+
 def _load_langgraph():
     try:
         from langgraph.graph import END, START, StateGraph
@@ -427,6 +504,9 @@ def run_planning(
     current_dataset_token: Callable[[], tuple[str, int]] | None = None,
     proposer: PlanProposer | None = None,
     checkpointer: object | None = None,
+    planner_source: PlannerSource = PlannerSource.LOCAL_DETERMINISTIC,
+    provider: str = "",
+    model_id: str = "",
 ) -> PlanningOutcome:
     """Run the fixed, offline StateGraph and validate its read-only proposal."""
     _check_live(context, cancelled, current_dataset_token)
@@ -491,7 +571,21 @@ def run_planning(
                 "error_code": PlanningErrorCode.PLAN_REJECTED.value,
                 "transitions": _append_transition(safe, "propose_read_only_plan"),
             }
-        needs_input = any(step.requires_human_input for step in proposals)
+        try:
+            proposals = _apply_scientific_safety_gates(safe, tuple(proposals))
+            _validate_steps(safe, proposals)
+        except PlanningValidationError:
+            return {
+                "steps": [],
+                "route": PlanningStatus.FAILED.value,
+                "error_code": PlanningErrorCode.PLAN_REJECTED.value,
+                "transitions": _append_transition(safe, "propose_read_only_plan"),
+            }
+        steps = [_serialize_step(step) for step in proposals]
+        needs_input = (
+            safe["readiness"] == PreflightReadiness.LIMITED.value
+            or any(step.requires_human_input for step in proposals)
+        )
         return {
             "steps": steps,
             "route": PlanningStatus.NEEDS_INPUT.value
@@ -577,6 +671,7 @@ def run_planning(
             PlanningStatus.FAILED,
             error_code=PlanningErrorCode.INVALID_STATE,
             message=str(exc)[:MAX_TEXT_LENGTH],
+            objective=context.objective,
         )
     _check_live(context, cancelled, current_dataset_token)
     state = _safe_state(raw)
@@ -596,10 +691,31 @@ def run_planning(
         steps=steps,
         transitions=tuple(state["transitions"]),
         error_code=error,
-        message=("Read-only plan proposal is available." if status is PlanningStatus.READY_PLAN
-                 else "More user input or evidence is required." if status is PlanningStatus.NEEDS_INPUT
-                 else "Preflight did not provide valid data and evidence." if status is PlanningStatus.BLOCKED_INVALID_DATA
-                 else "Planning did not complete safely."),
+        message=(
+            "Read-only plan proposal is available."
+            if status is PlanningStatus.READY_PLAN
+            else "More user input or evidence is required."
+            if status is PlanningStatus.NEEDS_INPUT
+            else "Preflight did not provide valid data and evidence."
+            if status is PlanningStatus.BLOCKED_INVALID_DATA
+            else "Planning did not complete safely."
+        ),
+        planner_source=(
+            planner_source
+            if status in {PlanningStatus.READY_PLAN, PlanningStatus.NEEDS_INPUT}
+            else PlannerSource.NONE
+        ),
+        provider=(
+            provider
+            if status in {PlanningStatus.READY_PLAN, PlanningStatus.NEEDS_INPUT}
+            else ""
+        ),
+        model_id=(
+            model_id
+            if status in {PlanningStatus.READY_PLAN, PlanningStatus.NEEDS_INPUT}
+            else ""
+        ),
+        objective=context.objective,
     )
 
 

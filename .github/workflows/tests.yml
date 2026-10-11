@@ -142,6 +142,28 @@ jobs:
             Pop-Location
           }
 
+      - name: Smoke-test clean wheel install with optional agent-llm extra
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist -Filter "*.whl" | Select-Object -First 1).FullName
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "neat-agent-llm-wheel-smoke"
+          New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
+          python -m venv (Join-Path $smokeRoot ".venv")
+          $python = Join-Path $smokeRoot ".venv\Scripts\python.exe"
+          & $python -m pip install "${wheel}[agent-llm]"
+          Copy-Item tools\installed_agent_llm_smoke.py (Join-Path $smokeRoot "installed_agent_llm_smoke.py")
+          $env:NEAT_CHECKOUT_ROOT = $env:GITHUB_WORKSPACE
+          $env:PYTHONPATH = ""
+          Push-Location $smokeRoot
+          try {
+            & $python .\installed_agent_llm_smoke.py
+            if ($LASTEXITCODE -ne 0) { throw "Optional agent-llm wheel smoke failed." }
+            & $python -m pip check
+            if ($LASTEXITCODE -ne 0) { throw "Optional agent-llm wheel pip check failed." }
+          } finally {
+            Pop-Location
+          }
+
       - name: Smoke-test clean sdist install
         shell: pwsh
         run: |
@@ -179,12 +201,13 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install clean package environment with optional agent extra
+      - name: Install clean package environment with optional LLM extra
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[assistant,assistant-server,test,agent]"
+          python -m pip install ".[assistant,assistant-server,test,agent-llm]"
 
-      - name: Run graph and one-click UI tests
+      - name: Run graph, LLM planning, and one-click UI tests
         run: |
           python -m unittest discover -s tests -p "test_agent_planning.py" -v
+          python -m unittest discover -s tests -p "test_agent_model.py" -v
           python -m unittest discover -s tests -p "test_agent_preflight.py" -v

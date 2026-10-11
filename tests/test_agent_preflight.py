@@ -8,14 +8,12 @@ import threading
 import time
 import unittest
 import weakref
-from unittest.mock import Mock, patch
 from importlib.util import find_spec
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Preserve the application import order: ONNX Runtime is initialized before Qt.
-import NEAT  # noqa: F401
-
 import numpy as np
 from PyQt5.QtCore import QEventLoop, Qt, QTimer
 from PyQt5.QtTest import QTest
@@ -29,9 +27,16 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
+import NEAT  # noqa: F401
+from NEAT.domain.agent_model import (
+    AgentModelMode,
+    AgentModelSettings,
+    PlanningObjective,
+)
 from NEAT.domain.agent_planning import PlanningOutcome, PlanningStatus
+from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
 from NEAT.domain.observation import DatasetMode
+from NEAT.ui.agent_model_settings_dialog import AgentModelSettingsDialog
 from NEAT.ui.agent_preflight_worker import PreflightWorker
 from NEAT.ui.agent_window import AgentWindow
 from NEAT.ui.main_window import FitsViewer
@@ -166,6 +171,140 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertTrue(self.window.evidence_scroll.isVisible())
         self.assertGreater(self.window.splitter.sizes()[0], 0)
         self.assertGreater(self.window.splitter.sizes()[1], 0)
+
+    def test_m4_provider_readiness_and_cloud_consent_are_scoped_to_one_run(self):
+        self.window._agent_settings = AgentModelSettings(
+            mode=AgentModelMode.OPENAI_CLOUD,
+            model_id="",
+        )
+        self.window._update_model_readiness()
+        self.assertTrue(self.window.cloud_consent_checkbox.isVisible())
+        self.assertIn("OpenAI", self.window.cloud_consent_checkbox.text())
+        self.assertIn("model not configured", self.window.cloud_consent_checkbox.text())
+        self.assertFalse(self.window.cloud_consent_checkbox.isChecked())
+        self.assertIn("Model not configured", self.window.model_readiness_label.text())
+
+        self.window._agent_settings = AgentModelSettings(
+            mode=AgentModelMode.OPENAI_CLOUD,
+            model_id="configured-model",
+        )
+        self.window._update_model_readiness()
+        self.assertIn("configured-model", self.window.cloud_consent_checkbox.text())
+        self.assertIn("configured-model", self.window.model_readiness_label.text())
+
+        self.window.objective_combo.setCurrentIndex(
+            self.window.objective_combo.findData(
+                PlanningObjective.MAPPING_FEASIBILITY_REVIEW
+            )
+        )
+        self.window.cloud_consent_checkbox.setChecked(True)
+        snapshot = self.window._snapshot_run_configuration()
+        self.assertEqual(
+            snapshot.objective, PlanningObjective.MAPPING_FEASIBILITY_REVIEW
+        )
+        self.assertTrue(snapshot.cloud_egress_consent)
+        self.assertFalse(self.window.cloud_consent_checkbox.isChecked())
+
+        self.window._agent_settings = AgentModelSettings(
+            mode=AgentModelMode.LOCAL,
+            model_id="changed-after-start",
+            endpoint="http://127.0.0.1:11434/v1",
+        )
+        self.window._update_model_readiness()
+        self.assertEqual(snapshot.settings.model_id, "configured-model")
+        self.assertEqual(
+            snapshot.settings.mode, AgentModelMode.OPENAI_CLOUD
+        )
+        self.assertFalse(self.window.cloud_consent_checkbox.isVisible())
+
+    def test_model_connection_is_user_initiated_and_uses_tracked_worker(self):
+        created_workers = []
+
+        class MemorySettings:
+            def load(self):
+                return AgentModelSettings()
+
+            def save(self, settings):
+                return settings
+
+        class MemoryCredentials:
+            def get(self):
+                return None
+
+            def set(self, _credential):
+                return None
+
+            def delete(self):
+                return None
+
+        class FakeSignal:
+            def __init__(self):
+                self.callbacks = []
+
+            def connect(self, callback):
+                self.callbacks.append(callback)
+
+            def emit(self, *args):
+                for callback in tuple(self.callbacks):
+                    callback(*args)
+
+        class FakeConnectionWorker:
+            def __init__(self, settings, *, parent=None):
+                self.settings = settings
+                self.parent = parent
+                self.completed = FakeSignal()
+                self.finished = FakeSignal()
+                self.running = False
+                created_workers.append(self)
+
+            def isRunning(self):
+                return self.running
+
+            def start(self):
+                self.running = True
+
+            def stop(self):
+                self.running = False
+
+        class FakeHost:
+            def __init__(self):
+                self.tracked = []
+
+            def _track_shutdown_worker(self, worker, role):
+                self.tracked.append((worker, role))
+
+            def _connect_shutdown_worker_signal(self, worker, signal, callback):
+                signal.connect(callback)
+
+        fake_host = FakeHost()
+        dialog = AgentModelSettingsDialog(
+            self.window,
+            main_window=fake_host,
+            settings_repository=MemorySettings(),
+            credential_store=MemoryCredentials(),
+            connection_worker_class=FakeConnectionWorker,
+        )
+        try:
+            self.assertEqual(created_workers, [])
+            dialog.mode_combo.setCurrentIndex(
+                dialog.mode_combo.findData(AgentModelMode.OPENAI_CLOUD.value)
+            )
+            dialog.model_edit.setText("explicit-model")
+            self.assertTrue(dialog.test_button.isEnabled())
+            dialog.test_button.click()
+            self.assertEqual(len(created_workers), 1)
+            self.assertEqual(
+                created_workers[0].settings.mode, AgentModelMode.OPENAI_CLOUD
+            )
+            self.assertEqual(fake_host.tracked, [(created_workers[0], "agent_model_test")])
+            self.assertFalse(dialog.test_button.isEnabled())
+            created_workers[0].completed.emit(True, "Connection test succeeded.")
+            created_workers[0].running = False
+            created_workers[0].finished.emit()
+            self.assertEqual(dialog.status_label.text(), "Connection test succeeded.")
+            self.assertTrue(dialog.test_button.isEnabled())
+        finally:
+            dialog.close()
 
     def test_agent_menu_survives_each_workflow_tab_rebuild(self):
         self.host.tabs = QTabWidget(self.host)
@@ -565,7 +704,6 @@ class AgentPreflightTests(unittest.TestCase):
             release.wait(5)
             if cancelled is not None and cancelled():
                 raise PlanningCancelled("dataset changed")
-            return None
 
         with patch.object(worker_module, "run_planning", side_effect=paused_planning):
             self.window.start_autonomous_analysis()
@@ -594,7 +732,6 @@ class AgentPreflightTests(unittest.TestCase):
             release.wait(5)
             if cancelled is not None and cancelled():
                 raise PlanningCancelled("shutdown")
-            return None
 
         with patch.object(worker_module, "run_planning", side_effect=paused_planning):
             self.window.start_autonomous_analysis()
