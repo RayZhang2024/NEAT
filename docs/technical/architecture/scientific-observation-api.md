@@ -94,6 +94,10 @@ and do not keep the image stack alive.
 
 ## Future assistant architecture
 
+The local read-only preflight window introduced after this API is documented
+in [agent-preflight-window.md](agent-preflight-window.md). It is a consumer of
+these contracts and does not change the scientific calculations here.
+
 The intended call path is:
 
 ```text

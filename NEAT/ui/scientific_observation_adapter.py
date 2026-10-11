@@ -236,6 +236,25 @@ class ScientificObservationAdapter:
             )
         return handle
 
+    def capture_selected_roi(self, handle: ScientificDatasetHandle) -> RoiBounds | None:
+        """Read the existing fitting ROI on the Qt owner thread, without changing it."""
+        window = self._window()
+        self._assert_owner_thread(window)
+        handle.assert_current()
+        if handle.mode is not DatasetMode.IMAGES or handle.image_shape is None:
+            return None
+        selected = getattr(window, "selected_area", None)
+        if not isinstance(selected, (tuple, list)) or len(selected) != 4:
+            return None
+        if any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) for value in selected):
+            return None
+        x_min, x_max, y_min, y_max = (int(value) for value in selected)
+        height, width = handle.image_shape
+        if not (0 <= x_min < x_max <= width and 0 <= y_min < y_max <= height):
+            return None
+        handle.assert_current()
+        return RoiBounds(x_min, x_max, y_min, y_max)
+
     def inspect_dataset(
         self, handle: ScientificDatasetHandle | None = None
     ) -> DatasetObservation:
