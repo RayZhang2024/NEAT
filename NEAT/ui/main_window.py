@@ -65,6 +65,7 @@ from .mixins.postprocessing import PostProcessingMixin
 from .mixins.preprocessing import PreprocessingMixin
 from .dialogs import UncertaintyEstimatorDialog
 from .assistant_panel import AssistantDockWidget, collect_neat_context
+from .agent_window import AgentWindow
 from .scientific_observation_adapter import ScientificObservationAdapter
 from .preprocessing_worker_registry import PreprocessingWorkerRegistry
 from .window_thread_inventory import WindowThreadInventory
@@ -194,6 +195,8 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.setup_PostProcessingTab()
         self.assistant_visible = True
         self.setup_assistant_dock()
+        self.agent_window = None
+        self.agent_preflight_worker = None
         self.setup_menu_bar()
 
         # Variables for storing image data and auto-adjust parameters
@@ -395,6 +398,7 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             self._build_preprocessing_menu_bar(menu_bar)
 
         self._add_assistant_menu(menu_bar)
+        self._add_agent_menu(menu_bar)
         self._add_about_menu(menu_bar)
 
     def _build_preprocessing_menu_bar(self, menu_bar):
@@ -576,6 +580,25 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             self.assistant_dock.open_settings_dialog
         )
         assistant_menu.addAction(assistant_settings_action)
+
+    def _add_agent_menu(self, menu_bar):
+        """Keep the local agent entry available in every workflow tab."""
+        agent_menu = menu_bar.addMenu("AI Agent")
+        open_action = QAction("Open AI Agent", self)
+        open_action.triggered.connect(self.open_ai_agent)
+        agent_menu.addAction(open_action)
+
+    def open_ai_agent(self):
+        """Show the one non-modal agent window owned by this NEAT window."""
+        if getattr(self, "_shutdown_committed", False):
+            return
+        window = getattr(self, "agent_window", None)
+        if window is None:
+            window = AgentWindow(self)
+            self.agent_window = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     def _add_about_menu(self, menu_bar):
         about_menu = menu_bar.addMenu("About")
@@ -1220,6 +1243,10 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         for name, value in tuple(vars(self).items()):
             if value is worker and name.endswith("worker"):
                 setattr(self, name, None)
+        if role == "agent_preflight":
+            agent_window = getattr(self, "agent_window", None)
+            if agent_window is not None:
+                agent_window.worker_retired(worker, callbacks_suppressed)
         if self._shutdown_close_pending and callbacks_suppressed:
             if role == "fits_image_loader":
                 self._hide_load_progress_dialog()
@@ -1730,6 +1757,9 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             return
         work_at_entry = self._has_shutdown_managed_work()
         if work_at_entry:
+            agent_window = getattr(self, "agent_window", None)
+            if agent_window is not None:
+                agent_window.stop_preflight()
             self._shutdown_close_pending = True
             for timer_name in ("update_timer", "remaining_time_timer"):
                 timer = getattr(self, timer_name, None)
@@ -1771,6 +1801,9 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             self._shutdown_committed = False
             event.ignore()
             return
+        agent_window = getattr(self, "agent_window", None)
+        if agent_window is not None:
+            agent_window.shutdown_for_parent_close()
         if not self._shutdown_settings_saved:
             self.save_user_settings()
             self._shutdown_settings_saved = True
