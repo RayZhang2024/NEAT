@@ -93,7 +93,7 @@ class AgentModelSettingsDialog(QDialog):
         connection_worker_class=AgentModelConnectionWorker,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("NEAT AI Agent Model Settings")
+        self.setWindowTitle("NEAT AI Agent Settings")
         self.setMinimumWidth(520)
         self.settings_repository = settings_repository or AgentModelSettingsRepository()
         self.credential_store = credential_store or AgentKeyringCredentialStore()

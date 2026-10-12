@@ -7,9 +7,11 @@ Evidence panels side by side and does not replace the AI Assistant dock.
 Opening the window is side-effect-free. **Start Autonomous Analysis** creates
 one parent run and automatically advances through the existing local Step 0
 preflight and the offline deterministic LangGraph plan. No second preview or
-continue action is required. **Start Preflight** remains a separate diagnostic
-action. The window permits only one active stage at a time; Stop applies to
-whichever stage is running.
+continue action is required. The dataset check is an internal stage of this
+single action; the window does not expose a separate diagnostic button, plan
+focus selector, or detailed dataset log. It keeps a short dataset summary and
+the measured visual evidence. The window permits only one active stage at a
+time; Stop applies to whichever stage is running.
 
 M3's terminal success message is **“Plan prepared — scientific execution is
 not yet implemented.”** The plan is a read-only proposal. M3 performs no LLM
@@ -51,7 +53,7 @@ evidence content.
 
 LangGraph is loaded lazily from the separate `NEAT[agent]` extra. A baseline
 NEAT install can import the domain/service and open the Agent window without
-LangGraph. Its diagnostic preflight remains available. If the user starts the
+LangGraph. Its internal preflight still runs. If the user starts the
 one-click run without the extra, preflight still completes and the window says
 that planning requires `[agent]`; it never reports a successful plan. The
 graph has no provider adapters or API-key access. Its invocation disables
@@ -70,8 +72,8 @@ publishing its result. It has a four-node fixed graph and no retry or
 refinement loop.
 
 Starting again while either worker is active is ignored and the controls stay
-disabled. Starting diagnostic preflight during an autonomous run is also
-blocked. Closing the Agent window requests a stop, discards current displayed
+disabled. The internal preflight entry point also rejects overlapping work.
+Closing the Agent window requests a stop, discards current displayed
 results, invalidates that run's callback IDs, and hides the reusable window.
 The main window's shutdown veto waits for both worker roles to retire before
 data cleanup. Planning results contain no references to old image stacks; the
@@ -107,8 +109,9 @@ gate before fitting or physical claims can be automated.
 
 1. On a normal install without `[agent]`, open **AI Agent** and confirm the
    window is side by side, the AI Assistant remains available, and opening the
-   window starts no analysis. Run **Start Preflight** and confirm it still
-   shows observed local evidence.
+   window starts no analysis. Press **Start Autonomous Analysis** and confirm
+   that the internal data check still shows observed local evidence, even if
+   planning cannot run without the optional dependency.
 2. Install `NEAT[agent]`, load an image stack, select a valid ROI, and press
    **Start Autonomous Analysis once**. Confirm the status advances from
    preflight to planning without another click; the plan shows only

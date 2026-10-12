@@ -143,8 +143,8 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(result.frames[0].image.coordinate_mapping.origin, "upper")
         overlay = self.window._preview_pixmap(result.frames[0].image, result.roi).toImage()
         self.assertEqual(overlay.pixelColor(1, 2).name(), "#ffff00")
-        self.assertNotIn("C:/private", self.window.assessment_text.toPlainText())
-        self.assertIn("Companion metadata", self.window.assessment_text.toPlainText())
+        self.assertNotIn("C:/private", self.window.dataset_summary_label.text())
+        self.assertIn("Companion metadata", self.window.dataset_summary_label.text())
         self.assertIs(self.host.images, old_images)
         self.assertEqual(self.host.selected_area, old_roi)
         self.assertEqual(self.host.scientific_observation_api.revision_clock.current(), old_revision)
@@ -170,7 +170,11 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(self.window.splitter.count(), 2)
         self.assertTrue(self.window.overview_panel.isVisible())
         self.assertTrue(self.window.evidence_panel.isVisible())
-        self.assertTrue(self.window.assessment_text.isVisible())
+        self.assertTrue(self.window.dataset_summary_label.isVisible())
+        self.assertFalse(hasattr(self.window, "assessment_text"))
+        self.assertFalse(hasattr(self.window, "objective_combo"))
+        self.assertFalse(hasattr(self.window, "start_button"))
+        self.assertEqual(self.window.settings_button.text(), "Agent settings…")
         self.assertTrue(self.window.evidence_scroll.isVisible())
         self.assertGreater(self.window.splitter.sizes()[0], 0)
         self.assertGreater(self.window.splitter.sizes()[1], 0)
@@ -195,16 +199,9 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIn("configured-model", self.window.cloud_consent_checkbox.text())
         self.assertIn("configured-model", self.window.model_readiness_label.text())
 
-        self.window.objective_combo.setCurrentIndex(
-            self.window.objective_combo.findData(
-                PlanningObjective.MAPPING_FEASIBILITY_REVIEW
-            )
-        )
         self.window.cloud_consent_checkbox.setChecked(True)
         snapshot = self.window._snapshot_run_configuration()
-        self.assertEqual(
-            snapshot.objective, PlanningObjective.MAPPING_FEASIBILITY_REVIEW
-        )
+        self.assertEqual(snapshot.objective, PlanningObjective.DATASET_READINESS)
         self.assertTrue(snapshot.cloud_egress_consent)
         self.assertFalse(self.window.cloud_consent_checkbox.isChecked())
 
@@ -511,7 +508,7 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(self.window.result.frames, ())
         self.assertIsNone(self.window.result.roi)
         self.assertIsNotNone(self.window.result.spectrum)
-        self.assertIn("spectrum-only", self.window.assessment_text.toPlainText().lower())
+        self.assertIn("spectrum-only", self.window.dataset_summary_label.text().lower())
 
     def test_dataset_change_discards_visible_evidence_and_late_result(self):
         self.window.start_preflight()
@@ -542,7 +539,7 @@ class AgentPreflightTests(unittest.TestCase):
             ticked = []
             QTimer.singleShot(0, lambda: ticked.append(True))
             self._wait_for(lambda: bool(ticked))
-            self.assertFalse(self.window.start_button.isEnabled())
+            self.assertFalse(self.window.start_autonomous_button.isEnabled())
             active_worker = self.window._worker
             self.window.start_preflight()
             self.assertIs(self.window._worker, active_worker)
@@ -644,7 +641,7 @@ class AgentPreflightTests(unittest.TestCase):
         self.window.start_autonomous_button.click()
         first_run_id = self.window._agent_run_id
         self.window.start_autonomous_button.click()
-        self.window.start_button.click()
+        self.assertFalse(hasattr(self.window, "start_button"))
         self._wait_for(
             lambda: self.window._planning_outcome is not None
             and self.window._planning_worker is None
@@ -685,7 +682,7 @@ class AgentPreflightTests(unittest.TestCase):
             return original(*args, **kwargs)
 
         with patch.object(worker_module, "get_image_preview", side_effect=paused_preview):
-            self.window.start_button.click()
+            self.window.start_preflight()
             self.assertTrue(entered.wait(2))
             active_worker = self.window._worker
             self.window.start_autonomous_button.click()
