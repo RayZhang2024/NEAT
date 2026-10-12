@@ -749,6 +749,10 @@ class AgentPreflightTests(unittest.TestCase):
             return_value=FakeKeyStore(),
         )
 
+    @unittest.skipUnless(
+        find_spec("langgraph") is not None,
+        "requires the optional NEAT [agent] extra",
+    )
     def test_openai_uses_same_model_for_consented_planning_and_visual_review(self):
         from test_agent_vision import FakeVision
         import NEAT.ui.agent_window as agent_window_module
@@ -806,8 +810,7 @@ class AgentPreflightTests(unittest.TestCase):
             self.window.start_autonomous_analysis()
             self._wait_for(
                 lambda: self.window._vision_outcome is not None
-                and self.window._vision_worker is None,
-                timeout=30,
+                and self.window._vision_worker is None
             )
             self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
         outcome = self.window._vision_outcome
