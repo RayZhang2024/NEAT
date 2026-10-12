@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
-import re
 from typing import Any
 
 from .agent_preflight import PreflightReadiness, PreflightResult
 from .observation import DatasetMode, WavelengthAxisStatus
-
 
 MAX_PLAN_STEPS = 5
 MAX_EVIDENCE_REFERENCES = 16
@@ -30,6 +29,7 @@ class PlanningStatus(str, Enum):
     CANCELLED = "cancelled"
     FAILED = "failed"
     UNAVAILABLE = "planning_unavailable"
+    NEEDS_PERMISSION = "needs_run_permission"
 
 
 class PlanStepType(str, Enum):
@@ -54,9 +54,42 @@ class PlanningErrorCode(str, Enum):
     PLAN_REJECTED = "plan_rejected"
     NO_EVIDENCE = "no_evidence"
     DEPENDENCY_MISSING = "optional_dependency_missing"
+    PERMISSION_REQUIRED = "run_permission_required"
+    MODEL_UNAVAILABLE = "model_unavailable"
+    MODEL_OUTPUT_REJECTED = "model_output_rejected"
+    MISSING_CREDENTIAL = "missing_agent_credential"
     CANCELLED = "cancelled"
     STALE = "stale"
     UNEXPECTED = "planning_failed"
+
+
+class PlanningObjective(str, Enum):
+    """Predefined metadata-review objectives; never scientific conclusions."""
+
+    DATASET_READINESS = "dataset_readiness"
+    ROI_SPECTRUM_REVIEW = "roi_spectrum_review"
+    EDGE_FITTING_READINESS = "edge_fitting_readiness"
+    MAPPING_FEASIBILITY_REVIEW = "mapping_feasibility_review"
+
+
+class PlannerSource(str, Enum):
+    """Trusted controller provenance for the proposal accepted by validation."""
+
+    LOCAL_DETERMINISTIC = "local_deterministic_plan"
+    LLM_GENERATED = "llm_generated_plan"
+    DETERMINISTIC_FALLBACK = "deterministic_fallback"
+    NONE = "no_accepted_plan"
+
+
+class PlanningWarningCode(str, Enum):
+    """Closed vocabulary for derived preflight cautions sent to a model."""
+
+    PREFLIGHT_LIMITED = "preflight_limited"
+    ROI_MISSING = "roi_missing"
+    WAVELENGTH_AXIS_INVALID = "wavelength_axis_invalid"
+    CALIBRATION_PROVENANCE_UNKNOWN = "calibration_provenance_unknown"
+    MEASURED_SPECTRUM_UNAVAILABLE = "measured_spectrum_unavailable"
+    NONFINITE_INTENSITY = "nonfinite_intensity"
 
 
 @dataclass(frozen=True)
@@ -80,6 +113,7 @@ class PlanningContext:
     evidence_references: tuple[str, ...]
     observations: tuple[str, ...]
     warnings: tuple[str, ...]
+    objective: PlanningObjective = PlanningObjective.DATASET_READINESS
 
 
 @dataclass(frozen=True)
@@ -105,6 +139,12 @@ class PlanningOutcome:
     transitions: tuple[str, ...] = ()
     error_code: PlanningErrorCode | None = None
     message: str = ""
+    planner_source: PlannerSource = PlannerSource.NONE
+    provider: str = ""
+    model_id: str = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    objective: PlanningObjective = PlanningObjective.DATASET_READINESS
 
 
 class PlanningValidationError(ValueError):
@@ -145,7 +185,10 @@ def _validate_references(references: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def context_from_preflight(
-    result: PreflightResult, *, run_id: str
+    result: PreflightResult,
+    *,
+    run_id: str,
+    objective: PlanningObjective = PlanningObjective.DATASET_READINESS,
 ) -> PlanningContext:
     """Copy safe facts from a current preflight, excluding arrays and previews."""
     if (
@@ -197,6 +240,7 @@ def context_from_preflight(
         evidence_references=refs,
         observations=observations,
         warnings=warnings,
+        objective=objective,
     )
 
 
@@ -221,12 +265,15 @@ def context_to_state(context: PlanningContext) -> dict[str, Any]:
     ):
         raise PlanningValidationError("Dataset mode or wavelength status is invalid.")
     refs = _validate_references(context.evidence_references)
+    if not isinstance(context.objective, PlanningObjective):
+        raise PlanningValidationError("Planning objective is not allowlisted.")
     return {
         "run_id": context.run_id,
         "preflight_run_id": context.preflight_run_id,
         "preflight_complete": context.preflight_complete,
         "dataset_id": context.dataset_id,
         "revision": context.revision,
+        "objective": context.objective.value,
         "readiness": context.readiness.value,
         "mode": context.mode.value,
         "wavelength_axis_status": context.wavelength_axis_status.value,
@@ -265,11 +312,14 @@ __all__ = [
     "FuturePermissionClass",
     "PlanStep",
     "PlanStepType",
+    "PlannerSource",
     "PlanningContext",
     "PlanningErrorCode",
+    "PlanningObjective",
     "PlanningOutcome",
     "PlanningStatus",
     "PlanningValidationError",
+    "PlanningWarningCode",
     "context_from_preflight",
     "context_to_state",
     "validate_bounded_text",

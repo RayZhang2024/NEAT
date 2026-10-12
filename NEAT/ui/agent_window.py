@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from uuid import uuid4
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -19,25 +24,40 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from ..domain.agent_model import (
+    AgentModelMode,
+    AgentModelSettings,
+    AgentRunSnapshot,
+    canonical_planning_schema,
+)
+from ..domain.agent_planning import (
+    PlanningContext,
+    PlanningObjective,
+    PlanningOutcome,
+    PlanningStatus,
+    PlanStep,
+    PlanStepType,
+    context_from_preflight,
+)
 from ..domain.agent_preflight import (
     PreflightOutcome,
     PreflightResult,
     PreflightRunState,
 )
-from ..domain.agent_planning import (
-    PlanStep,
-    PlanningContext,
-    PlanningOutcome,
-    PlanningStatus,
-    context_from_preflight,
-)
 from ..domain.observation import DatasetMode, RoiBounds
+from ..services.agent_model import (
+    AgentCredentialResolver,
+    AgentKeyringCredentialStore,
+    AgentModelSettingsRepository,
+    canonical_payload_for_context,
+)
 from ..services.scientific_observation import (
     DatasetUnavailableError,
     ObservationErrorBase,
 )
-from .agent_preflight_worker import PreflightWorker
+from .agent_model_settings_dialog import AgentModelSettingsDialog
 from .agent_planning_worker import PlanningWorker
+from .agent_preflight_worker import PreflightWorker
 
 
 class AgentWindow(QMainWindow):
@@ -60,8 +80,12 @@ class AgentWindow(QMainWindow):
         self._awaiting_preflight_completion = False
         self._pending_planning_context: PlanningContext | None = None
         self._cancellation_requested = False
+        self._agent_settings_repository = AgentModelSettingsRepository()
+        self._agent_settings: AgentModelSettings = self._agent_settings_repository.load()
+        self._run_snapshot: AgentRunSnapshot | None = None
+        self._run_credential_resolver: AgentCredentialResolver | None = None
 
-        self.setWindowTitle("NEAT AI Agent — Autonomous Analysis (M3)")
+        self.setWindowTitle("NEAT AI Agent — Autonomous Analysis (M4)")
         self.setMinimumSize(820, 520)
         self.resize(1000, 720)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -71,69 +95,113 @@ class AgentWindow(QMainWindow):
         self.splitter.setChildrenCollapsible(False)
         self.setCentralWidget(self.splitter)
 
-        self.overview_panel = QWidget(self.splitter)
+        self.overview_scroll = QScrollArea(self.splitter)
+        self.overview_scroll.setWidgetResizable(True)
+        self.overview_scroll.setFrameShape(QFrame.NoFrame)
+        self.overview_scroll.setAccessibleName("Overview")
+        self.overview_panel = QWidget(self.overview_scroll)
         self.overview_panel.setObjectName("preflightOverviewPanel")
         overview_layout = QVBoxLayout(self.overview_panel)
+        overview_layout.setSpacing(6)
         overview_heading = QLabel("Overview", self.overview_panel)
         overview_heading.setStyleSheet("font-size: 15px; font-weight: bold;")
         overview_layout.addWidget(overview_heading)
-        title = QLabel("One-click Autonomous Analysis — M3", self.overview_panel)
+        title = QLabel("Prepare an analysis plan", self.overview_panel)
         overview_layout.addWidget(title)
         self.scope_label = QLabel(
-            "Local preflight + deterministic plan only; no LLM or scientific execution.",
+            "NEAT checks the current dataset and suggests next steps. This version stops before fitting or mapping.",
             self.overview_panel,
         )
         self.scope_label.setWordWrap(True)
         self.scope_label.setObjectName("m3ScopeLimitLabel")
         overview_layout.addWidget(self.scope_label)
-        self.status_label = QLabel("No preflight has been run.", self.overview_panel)
+
+        self.settings_button = QPushButton("Agent settings…", self.overview_panel)
+        self.settings_button.clicked.connect(self.open_model_settings)
+        self.model_readiness_label = QLabel(self.overview_panel)
+        self.model_readiness_label.setWordWrap(True)
+        self.model_readiness_label.setAccessibleName("Agent model readiness")
+        overview_layout.addWidget(self.model_readiness_label)
+        self.cloud_consent_checkbox = QCheckBox(self.overview_panel)
+        self.cloud_consent_checkbox.setObjectName("agentRunCloudConsent")
+        self.cloud_consent_checkbox.setAccessibleName(
+            "Allow planning-summary transmission for this run"
+        )
+        self.cloud_consent_checkbox.setChecked(False)
+        self.cloud_consent_checkbox.setVisible(False)
+        overview_layout.addWidget(self.cloud_consent_checkbox)
+        self.fallback_checkbox = QCheckBox(
+            "Use the offline plan if the selected model fails",
+            self.overview_panel,
+        )
+        self.fallback_checkbox.setAccessibleName("Allow deterministic model fallback")
+        self.fallback_checkbox.setToolTip(
+            "If the model is unavailable or its proposal is rejected, prepare a validated offline plan instead."
+        )
+        self.fallback_checkbox.setChecked(False)
+        overview_layout.addWidget(self.fallback_checkbox)
+        self.status_label = QLabel("No analysis has been started.", self.overview_panel)
         self.status_label.setAccessibleName("Preflight status")
         self.status_label.setWordWrap(True)
-        overview_layout.addWidget(self.status_label)
-        self.progress_bar = QProgressBar(self.overview_panel)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setAccessibleName("Preflight progress")
-        overview_layout.addWidget(self.progress_bar)
         controls = QHBoxLayout()
         self.start_autonomous_button = QPushButton(
             "Start Autonomous Analysis", self.overview_panel
         )
         self.start_autonomous_button.setAccessibleName("Start Autonomous Analysis")
         self.start_autonomous_button.setObjectName("startAutonomousAnalysisButton")
+        self.start_autonomous_button.setMinimumHeight(36)
+        self.start_autonomous_button.setStyleSheet("font-weight: 600; padding: 6px 12px;")
+        self.start_autonomous_button.setToolTip(
+            "Check the dataset and prepare a read-only plan in one action."
+        )
         self.start_autonomous_button.clicked.connect(self.start_autonomous_analysis)
-        controls.addWidget(self.start_autonomous_button)
-        self.start_button = QPushButton("Start Preflight", self.overview_panel)
-        self.start_button.setAccessibleName("Start local read-only preflight")
-        self.start_button.clicked.connect(self.start_preflight)
-        controls.addWidget(self.start_button)
+        controls.addWidget(self.start_autonomous_button, 1)
         self.stop_button = QPushButton("Stop", self.overview_panel)
         self.stop_button.setAccessibleName("Cancel current preflight")
         self.stop_button.setEnabled(False)
+        self.stop_button.setVisible(False)
         self.stop_button.clicked.connect(self.stop_preflight)
         controls.addWidget(self.stop_button)
-        controls.addStretch()
         overview_layout.addLayout(controls)
-        self.assessment_text = QPlainTextEdit(self.overview_panel)
-        self.assessment_text.setReadOnly(True)
-        self.assessment_text.setAccessibleName("Dataset assessment")
-        self.assessment_text.setPlainText(
-            "Start Autonomous Analysis to run preflight and then prepare a "
-            "deterministic read-only plan in one action. Start Preflight remains "
-            "available as a diagnostic action."
+
+        overview_layout.addWidget(self.status_label)
+        self.progress_bar = QProgressBar(self.overview_panel)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setAccessibleName("Preflight progress")
+        self.progress_bar.setVisible(False)
+        overview_layout.addWidget(self.progress_bar)
+
+        secondary_controls = QHBoxLayout()
+        secondary_controls.addWidget(self.settings_button)
+        self.preview_data_button = QPushButton("Preview model data…", self.overview_panel)
+        self.preview_data_button.setToolTip(
+            "Inspect the exact allowed metadata request. Opening this preview sends nothing."
         )
-        overview_layout.addWidget(self.assessment_text)
-        plan_heading = QLabel("Read-only plan proposal", self.overview_panel)
+        self.preview_data_button.clicked.connect(self.show_data_preview)
+        secondary_controls.addStretch()
+        overview_layout.addLayout(secondary_controls)
+        overview_layout.addWidget(self.preview_data_button, 0, Qt.AlignLeft)
+
+        self.dataset_summary_label = QLabel("No dataset check yet.", self.overview_panel)
+        self.dataset_summary_label.setWordWrap(True)
+        self.dataset_summary_label.setAccessibleName("Dataset check summary")
+        overview_layout.addWidget(self.dataset_summary_label)
+
+        plan_heading = QLabel("Suggested next steps — not executed", self.overview_panel)
         plan_heading.setStyleSheet("font-weight: bold;")
         overview_layout.addWidget(plan_heading)
         self.plan_text = QPlainTextEdit(self.overview_panel)
         self.plan_text.setReadOnly(True)
-        self.plan_text.setMaximumHeight(170)
-        self.plan_text.setAccessibleName("Deterministic plan proposal")
+        self.plan_text.setMinimumHeight(140)
+        self.plan_text.setMaximumHeight(220)
+        self.plan_text.setAccessibleName("Read-only plan proposal")
         self.plan_text.setPlainText(
-            "The plan will appear automatically after a successful current preflight."
+            "Start Autonomous Analysis to check the dataset and prepare a plan."
         )
         overview_layout.addWidget(self.plan_text)
+
+        self.overview_scroll.setWidget(self.overview_panel)
 
         self.evidence_panel = QWidget(self.splitter)
         self.evidence_panel.setObjectName("preflightEvidencePanel")
@@ -141,6 +209,11 @@ class AgentWindow(QMainWindow):
         evidence_heading = QLabel("Visual Evidence", self.evidence_panel)
         evidence_heading.setStyleSheet("font-size: 15px; font-weight: bold;")
         evidence_layout.addWidget(evidence_heading)
+        evidence_explanation = QLabel(
+            "Measured images and spectrum from the current dataset.", self.evidence_panel
+        )
+        evidence_explanation.setWordWrap(True)
+        evidence_layout.addWidget(evidence_explanation)
         self.evidence_scroll = QScrollArea(self.evidence_panel)
         self.evidence_scroll.setWidgetResizable(True)
         self.evidence_scroll.setAccessibleName("Visual evidence")
@@ -149,18 +222,20 @@ class AgentWindow(QMainWindow):
         self.evidence_layout.setAlignment(Qt.AlignTop)
         self.evidence_scroll.setWidget(self.evidence_content)
         evidence_layout.addWidget(self.evidence_scroll)
-        self.splitter.addWidget(self.overview_panel)
+        self.splitter.addWidget(self.overview_scroll)
         self.splitter.addWidget(self.evidence_panel)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 2)
-        self.splitter.setSizes([390, 610])
+        self.splitter.setSizes([430, 570])
         self._show_evidence_message(
-            "No visual evidence yet. Start Autonomous Analysis or Start Preflight to inspect the dataset."
+            "No measured evidence yet. Start Autonomous Analysis to review the dataset."
         )
 
         self._revision_timer = QTimer(self)
         self._revision_timer.setInterval(200)
         self._revision_timer.timeout.connect(self._check_revision)
+        self._update_model_readiness()
+        self._update_controls()
 
     @property
     def result(self) -> PreflightResult | None:
@@ -208,7 +283,7 @@ class AgentWindow(QMainWindow):
         )
         self._set_status(stale_message)
         self.plan_text.setPlainText(stale_message)
-        self.assessment_text.setPlainText("Previous evidence was discarded because the dataset changed.")
+        self.dataset_summary_label.setText("Dataset changed. Run the analysis again.")
         self._show_evidence_message(
             "Dataset changed — rerun autonomous analysis to inspect current evidence."
             if self._agent_run_id is not None
@@ -258,17 +333,165 @@ class AgentWindow(QMainWindow):
             or getattr(self._main_window, "_shutdown_committed", False)
         )
         can_start = not active and not self._parent_closing and not host_closing
-        self.start_button.setEnabled(can_start)
         self.start_autonomous_button.setEnabled(can_start)
+        self.stop_button.setVisible(active)
+        self.progress_bar.setVisible(active)
         self.stop_button.setEnabled(
             self._can_stop_active_run() and not self._parent_closing
         )
-        if not self._can_stop_active_run():
-            self.stop_button.setText("Stop")
+        self.stop_button.setText(
+            "Stopping…" if active and self._cancellation_requested else "Stop"
+        )
+
+    def _update_model_readiness(self) -> None:
+        settings = self._agent_settings
+        if settings.mode is AgentModelMode.OFFLINE:
+            self.model_readiness_label.setText(
+                "Planning method: Offline. No model or network request."
+            )
+            self.cloud_consent_checkbox.setVisible(False)
+            self.fallback_checkbox.setVisible(False)
+            self.fallback_checkbox.setEnabled(False)
+            self.preview_data_button.setVisible(False)
+            return
+        self.fallback_checkbox.setVisible(True)
+        self.fallback_checkbox.setEnabled(True)
+        self.preview_data_button.setVisible(True)
+        if settings.mode is AgentModelMode.LOCAL:
+            configured = bool(settings.model_id and settings.endpoint)
+            readiness = (
+                f"Local model: {settings.model_id} at {settings.endpoint}. "
+                "Only this computer's loopback endpoint is allowed."
+                if configured
+                else "Local model not configured. Enter a loopback endpoint and exact model ID in Agent settings."
+            )
+            self.cloud_consent_checkbox.setVisible(False)
+        else:
+            configured = bool(settings.model_id)
+            readiness = (
+                f"OpenAI model: {settings.model_id}. "
+                "Each run needs separate permission before a metadata request."
+                if configured
+                else "Model not configured. Enter an exact OpenAI model ID in Agent settings."
+            )
+            self.cloud_consent_checkbox.setText(
+                "For this run, send only the previewed metadata summary to OpenAI — "
+                + (settings.model_id or "model not configured")
+            )
+            self.cloud_consent_checkbox.setVisible(True)
+        self.model_readiness_label.setText("Planning method: " + readiness)
+
+    def open_model_settings(self) -> None:
+        dialog = AgentModelSettingsDialog(
+            self,
+            main_window=self._main_window,
+            settings_repository=self._agent_settings_repository,
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            self._agent_settings = self._agent_settings_repository.load()
+            self.cloud_consent_checkbox.setChecked(False)
+            self._update_model_readiness()
+
+    def _snapshot_run_configuration(self) -> AgentRunSnapshot:
+        settings = self._agent_settings
+        consent = (
+            self.cloud_consent_checkbox.isChecked()
+            if settings.mode is AgentModelMode.OPENAI_CLOUD
+            else False
+        )
+        snapshot = AgentRunSnapshot(
+            settings=settings,
+            objective=PlanningObjective.DATASET_READINESS,
+            cloud_egress_consent=consent,
+            deterministic_fallback=self.fallback_checkbox.isChecked(),
+        )
+        resolver = None
+        if settings.mode is AgentModelMode.OPENAI_CLOUD:
+            resolver = AgentCredentialResolver(
+                AgentKeyringCredentialStore(),
+                environment_allowed=settings.allow_environment_credential,
+            )
+        self._run_credential_resolver = resolver
+        self.cloud_consent_checkbox.setChecked(False)
+        return snapshot
+
+    def show_data_preview(self) -> None:
+        self._check_revision()
+        settings = self._agent_settings
+        if settings.mode is AgentModelMode.OFFLINE:
+            destination = "Offline deterministic mode — no model destination or request."
+        elif settings.mode is AgentModelMode.LOCAL:
+            destination = (
+                f"Local model {settings.model_id or '(model not configured)'} at "
+                f"{settings.endpoint or '(loopback endpoint not configured)'}; "
+                "loopback only, no proxy or remote redirects."
+            )
+        else:
+            destination = (
+                "OpenAI cloud model "
+                + (settings.model_id or "(model not configured)")
+                + "; dataset transmission still requires the unchecked run-level consent."
+            )
+        content = [
+            "Configured destination:",
+            destination,
+            "",
+            "Canonical planning request schema (the same schema used by the serializer):",
+            "",
+            json.dumps(canonical_planning_schema(), indent=2),
+            "",
+            "Request limits: at most 1 analysis request per run; complete serialized request body ≤ 4,096 ASCII bytes (conservative input-token bound: 4,096); output ≤ 384 tokens; response ≤ 4,096 bytes; HTTP operation timeout 10 seconds; total request deadline 15 seconds.",
+            "The connection test is a separate user-initiated operation and sends only its fixed test payload.",
+            "",
+            "This request never contains image bytes, thumbnails, spectra or arrays, actual wavelength/intensity values, file paths or names, sample titles, free-form observations/warnings, dataset/run IDs, credentials, or local files.",
+            "The request is metadata-only and is not sent by opening this preview.",
+        ]
+        if self._result is not None and not self._stale:
+            try:
+                run_id = self._agent_run_id or uuid4().hex
+                context = context_from_preflight(
+                    self._result,
+                    run_id=run_id,
+                    objective=(
+                        self._run_snapshot.objective
+                        if self._run_snapshot is not None
+                        else PlanningObjective.DATASET_READINESS
+                    ),
+                )
+                payload = canonical_payload_for_context(context)
+            except (ValueError, TypeError):
+                payload = None
+            if payload is not None:
+                content.extend(
+                    (
+                        "",
+                        "Current payload after preflight (serializer output only; not transmitted):",
+                        "",
+                        payload,
+                    )
+                )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Review model request")
+        dialog.resize(680, 600)
+        layout = QVBoxLayout(dialog)
+        preview = QPlainTextEdit(dialog)
+        preview.setReadOnly(True)
+        preview.setPlainText("\n".join(content))
+        layout.addWidget(preview)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, parent=dialog)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec_()
 
     def start_autonomous_analysis(self) -> None:
         """Run existing preflight and automatically continue to read-only planning."""
         if self._has_active_worker() or self._parent_closing:
+            return
+        try:
+            self._run_snapshot = self._snapshot_run_configuration()
+        except ValueError as exc:
+            self._set_status(str(exc))
             return
         run_id = uuid4().hex
         self._agent_run_id = run_id
@@ -276,12 +499,22 @@ class AgentWindow(QMainWindow):
         self._stage = "preflight_running"
         self.plan_text.clear()
         self.plan_text.setPlainText("Waiting for the current dataset preflight.")
-        self.start_preflight(_agent_run_id=run_id)
+        self.start_preflight(
+            _agent_run_id=run_id,
+            _run_snapshot=self._run_snapshot,
+        )
 
-    def start_preflight(self, *, _agent_run_id: str | None = None) -> None:
+    def start_preflight(
+        self,
+        *,
+        _agent_run_id: str | None = None,
+        _run_snapshot: AgentRunSnapshot | None = None,
+    ) -> None:
         """Capture live state only on the Qt owner thread, then start bounded work."""
         if self._has_active_worker() or self._parent_closing:
             return
+        if _run_snapshot is not None:
+            self._run_snapshot = _run_snapshot
         if getattr(self._main_window, "_shutdown_close_pending", False) or getattr(self._main_window, "_shutdown_committed", False):
             self._set_status("NEAT is closing; retry after the close attempt finishes.")
             return
@@ -295,14 +528,16 @@ class AgentWindow(QMainWindow):
         self._planning_outcome = None
         if _agent_run_id is None:
             self._agent_run_id = None
+            self._run_snapshot = None
+            self._run_credential_resolver = None
             self._stage = "preflight_running"
         self._revision_timer.stop()
         self.progress_bar.setValue(0)
         self._show_evidence_message("Preflight is preparing the observation snapshot.")
-        self.assessment_text.clear()
+        self.dataset_summary_label.setText("Checking the current dataset…")
         if _agent_run_id is None:
             self.plan_text.setPlainText(
-                "Diagnostic preflight only. Use Start Autonomous Analysis to run planning afterward."
+                "Dataset check only. Start Autonomous Analysis to prepare a plan."
             )
         run_id = uuid4().hex
         self._active_run_id = run_id
@@ -310,6 +545,7 @@ class AgentWindow(QMainWindow):
         if adapter is None:
             self._awaiting_preflight_completion = False
             self._set_status("Scientific observation API is unavailable.")
+            self.dataset_summary_label.setText("Dataset check could not start.")
             self._stage = "failed"
             self._update_controls()
             return
@@ -319,12 +555,14 @@ class AgentWindow(QMainWindow):
         except DatasetUnavailableError:
             self._awaiting_preflight_completion = False
             self._set_status("Dataset loader is busy — retry preflight after loading finishes.")
+            self.dataset_summary_label.setText("Dataset check could not start while loading.")
             self._stage = "busy_retry"
             self._update_controls()
             return
         except (ObservationErrorBase, ValueError):
             self._awaiting_preflight_completion = False
             self._set_status("Dataset capture is unavailable — check loaded data and retry.")
+            self.dataset_summary_label.setText("Dataset check could not start.")
             self._stage = "blocked_invalid_data"
             self._update_controls()
             return
@@ -348,15 +586,12 @@ class AgentWindow(QMainWindow):
             lambda rid=run_id, current=worker: self._on_worker_finished(rid, current),
             current_attribute="agent_preflight_worker",
         )
-        self.start_autonomous_button.setEnabled(False)
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.stop_button.setText("Stop")
         self._set_status(
-            "Preflight running locally. Planning will start automatically after current evidence is validated."
+            "Checking the dataset. Planning will follow after the evidence and permissions are checked."
             if _agent_run_id is not None
-            else "Preflight running locally. No model or network request is used."
+            else "Checking the dataset locally. No model or network request is used."
         )
+        self._update_controls()
         self._revision_timer.start()
         worker.start()
 
@@ -417,9 +652,7 @@ class AgentWindow(QMainWindow):
                 else "Preflight cancelled."
             )
             self._set_status(message)
-            self.assessment_text.setPlainText(
-                "The preflight result was discarded because Stop was requested."
-            )
+            self.dataset_summary_label.setText("Dataset check stopped.")
             self.plan_text.setPlainText(message)
             self._show_evidence_message(message)
             self._update_controls()
@@ -435,7 +668,13 @@ class AgentWindow(QMainWindow):
             if self._agent_run_id is not None:
                 try:
                     context = context_from_preflight(
-                        outcome.result, run_id=self._agent_run_id
+                        outcome.result,
+                        run_id=self._agent_run_id,
+                        objective=(
+                            self._run_snapshot.objective
+                            if self._run_snapshot is not None
+                            else PlanningObjective.DATASET_READINESS
+                        ),
                     )
                 except (ValueError, TypeError):
                     self._stage = "failed"
@@ -451,8 +690,8 @@ class AgentWindow(QMainWindow):
                         self._start_pending_planning()
         else:
             self._result = None
+            self.dataset_summary_label.setText("Dataset check did not complete.")
             self._show_evidence_message(outcome.message or "No evidence was produced.")
-            self.assessment_text.setPlainText(outcome.message or "Preflight did not complete.")
             self._set_status(outcome.message or "Preflight did not complete.")
             if outcome.state is PreflightRunState.STALE:
                 self._mark_stale()
@@ -495,7 +734,11 @@ class AgentWindow(QMainWindow):
             self._mark_stale()
             return
         worker = PlanningWorker(
-            context, adapter.revision_clock, parent=self._main_window
+            context,
+            adapter.revision_clock,
+            self._run_snapshot,
+            credential_resolver=self._run_credential_resolver,
+            parent=self._main_window,
         )
         self._planning_worker = worker
         self._main_window.agent_planning_worker = worker
@@ -526,10 +769,21 @@ class AgentWindow(QMainWindow):
         )
         self._stage = "planning_running"
         self.progress_bar.setValue(90)
+        mode = (
+            self._run_snapshot.settings.mode
+            if self._run_snapshot is not None
+            else AgentModelMode.OFFLINE
+        )
+        planner = {
+            AgentModelMode.OFFLINE: "local deterministic planner",
+            AgentModelMode.LOCAL: "configured loopback structured model",
+            AgentModelMode.OPENAI_CLOUD: "consent-gated OpenAI structured model",
+        }[mode]
         self.plan_text.setPlainText(
-            "Preflight is current. The deterministic local LangGraph planner is preparing a read-only proposal."
+            f"Preflight is current. The {planner} is preparing a read-only proposal."
         )
         self._set_status("Preflight complete — planning is advancing automatically.")
+        self._update_controls()
         worker.start()
 
     def _on_planning_progress(
@@ -552,14 +806,18 @@ class AgentWindow(QMainWindow):
 
     @staticmethod
     def _format_plan_step(step: PlanStep, index: int) -> tuple[str, ...]:
-        evidence = ", ".join(step.evidence_ids) if step.evidence_ids else "none"
-        input_note = "Human input required" if step.requires_human_input else "Read-only proposal"
-        return (
-            f"{index}. {step.step_type.value}",
-            f"   {step.rationale}",
-            f"   Evidence: {evidence}",
-            f"   {input_note}; supported by current preflight: {step.supported}.",
-        )
+        titles = {
+            PlanStepType.INSPECT_DATASET_SUMMARY: "Check the dataset summary",
+            PlanStepType.REVIEW_IMAGE_PREVIEWS: "Review the image previews",
+            PlanStepType.REVIEW_MEASURED_SPECTRUM: "Review the measured spectrum",
+            PlanStepType.REQUEST_ROI: "Select an ROI in NEAT",
+            PlanStepType.REQUEST_CALIBRATION_REVIEW: "Confirm the calibration metadata",
+            PlanStepType.STOP_NEEDS_MORE_EVIDENCE: "Pause until more evidence is available",
+        }
+        lines = [f"{index}. {titles[step.step_type]}", f"   {step.rationale}"]
+        if step.requires_human_input:
+            lines.append("   Your review is needed before this step can proceed.")
+        return tuple(lines)
 
     def _on_planning_completed(
         self, run_id: str, worker: PlanningWorker, outcome: PlanningOutcome
@@ -592,18 +850,49 @@ class AgentWindow(QMainWindow):
         self._planning_outcome = outcome
         self._stage = outcome.status.value
         lines = [
+            f"Review focus: {outcome.objective.value.replace('_', ' ')}",
+        ]
+        if outcome.steps:
+            lines.extend(("", "Suggested steps (not executed):"))
+            for index, step in enumerate(outcome.steps, start=1):
+                lines.extend(self._format_plan_step(step, index))
+        else:
+            lines.extend(("", "No steps were proposed."))
+        lines.extend((
+            "",
+            "Run details:",
             f"Status: {outcome.status.value.replace('_', ' ')}",
             f"Agent run: {outcome.run_id}",
             f"Preflight run: {outcome.preflight_run_id}",
             f"Dataset: {outcome.dataset_id} revision {outcome.revision}",
             f"Graph transitions: {' → '.join(outcome.transitions) or 'none'}",
-        ]
+            f"Objective: {outcome.objective.value}",
+            f"Planner source: {outcome.planner_source.value.replace('_', ' ')}",
+        ))
+        if outcome.provider:
+            lines.append(f"Provider/model: {outcome.provider} / {outcome.model_id}")
+        if self._run_snapshot is not None:
+            if self._run_snapshot.settings.mode is AgentModelMode.OPENAI_CLOUD:
+                lines.append(
+                    "Cloud permission: granted for this run"
+                    if self._run_snapshot.cloud_egress_consent
+                    else "Cloud permission: not granted; no cloud request was made"
+                )
+            elif self._run_snapshot.settings.mode is AgentModelMode.LOCAL:
+                lines.append("Network scope: configured loopback endpoint only")
+            else:
+                lines.append("Network scope: no model request")
+        if outcome.input_tokens is not None or outcome.output_tokens is not None:
+            lines.append(
+                f"Provider-reported tokens: input={outcome.input_tokens}, output={outcome.output_tokens}"
+            )
         if outcome.error_code is not None:
             lines.append(f"Reason code: {outcome.error_code.value}")
         if outcome.steps:
-            lines.extend(("", "Proposed steps (not executed):"))
+            lines.extend(("", "Evidence behind the suggested steps:"))
             for index, step in enumerate(outcome.steps, start=1):
-                lines.extend(self._format_plan_step(step, index))
+                evidence = ", ".join(step.evidence_ids) if step.evidence_ids else "none"
+                lines.append(f"{index}. {step.step_type.value}: {evidence}")
         if outcome.status is PlanningStatus.READY_PLAN:
             lines.extend(
                 (
@@ -613,7 +902,7 @@ class AgentWindow(QMainWindow):
                 )
             )
             self._set_status(
-                "Plan prepared — scientific execution is not yet implemented."
+                "Plan ready to review. No fitting or mapping has run."
             )
             self.progress_bar.setValue(100)
         elif outcome.status is PlanningStatus.NEEDS_INPUT:
@@ -623,6 +912,10 @@ class AgentWindow(QMainWindow):
         elif outcome.status is PlanningStatus.UNAVAILABLE:
             self._set_status(
                 "Preflight complete — planning is unavailable; install the optional [agent] extra."
+            )
+        elif outcome.status is PlanningStatus.NEEDS_PERMISSION:
+            self._set_status(
+                "Planning stopped — cloud permission was not granted for this run."
             )
         elif outcome.status is PlanningStatus.CANCELLED:
             self._set_status("Autonomous analysis stopped during planning.")
@@ -644,11 +937,12 @@ class AgentWindow(QMainWindow):
             run_id == self._agent_run_id
             and not self._parent_closing
             and not self._cancellation_requested
+            and self._planning_outcome is None
+            and not self._stale
         ):
-            if self._planning_outcome is None and not self._stale:
-                self._stage = "failed"
-                self._set_status("Planning stopped before a result was received.")
-                self.plan_text.setPlainText("No plan was produced.")
+            self._stage = "failed"
+            self._set_status("Planning stopped before a result was received.")
+            self.plan_text.setPlainText("No plan was produced.")
         self._update_controls()
         if not self._has_active_worker() and self._result is None:
             self._revision_timer.stop()
@@ -748,42 +1042,30 @@ class AgentWindow(QMainWindow):
         dataset = result.dataset
         assessment = result.assessment
         self._set_status(
-            f"Preflight complete — {assessment.readiness.value.replace('_', ' ')}."
+            f"Dataset check complete — {assessment.readiness.value.replace('_', ' ')}."
         )
-        lines = [
-            f"Run: {result.run_id}",
-            f"Dataset: {result.dataset_id}  revision {result.revision}",
-            f"Assessment: {assessment.readiness.value.replace('_', ' ')}",
-            f"Mode: {dataset.mode.value}",
-            f"Frames: {dataset.frame_count if dataset.frame_count is not None else 'not applicable'}",
-            f"Image shape (rows, columns): {dataset.image_shape if dataset.image_shape else 'not applicable'}",
-            f"Wavelength points: {dataset.wavelength_count}",
-            f"Wavelength range (Å): {dataset.wavelength_min} to {dataset.wavelength_max}",
-            f"Wavelength axis: {dataset.wavelength_axis_status.value}",
-            f"Input format: {dataset.provenance.input_format}",
-            f"Wavelength source: {dataset.provenance.wavelength_source}",
-            f"Flight path source: {dataset.provenance.flight_path_source}",
-            f"Flight path (m): {dataset.provenance.flight_path_m}",
-            f"Delay (ms): {dataset.provenance.delay_ms}",
-            (
-                f"Capabilities: images={dataset.capabilities.images_available}, "
-                f"spectrum={dataset.capabilities.spectrum_available}, "
-                f"mapping applicable={dataset.capabilities.mapping_applicable}"
-            ),
-            "",
-            "Observed facts:",
-            *assessment.observations,
-            "",
-            "Evidence references:",
-            *(assessment.evidence_references or ("None",)),
-            "",
-            "Warnings:",
-            *(assessment.warnings or ("None",)),
-            "",
-            "Unsupported operations:",
-            *(assessment.unsupported_operations or ("None",)),
-        ]
-        self.assessment_text.setPlainText("\n".join(lines))
+        summary_parts = []
+        if dataset.mode is DatasetMode.PROFILE:
+            summary_parts.append("spectrum-only dataset")
+        else:
+            if dataset.frame_count is not None:
+                summary_parts.append(f"{dataset.frame_count:,} image frames")
+            if dataset.image_shape is not None:
+                rows, columns = dataset.image_shape
+                summary_parts.append(f"{columns} × {rows} pixels")
+        summary_parts.append(f"{dataset.wavelength_count:,} wavelength points")
+        summary_parts.append(
+            "wavelength axis: " + dataset.wavelength_axis_status.value.replace("_", " ")
+        )
+        if result.roi is not None:
+            summary_parts.append(
+                f"ROI: {result.roi.x_max - result.roi.x_min} × "
+                f"{result.roi.y_max - result.roi.y_min} pixels"
+            )
+        summary = "Dataset check: " + " · ".join(summary_parts) + "."
+        if assessment.warnings:
+            summary += "\nNeeds review: " + assessment.warnings[0]
+        self.dataset_summary_label.setText(summary)
         self._clear_evidence()
         if dataset.mode is DatasetMode.PROFILE:
             self.evidence_layout.addWidget(QLabel("Spectrum-only input: image controls do not apply."))
@@ -840,6 +1122,8 @@ class AgentWindow(QMainWindow):
         self._revision_timer.stop()
         self._result = None
         self._planning_outcome = None
+        self._run_snapshot = None
+        self._run_credential_resolver = None
         self._dataset_token = None
         self.plan_text.clear()
         self._show_evidence_message("NEAT is closing.")
@@ -854,11 +1138,10 @@ class AgentWindow(QMainWindow):
         self._result = None
         self._planning_outcome = None
         self._dataset_token = None
+        self._run_snapshot = None
+        self._run_credential_resolver = None
         self.plan_text.clear()
         self._revision_timer.stop()
-        self.assessment_text.setPlainText(
-            "The Agent window was closed. Any active stage is stopping safely."
-        )
         self._show_evidence_message("No current evidence is displayed.")
         self.hide()
         event.accept()

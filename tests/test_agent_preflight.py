@@ -8,14 +8,12 @@ import threading
 import time
 import unittest
 import weakref
-from unittest.mock import Mock, patch
 from importlib.util import find_spec
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Preserve the application import order: ONNX Runtime is initialized before Qt.
-import NEAT  # noqa: F401
-
 import numpy as np
 from PyQt5.QtCore import QEventLoop, Qt, QTimer
 from PyQt5.QtTest import QTest
@@ -29,9 +27,19 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
+import NEAT  # noqa: F401
+from NEAT.domain.agent_model import (
+    AgentModelMode,
+    AgentModelSettings,
+    PlanningObjective,
+)
 from NEAT.domain.agent_planning import PlanningOutcome, PlanningStatus
+from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
 from NEAT.domain.observation import DatasetMode
+from NEAT.ui.agent_model_settings_dialog import (
+    AgentModelConnectionWorker,
+    AgentModelSettingsDialog,
+)
 from NEAT.ui.agent_preflight_worker import PreflightWorker
 from NEAT.ui.agent_window import AgentWindow
 from NEAT.ui.main_window import FitsViewer
@@ -135,12 +143,15 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(result.frames[0].image.coordinate_mapping.origin, "upper")
         overlay = self.window._preview_pixmap(result.frames[0].image, result.roi).toImage()
         self.assertEqual(overlay.pixelColor(1, 2).name(), "#ffff00")
-        self.assertNotIn("C:/private", self.window.assessment_text.toPlainText())
-        self.assertIn("Companion metadata", self.window.assessment_text.toPlainText())
+        self.assertNotIn("C:/private", self.window.dataset_summary_label.text())
+        self.assertIn("Companion metadata", self.window.dataset_summary_label.text())
         self.assertIs(self.host.images, old_images)
         self.assertEqual(self.host.selected_area, old_roi)
         self.assertEqual(self.host.scientific_observation_api.revision_clock.current(), old_revision)
         self._wait_for(lambda: self.window._worker is None)
+        self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+        self.assertFalse(self.window.stop_button.isVisible())
+        self.assertFalse(self.window.progress_bar.isVisible())
 
     def test_agent_entry_is_independent_and_reuses_hidden_window(self):
         menu = self.host.menuBar()
@@ -162,10 +173,263 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(self.window.splitter.count(), 2)
         self.assertTrue(self.window.overview_panel.isVisible())
         self.assertTrue(self.window.evidence_panel.isVisible())
-        self.assertTrue(self.window.assessment_text.isVisible())
+        self.assertTrue(self.window.dataset_summary_label.isVisible())
+        self.assertFalse(hasattr(self.window, "assessment_text"))
+        self.assertFalse(hasattr(self.window, "objective_combo"))
+        self.assertFalse(hasattr(self.window, "start_button"))
+        self.assertEqual(self.window.settings_button.text(), "Agent settings…")
         self.assertTrue(self.window.evidence_scroll.isVisible())
         self.assertGreater(self.window.splitter.sizes()[0], 0)
         self.assertGreater(self.window.splitter.sizes()[1], 0)
+
+    def test_m4_provider_readiness_and_cloud_consent_are_scoped_to_one_run(self):
+        self.window._agent_settings = AgentModelSettings(
+            mode=AgentModelMode.OPENAI_CLOUD,
+            model_id="",
+        )
+        self.window._update_model_readiness()
+        self.assertTrue(self.window.cloud_consent_checkbox.isVisible())
+        self.assertIn("OpenAI", self.window.cloud_consent_checkbox.text())
+        self.assertIn("model not configured", self.window.cloud_consent_checkbox.text())
+        self.assertFalse(self.window.cloud_consent_checkbox.isChecked())
+        self.assertIn("Model not configured", self.window.model_readiness_label.text())
+
+        self.window._agent_settings = AgentModelSettings(
+            mode=AgentModelMode.OPENAI_CLOUD,
+            model_id="configured-model",
+        )
+        self.window._update_model_readiness()
+        self.assertIn("configured-model", self.window.cloud_consent_checkbox.text())
+        self.assertIn("configured-model", self.window.model_readiness_label.text())
+
+        self.window.cloud_consent_checkbox.setChecked(True)
+        snapshot = self.window._snapshot_run_configuration()
+        self.assertEqual(snapshot.objective, PlanningObjective.DATASET_READINESS)
+        self.assertTrue(snapshot.cloud_egress_consent)
+        self.assertFalse(self.window.cloud_consent_checkbox.isChecked())
+
+        self.window._agent_settings = AgentModelSettings(
+            mode=AgentModelMode.LOCAL,
+            model_id="changed-after-start",
+            endpoint="http://127.0.0.1:11434/v1",
+        )
+        self.window._update_model_readiness()
+        self.assertEqual(snapshot.settings.model_id, "configured-model")
+        self.assertEqual(
+            snapshot.settings.mode, AgentModelMode.OPENAI_CLOUD
+        )
+        self.assertFalse(self.window.cloud_consent_checkbox.isVisible())
+
+    def test_model_connection_is_user_initiated_and_uses_tracked_worker(self):
+        created_workers = []
+        saved_settings = []
+        saved_credentials = []
+
+        class MemorySettings:
+            def load(self):
+                return AgentModelSettings()
+
+            def save(self, settings):
+                saved_settings.append(settings)
+                return settings
+
+        class MemoryCredentials:
+            def get(self):
+                return None
+
+            def set(self, _credential):
+                saved_credentials.append(_credential)
+
+            def delete(self):
+                return None
+
+        class FakeSignal:
+            def __init__(self):
+                self.callbacks = []
+
+            def connect(self, callback):
+                self.callbacks.append(callback)
+
+            def emit(self, *args):
+                for callback in tuple(self.callbacks):
+                    callback(*args)
+
+        class FakeConnectionWorker:
+            def __init__(self, settings, *, pending_api_key=None, parent=None):
+                self.settings = settings
+                self.pending_api_key = pending_api_key
+                self.parent = parent
+                self.completed = FakeSignal()
+                self.finished = FakeSignal()
+                self.running = False
+                created_workers.append(self)
+
+            def isRunning(self):
+                return self.running
+
+            def start(self):
+                self.running = True
+
+            def stop(self):
+                self.running = False
+
+        class FakeHost:
+            def __init__(self):
+                self.tracked = []
+
+            def _track_shutdown_worker(self, worker, role):
+                self.tracked.append((worker, role))
+
+            def _connect_shutdown_worker_signal(self, worker, signal, callback):
+                signal.connect(callback)
+
+        fake_host = FakeHost()
+        dialog = AgentModelSettingsDialog(
+            self.window,
+            main_window=fake_host,
+            settings_repository=MemorySettings(),
+            credential_store=MemoryCredentials(),
+            connection_worker_class=FakeConnectionWorker,
+        )
+        try:
+            self.assertEqual(created_workers, [])
+            dialog.mode_combo.setCurrentIndex(
+                dialog.mode_combo.findData(AgentModelMode.OPENAI_CLOUD.value)
+            )
+            dialog.model_edit.setText("explicit-model")
+            dialog.key_edit.setText("unsaved-agent-key")
+            self.assertTrue(dialog.test_button.isEnabled())
+            dialog.test_button.click()
+            self.assertEqual(len(created_workers), 1)
+            self.assertEqual(
+                created_workers[0].settings.mode, AgentModelMode.OPENAI_CLOUD
+            )
+            self.assertEqual(created_workers[0].pending_api_key, "unsaved-agent-key")
+            self.assertEqual(saved_credentials, [])
+            self.assertEqual(saved_settings, [])
+            self.assertEqual(fake_host.tracked, [(created_workers[0], "agent_model_test")])
+            self.assertFalse(dialog.test_button.isEnabled())
+            created_workers[0].completed.emit(True, "Connection test succeeded.")
+            created_workers[0].running = False
+            created_workers[0].finished.emit()
+            self.assertEqual(dialog.status_label.text(), "Connection test succeeded.")
+            self.assertTrue(dialog.test_button.isEnabled())
+            self.assertEqual(dialog.key_edit.text(), "unsaved-agent-key")
+            self.assertEqual(saved_credentials, [])
+
+            dialog.save_and_accept()
+            self.assertEqual(saved_credentials, ["unsaved-agent-key"])
+            self.assertEqual(len(saved_settings), 1)
+            self.assertEqual(dialog.result(), dialog.Accepted)
+        finally:
+            dialog.close()
+
+    def test_agent_model_settings_cancel_discards_pending_key(self):
+        saved_credentials = []
+
+        class MemorySettings:
+            def load(self):
+                return AgentModelSettings()
+
+            def save(self, _settings):
+                raise AssertionError("Cancel must not save settings")
+
+        class MemoryCredentials:
+            def get(self):
+                return None
+
+            def set(self, credential):
+                saved_credentials.append(credential)
+
+            def delete(self):
+                return None
+
+        dialog = AgentModelSettingsDialog(
+            self.window,
+            settings_repository=MemorySettings(),
+            credential_store=MemoryCredentials(),
+        )
+        dialog.mode_combo.setCurrentIndex(
+            dialog.mode_combo.findData(AgentModelMode.OPENAI_CLOUD.value)
+        )
+        dialog.model_edit.setText("explicit-model")
+        dialog.key_edit.setText("cancelled-agent-key")
+        dialog.reject()
+        self.assertEqual(saved_credentials, [])
+        self.assertEqual(dialog.key_edit.text(), "")
+        self.assertEqual(dialog.result(), dialog.Rejected)
+
+    def test_connection_worker_releases_pending_key_and_is_shutdown_tracked(self):
+        import NEAT.ui.agent_model_settings_dialog as settings_module
+
+        entered = threading.Event()
+        release = threading.Event()
+        observed = []
+
+        def paused_connection_test(
+            settings, resolver, *, credential_override=None, transport=None
+        ):
+            observed.append((settings.mode, credential_override))
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release connection worker")
+
+        class MemorySettings:
+            def load(self):
+                return AgentModelSettings()
+
+            def save(self, _settings):
+                return None
+
+        class MemoryCredentials:
+            def get(self):
+                return None
+
+            def set(self, _credential):
+                raise AssertionError("Test Connection must not persist a key")
+
+            def delete(self):
+                return None
+
+        dialog = AgentModelSettingsDialog(
+            self.window,
+            main_window=self.host,
+            settings_repository=MemorySettings(),
+            credential_store=MemoryCredentials(),
+        )
+        dialog.mode_combo.setCurrentIndex(
+            dialog.mode_combo.findData(AgentModelMode.OPENAI_CLOUD.value)
+        )
+        dialog.model_edit.setText("explicit-model")
+        dialog.key_edit.setText("ephemeral-worker-key")
+        with patch.object(
+            settings_module,
+            "run_model_connection_test",
+            side_effect=paused_connection_test,
+        ):
+            dialog.test_button.click()
+            worker = dialog.connection_worker
+            self.assertIsInstance(worker, AgentModelConnectionWorker)
+            self.assertTrue(entered.wait(2))
+            self.assertIn("agent_model_test", self.host._shutdown_worker_inventory.roles)
+            self.assertIsNone(worker._pending_api_key)
+            self.assertEqual(
+                observed,
+                [(AgentModelMode.OPENAI_CLOUD, "ephemeral-worker-key")],
+            )
+
+            self.host._shutdown_worker_inventory.request_shutdown()
+            self.assertTrue(worker._transport._cancelled)
+            self.assertIn(worker, self.host._shutdown_worker_inventory.workers)
+            release.set()
+            self._wait_for(
+                lambda: not self.host._shutdown_worker_inventory.workers
+            )
+
+        self.assertIsNone(self.host.agent_model_test_worker)
+        self.assertEqual(dialog.key_edit.text(), "ephemeral-worker-key")
+        dialog.reject()
+        self.assertEqual(dialog.key_edit.text(), "")
 
     def test_agent_menu_survives_each_workflow_tab_rebuild(self):
         self.host.tabs = QTabWidget(self.host)
@@ -247,7 +511,7 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(self.window.result.frames, ())
         self.assertIsNone(self.window.result.roi)
         self.assertIsNotNone(self.window.result.spectrum)
-        self.assertIn("spectrum-only", self.window.assessment_text.toPlainText().lower())
+        self.assertIn("spectrum-only", self.window.dataset_summary_label.text().lower())
 
     def test_dataset_change_discards_visible_evidence_and_late_result(self):
         self.window.start_preflight()
@@ -278,7 +542,7 @@ class AgentPreflightTests(unittest.TestCase):
             ticked = []
             QTimer.singleShot(0, lambda: ticked.append(True))
             self._wait_for(lambda: bool(ticked))
-            self.assertFalse(self.window.start_button.isEnabled())
+            self.assertFalse(self.window.start_autonomous_button.isEnabled())
             active_worker = self.window._worker
             self.window.start_preflight()
             self.assertIs(self.window._worker, active_worker)
@@ -287,6 +551,43 @@ class AgentPreflightTests(unittest.TestCase):
             self._wait_for(lambda: self.window._worker is None)
             self.assertIsNone(self.window.result)
             self.assertIn("cancelled", self.window.status_label.text().lower())
+
+    def test_preflight_controls_are_visible_until_cancelled_worker_retires(self):
+        import NEAT.ui.agent_preflight_worker as worker_module
+
+        entered = threading.Event()
+        release = threading.Event()
+        original = worker_module.get_image_preview
+
+        def paused_preview(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release preflight")
+            return original(*args, **kwargs)
+
+        with patch.object(worker_module, "get_image_preview", side_effect=paused_preview):
+            try:
+                self.window.start_autonomous_button.click()
+                self.assertTrue(self.window.stop_button.isVisible())
+                self.assertTrue(self.window.stop_button.isEnabled())
+                self.assertTrue(self.window.progress_bar.isVisible())
+                self.assertFalse(self.window.start_autonomous_button.isEnabled())
+                self.assertTrue(entered.wait(2))
+
+                self.window.stop_button.click()
+                self.assertTrue(self.window.stop_button.isVisible())
+                self.assertFalse(self.window.stop_button.isEnabled())
+                self.assertEqual(self.window.stop_button.text(), "Stopping…")
+                self.assertTrue(self.window.progress_bar.isVisible())
+                self.assertFalse(self.window.start_autonomous_button.isEnabled())
+            finally:
+                release.set()
+            self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+
+        self.assertFalse(self.window.stop_button.isVisible())
+        self.assertFalse(self.window.progress_bar.isVisible())
+        self.assertTrue(self.window.start_autonomous_button.isEnabled())
+        self.assertEqual(self.window._stage, "cancelled")
 
     def test_cancel_before_worker_start_returns_no_evidence(self):
         handle = self.host.scientific_observation_api.capture_dataset()
@@ -380,7 +681,7 @@ class AgentPreflightTests(unittest.TestCase):
         self.window.start_autonomous_button.click()
         first_run_id = self.window._agent_run_id
         self.window.start_autonomous_button.click()
-        self.window.start_button.click()
+        self.assertFalse(hasattr(self.window, "start_button"))
         self._wait_for(
             lambda: self.window._planning_outcome is not None
             and self.window._planning_worker is None
@@ -397,6 +698,8 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIn("propose_read_only_plan", outcome.transitions)
         self.assertEqual(outcome.transitions[-1], "terminal")
         self.assertTrue(self.window.start_autonomous_button.isEnabled())
+        self.assertFalse(self.window.stop_button.isVisible())
+        self.assertFalse(self.window.progress_bar.isVisible())
         self.assertEqual(self.window.splitter.count(), 2)
         self.assertTrue(self.window.overview_panel.isVisible())
         self.assertTrue(self.window.evidence_panel.isVisible())
@@ -421,7 +724,7 @@ class AgentPreflightTests(unittest.TestCase):
             return original(*args, **kwargs)
 
         with patch.object(worker_module, "get_image_preview", side_effect=paused_preview):
-            self.window.start_button.click()
+            self.window.start_preflight()
             self.assertTrue(entered.wait(2))
             active_worker = self.window._worker
             self.window.start_autonomous_button.click()
@@ -531,6 +834,47 @@ class AgentPreflightTests(unittest.TestCase):
             self.assertEqual(self.window._planning_outcome.status, PlanningStatus.CANCELLED)
             self.assertIsNone(self.window._main_window.agent_planning_worker)
 
+    def test_planning_controls_are_visible_until_cancelled_worker_retires(self):
+        import NEAT.ui.agent_planning_worker as worker_module
+        from NEAT.services.agent_planning import PlanningCancelled
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def paused_planning(context, *, cancelled=None, **_kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release planning")
+            if cancelled is not None and cancelled():
+                raise PlanningCancelled("stopped")
+            raise RuntimeError("planning was expected to be cancelled")
+
+        with patch.object(worker_module, "run_planning", side_effect=paused_planning):
+            try:
+                self.window.start_autonomous_button.click()
+                self._wait_for(
+                    lambda: entered.is_set() and self.window._planning_worker is not None
+                )
+                self.assertTrue(self.window.stop_button.isVisible())
+                self.assertTrue(self.window.stop_button.isEnabled())
+                self.assertTrue(self.window.progress_bar.isVisible())
+                self.assertGreaterEqual(self.window.progress_bar.value(), 90)
+                self.assertFalse(self.window.start_autonomous_button.isEnabled())
+
+                self.window.stop_button.click()
+                self.assertTrue(self.window.stop_button.isVisible())
+                self.assertFalse(self.window.stop_button.isEnabled())
+                self.assertEqual(self.window.stop_button.text(), "Stopping…")
+                self.assertTrue(self.window.progress_bar.isVisible())
+            finally:
+                release.set()
+            self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+
+        self.assertFalse(self.window.stop_button.isVisible())
+        self.assertFalse(self.window.progress_bar.isVisible())
+        self.assertTrue(self.window.start_autonomous_button.isEnabled())
+        self.assertEqual(self.window._stage, "cancelled")
+
     def test_one_click_reports_optional_planning_unavailable_after_preflight(self):
         import NEAT.ui.agent_planning_worker as worker_module
         from NEAT.services.agent_planning import PlanningDependencyUnavailable
@@ -565,7 +909,6 @@ class AgentPreflightTests(unittest.TestCase):
             release.wait(5)
             if cancelled is not None and cancelled():
                 raise PlanningCancelled("dataset changed")
-            return None
 
         with patch.object(worker_module, "run_planning", side_effect=paused_planning):
             self.window.start_autonomous_analysis()
@@ -594,7 +937,6 @@ class AgentPreflightTests(unittest.TestCase):
             release.wait(5)
             if cancelled is not None and cancelled():
                 raise PlanningCancelled("shutdown")
-            return None
 
         with patch.object(worker_module, "run_planning", side_effect=paused_planning):
             self.window.start_autonomous_analysis()
