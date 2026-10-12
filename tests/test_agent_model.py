@@ -331,6 +331,8 @@ class StructuredModelAdapterTests(unittest.TestCase):
         self.assertEqual(body["model"], "explicit-model-id")
         self.assertEqual(body["max_completion_tokens"], MAX_OUTPUT_TOKENS)
         self.assertEqual(body["store"], False)
+        self.assertNotIn("temperature", body)
+        self.assertTrue(body["response_format"]["json_schema"]["strict"])
         self.assertEqual(timeout, REQUEST_TIMEOUT_SECONDS)
         self.assertLessEqual(MAX_PLANNING_DURATION_SECONDS, 15)
         self.assertEqual(MAX_STRUCTURED_RESPONSE_BYTES, 4096)
@@ -368,6 +370,7 @@ class StructuredModelAdapterTests(unittest.TestCase):
         self.assertNotIn("Authorization", transport.requests[0][1])
         self.assertEqual(transport.requests[0][2]["max_tokens"], MAX_OUTPUT_TOKENS)
         self.assertNotIn("store", transport.requests[0][2])
+        self.assertNotIn("temperature", transport.requests[0][2])
 
     def test_http_errors_and_oversized_responses_are_rejected_without_retry(self):
         settings = AgentModelSettings(
@@ -429,7 +432,10 @@ class StructuredModelAdapterTests(unittest.TestCase):
         transport = FakeTransport(body=response_body)
 
         class AgentKeyStore:
+            reads = 0
+
             def get(self):
+                self.reads += 1
                 return "test-agent-key"
 
             def set(self, _credential):
@@ -438,23 +444,44 @@ class StructuredModelAdapterTests(unittest.TestCase):
             def delete(self):
                 raise AssertionError("connection test must not delete credentials")
 
+        override_store = AgentKeyStore()
         run_model_connection_test(
             AgentModelSettings(
                 mode=AgentModelMode.OPENAI_CLOUD, model_id="explicit-model-id"
             ),
             AgentCredentialResolver(
-                AgentKeyStore(), environment_allowed=False, environ={}
+                override_store, environment_allowed=False, environ={}
             ),
+            credential_override="pending-unsaved-agent-key",
             transport=transport,
         )
         self.assertEqual(len(transport.requests), 1)
         _, headers, body, timeout = transport.requests[0]
-        self.assertEqual(headers["Authorization"], "Bearer test-agent-key")
+        self.assertEqual(headers["Authorization"], "Bearer pending-unsaved-agent-key")
         self.assertEqual(timeout, REQUEST_TIMEOUT_SECONDS)
         self.assertEqual(body["messages"][1]["content"],
                          '{"purpose":"connection_test","schema_version":"neat-agent-test-v1"}')
-        self.assertNotIn("test-agent-key", json.dumps(body))
+        self.assertNotIn("pending-unsaved-agent-key", json.dumps(body))
+        self.assertNotIn("temperature", body)
         self.assertEqual(body["store"], False)
+        self.assertEqual(override_store.reads, 0)
+
+        saved_transport = FakeTransport(body=response_body)
+        saved_store = AgentKeyStore()
+        run_model_connection_test(
+            AgentModelSettings(
+                mode=AgentModelMode.OPENAI_CLOUD, model_id="explicit-model-id"
+            ),
+            AgentCredentialResolver(
+                saved_store, environment_allowed=False, environ={}
+            ),
+            transport=saved_transport,
+        )
+        self.assertEqual(saved_store.reads, 1)
+        self.assertEqual(
+            saved_transport.requests[0][1]["Authorization"],
+            "Bearer test-agent-key",
+        )
 
     @unittest.skipUnless(find_spec("httpx") is not None, "requires NEAT[agent-llm]")
     def test_httpx_transport_enforces_total_deadline_by_cancelling_stream(self):

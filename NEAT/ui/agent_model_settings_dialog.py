@@ -33,29 +33,51 @@ class AgentModelConnectionWorker(QThread):
 
     completed = pyqtSignal(bool, str)
 
-    def __init__(self, settings: AgentModelSettings, *, parent=None) -> None:
+    def __init__(
+        self,
+        settings: AgentModelSettings,
+        *,
+        pending_api_key: str | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._settings = settings
+        self._pending_api_key = pending_api_key
         self._transport = HttpxJsonTransport()
 
     def stop(self) -> None:
         self._transport.cancel()
 
     def run(self) -> None:
+        pending_api_key = self._pending_api_key
+        # The worker owns the temporary credential only while its request runs.
+        # Clear the instance reference immediately so shutdown tracking cannot
+        # keep the key alive after the worker has finished.
+        self._pending_api_key = None
+        succeeded = False
+        message = "Connection test succeeded."
         try:
             resolver = AgentCredentialResolver(
                 AgentKeyringCredentialStore(),
                 environment_allowed=self._settings.allow_environment_credential,
             )
             run_model_connection_test(
-                self._settings, resolver, transport=self._transport
+                self._settings,
+                resolver,
+                credential_override=pending_api_key,
+                transport=self._transport,
             )
         except AgentModelUnavailable as exc:
-            self.completed.emit(False, str(exc))
+            message = str(exc)
         except Exception as exc:  # noqa: BLE001 - do not display exception contents
-            self.completed.emit(False, f"Connection test failed ({type(exc).__name__}).")
+            message = f"Connection test failed ({type(exc).__name__})."
         else:
-            self.completed.emit(True, "Connection test succeeded.")
+            succeeded = True
+        finally:
+            # Drop the local reference before notifying the UI or allowing the
+            # tracked QThread to retire.
+            pending_api_key = None
+        self.completed.emit(succeeded, message)
 
 
 class AgentModelSettingsDialog(QDialog):
@@ -152,7 +174,15 @@ class AgentModelSettingsDialog(QDialog):
     @property
     def has_unsettled_workers(self) -> bool:
         worker = self.connection_worker
-        return worker is not None and worker.isRunning()
+        if worker is None:
+            return False
+        try:
+            return worker.isRunning()
+        except RuntimeError:
+            # The main-window inventory may retire and delete the QThread before
+            # this dialog processes its queued finished notification.
+            self.connection_worker = None
+            return False
 
     def selected_settings(self) -> AgentModelSettings:
         mode = AgentModelMode(self.mode_combo.currentData())
@@ -205,20 +235,19 @@ class AgentModelSettingsDialog(QDialog):
             self.status_label.setText(str(exc))
             return
         pending_key = self.key_edit.text().strip()
-        if pending_key:
-            try:
-                self.credential_store.set(pending_key)
-            except Exception as exc:  # noqa: BLE001 - keep key out of displayed text
-                self.status_label.setText(
-                    f"The key could not be stored in the Agent keyring ({type(exc).__name__})."
-                )
-                return
-            self.key_edit.clear()
         self.status_label.setText(
             "Sending one small connection-test request to the configured model. "
             "No NEAT dataset or planning summary is included."
         )
-        worker = self.connection_worker_class(settings, parent=self)
+        worker = self.connection_worker_class(
+            settings,
+            pending_api_key=(
+                pending_key or None
+                if settings.mode is AgentModelMode.OPENAI_CLOUD
+                else None
+            ),
+            parent=self,
+        )
         self.connection_worker = worker
         main_window = self.main_window
         if main_window is not None and callable(
@@ -243,6 +272,10 @@ class AgentModelSettingsDialog(QDialog):
         )
 
     def _on_test_finished(self) -> None:
+        # The shutdown inventory keeps ownership through native thread exit.
+        # Drop the dialog's convenience reference so it cannot outlive a
+        # retired/deleted QThread wrapper.
+        self.connection_worker = None
         self.test_button.setEnabled(True)
         self.button_box.setEnabled(True)
         self._update_fields()
@@ -258,6 +291,15 @@ class AgentModelSettingsDialog(QDialog):
         self.key_edit.clear()
         self.status_label.setText("Saved Agent key removed from the OS keyring.")
 
+    def reject(self) -> None:
+        if self.has_unsettled_workers:
+            self.status_label.setText(
+                "Wait for the bounded connection test to finish before closing settings."
+            )
+            return
+        self.key_edit.clear()
+        super().reject()
+
     def closeEvent(self, event) -> None:
         if self.has_unsettled_workers:
             self.status_label.setText(
@@ -265,6 +307,7 @@ class AgentModelSettingsDialog(QDialog):
             )
             event.ignore()
             return
+        self.key_edit.clear()
         super().closeEvent(event)
 
 

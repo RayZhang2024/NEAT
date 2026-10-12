@@ -36,7 +36,10 @@ from NEAT.domain.agent_model import (
 from NEAT.domain.agent_planning import PlanningOutcome, PlanningStatus
 from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
 from NEAT.domain.observation import DatasetMode
-from NEAT.ui.agent_model_settings_dialog import AgentModelSettingsDialog
+from NEAT.ui.agent_model_settings_dialog import (
+    AgentModelConnectionWorker,
+    AgentModelSettingsDialog,
+)
 from NEAT.ui.agent_preflight_worker import PreflightWorker
 from NEAT.ui.agent_window import AgentWindow
 from NEAT.ui.main_window import FitsViewer
@@ -219,12 +222,15 @@ class AgentPreflightTests(unittest.TestCase):
 
     def test_model_connection_is_user_initiated_and_uses_tracked_worker(self):
         created_workers = []
+        saved_settings = []
+        saved_credentials = []
 
         class MemorySettings:
             def load(self):
                 return AgentModelSettings()
 
             def save(self, settings):
+                saved_settings.append(settings)
                 return settings
 
         class MemoryCredentials:
@@ -232,7 +238,7 @@ class AgentPreflightTests(unittest.TestCase):
                 return None
 
             def set(self, _credential):
-                return None
+                saved_credentials.append(_credential)
 
             def delete(self):
                 return None
@@ -249,8 +255,9 @@ class AgentPreflightTests(unittest.TestCase):
                     callback(*args)
 
         class FakeConnectionWorker:
-            def __init__(self, settings, *, parent=None):
+            def __init__(self, settings, *, pending_api_key=None, parent=None):
                 self.settings = settings
+                self.pending_api_key = pending_api_key
                 self.parent = parent
                 self.completed = FakeSignal()
                 self.finished = FakeSignal()
@@ -290,12 +297,16 @@ class AgentPreflightTests(unittest.TestCase):
                 dialog.mode_combo.findData(AgentModelMode.OPENAI_CLOUD.value)
             )
             dialog.model_edit.setText("explicit-model")
+            dialog.key_edit.setText("unsaved-agent-key")
             self.assertTrue(dialog.test_button.isEnabled())
             dialog.test_button.click()
             self.assertEqual(len(created_workers), 1)
             self.assertEqual(
                 created_workers[0].settings.mode, AgentModelMode.OPENAI_CLOUD
             )
+            self.assertEqual(created_workers[0].pending_api_key, "unsaved-agent-key")
+            self.assertEqual(saved_credentials, [])
+            self.assertEqual(saved_settings, [])
             self.assertEqual(fake_host.tracked, [(created_workers[0], "agent_model_test")])
             self.assertFalse(dialog.test_button.isEnabled())
             created_workers[0].completed.emit(True, "Connection test succeeded.")
@@ -303,8 +314,122 @@ class AgentPreflightTests(unittest.TestCase):
             created_workers[0].finished.emit()
             self.assertEqual(dialog.status_label.text(), "Connection test succeeded.")
             self.assertTrue(dialog.test_button.isEnabled())
+            self.assertEqual(dialog.key_edit.text(), "unsaved-agent-key")
+            self.assertEqual(saved_credentials, [])
+
+            dialog.save_and_accept()
+            self.assertEqual(saved_credentials, ["unsaved-agent-key"])
+            self.assertEqual(len(saved_settings), 1)
+            self.assertEqual(dialog.result(), dialog.Accepted)
         finally:
             dialog.close()
+
+    def test_agent_model_settings_cancel_discards_pending_key(self):
+        saved_credentials = []
+
+        class MemorySettings:
+            def load(self):
+                return AgentModelSettings()
+
+            def save(self, _settings):
+                raise AssertionError("Cancel must not save settings")
+
+        class MemoryCredentials:
+            def get(self):
+                return None
+
+            def set(self, credential):
+                saved_credentials.append(credential)
+
+            def delete(self):
+                return None
+
+        dialog = AgentModelSettingsDialog(
+            self.window,
+            settings_repository=MemorySettings(),
+            credential_store=MemoryCredentials(),
+        )
+        dialog.mode_combo.setCurrentIndex(
+            dialog.mode_combo.findData(AgentModelMode.OPENAI_CLOUD.value)
+        )
+        dialog.model_edit.setText("explicit-model")
+        dialog.key_edit.setText("cancelled-agent-key")
+        dialog.reject()
+        self.assertEqual(saved_credentials, [])
+        self.assertEqual(dialog.key_edit.text(), "")
+        self.assertEqual(dialog.result(), dialog.Rejected)
+
+    def test_connection_worker_releases_pending_key_and_is_shutdown_tracked(self):
+        import NEAT.ui.agent_model_settings_dialog as settings_module
+
+        entered = threading.Event()
+        release = threading.Event()
+        observed = []
+
+        def paused_connection_test(
+            settings, resolver, *, credential_override=None, transport=None
+        ):
+            observed.append((settings.mode, credential_override))
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release connection worker")
+
+        class MemorySettings:
+            def load(self):
+                return AgentModelSettings()
+
+            def save(self, _settings):
+                return None
+
+        class MemoryCredentials:
+            def get(self):
+                return None
+
+            def set(self, _credential):
+                raise AssertionError("Test Connection must not persist a key")
+
+            def delete(self):
+                return None
+
+        dialog = AgentModelSettingsDialog(
+            self.window,
+            main_window=self.host,
+            settings_repository=MemorySettings(),
+            credential_store=MemoryCredentials(),
+        )
+        dialog.mode_combo.setCurrentIndex(
+            dialog.mode_combo.findData(AgentModelMode.OPENAI_CLOUD.value)
+        )
+        dialog.model_edit.setText("explicit-model")
+        dialog.key_edit.setText("ephemeral-worker-key")
+        with patch.object(
+            settings_module,
+            "run_model_connection_test",
+            side_effect=paused_connection_test,
+        ):
+            dialog.test_button.click()
+            worker = dialog.connection_worker
+            self.assertIsInstance(worker, AgentModelConnectionWorker)
+            self.assertTrue(entered.wait(2))
+            self.assertIn("agent_model_test", self.host._shutdown_worker_inventory.roles)
+            self.assertIsNone(worker._pending_api_key)
+            self.assertEqual(
+                observed,
+                [(AgentModelMode.OPENAI_CLOUD, "ephemeral-worker-key")],
+            )
+
+            self.host._shutdown_worker_inventory.request_shutdown()
+            self.assertTrue(worker._transport._cancelled)
+            self.assertIn(worker, self.host._shutdown_worker_inventory.workers)
+            release.set()
+            self._wait_for(
+                lambda: not self.host._shutdown_worker_inventory.workers
+            )
+
+        self.assertIsNone(self.host.agent_model_test_worker)
+        self.assertEqual(dialog.key_edit.text(), "ephemeral-worker-key")
+        dialog.reject()
+        self.assertEqual(dialog.key_edit.text(), "")
 
     def test_agent_menu_survives_each_workflow_tab_rebuild(self):
         self.host.tabs = QTabWidget(self.host)

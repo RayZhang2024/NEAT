@@ -452,7 +452,6 @@ class OpenAICompatibleStructuredModel:
                     "schema": dict(schema),
                 },
             },
-            "temperature": 0,
         }
         if self.settings.mode is AgentModelMode.OPENAI_CLOUD:
             request_body["max_completion_tokens"] = MAX_OUTPUT_TOKENS
@@ -738,6 +737,7 @@ def run_model_connection_test(
     settings: AgentModelSettings,
     credential_resolver: AgentCredentialResolver | None,
     *,
+    credential_override: str | None = None,
     transport: JsonTransport | None = None,
 ) -> None:
     """Make one explicit, NEAT-data-free settings test request."""
@@ -745,7 +745,11 @@ def run_model_connection_test(
     if selected.mode is AgentModelMode.OFFLINE:
         raise AgentModelUnavailable("Offline deterministic mode has no connection to test.")
     if selected.mode is AgentModelMode.OPENAI_CLOUD:
-        credential = credential_resolver.get() if credential_resolver is not None else None
+        credential = str(credential_override or "").strip() or None
+        if credential is None:
+            credential = (
+                credential_resolver.get() if credential_resolver is not None else None
+            )
         if not credential:
             raise MissingAgentCredential("No Agent-specific OpenAI key is configured.")
     else:
