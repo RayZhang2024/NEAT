@@ -736,6 +736,19 @@ class AgentPreflightTests(unittest.TestCase):
         self.window._update_model_readiness()
         self.window.vision_checkbox.setChecked(True)
 
+    def _fake_agent_keyring_patch(self):
+        import NEAT.ui.agent_window as agent_window_module
+
+        class FakeKeyStore:
+            def get(self):
+                return "test-key"
+
+        return patch.object(
+            agent_window_module,
+            "AgentKeyringCredentialStore",
+            return_value=FakeKeyStore(),
+        )
+
     def test_openai_uses_same_model_for_consented_planning_and_visual_review(self):
         from test_agent_vision import FakeVision
         import NEAT.ui.agent_window as agent_window_module
@@ -831,7 +844,10 @@ class AgentPreflightTests(unittest.TestCase):
         import NEAT.ui.agent_vision_worker as worker_module
 
         self._configure_synthetic_vision_dataset()
-        with patch.object(worker_module, "OpenAIVisionInspector", return_value=FakeVision()):
+        with (
+            self._fake_agent_keyring_patch(),
+            patch.object(worker_module, "OpenAIVisionInspector", return_value=FakeVision()),
+        ):
             self.window.start_autonomous_analysis()
             self._wait_for(lambda: self.window._vision_worker is not None)
             worker = self.window._vision_worker
@@ -863,7 +879,10 @@ class AgentPreflightTests(unittest.TestCase):
                 release.set()
 
         self._configure_synthetic_vision_dataset()
-        with patch.object(worker_module, "OpenAIVisionInspector", return_value=BlockingVision()):
+        with (
+            self._fake_agent_keyring_patch(),
+            patch.object(worker_module, "OpenAIVisionInspector", return_value=BlockingVision()),
+        ):
             self.window.start_autonomous_analysis()
             self._wait_for(entered.is_set)
             self.assertTrue(self.window.stop_button.isVisible())
@@ -904,7 +923,10 @@ class AgentPreflightTests(unittest.TestCase):
                 release.set()
 
         self._configure_synthetic_vision_dataset()
-        with patch.object(worker_module, "OpenAIVisionInspector", return_value=BlockingVision()):
+        with (
+            self._fake_agent_keyring_patch(),
+            patch.object(worker_module, "OpenAIVisionInspector", return_value=BlockingVision()),
+        ):
             self.window.start_autonomous_analysis()
             self._wait_for(entered.is_set)
             self.assertFalse(self.host.close())
