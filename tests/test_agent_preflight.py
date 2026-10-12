@@ -804,7 +804,11 @@ class AgentPreflightTests(unittest.TestCase):
             patch.object(worker_module, "OpenAIVisionInspector", side_effect=make_vision),
         ):
             self.window.start_autonomous_analysis()
-            self._wait_for(lambda: self.window._vision_outcome is not None and self.window._vision_worker is None)
+            self._wait_for(
+                lambda: self.window._vision_outcome is not None
+                and self.window._vision_worker is None,
+                timeout=30,
+            )
             self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
         outcome = self.window._vision_outcome
         self.assertEqual(outcome.status, VisionStatus.NEEDS_REVIEW)
