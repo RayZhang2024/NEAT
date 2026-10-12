@@ -18,9 +18,9 @@ from PIL import Image
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 
-from NEAT.domain.agent_model import AgentModelSettings
+from NEAT.domain.agent_model import AgentModelMode, AgentModelSettings
 from NEAT.domain.agent_preflight import FrameEvidence, PreflightResult, assess_dataset
-from NEAT.domain.agent_vision import VisionSettings, VisionStatus
+from NEAT.domain.agent_vision import VisionStatus
 from NEAT.domain.observation import (
     DatasetMode,
     DatasetRevisionClock,
@@ -28,17 +28,15 @@ from NEAT.domain.observation import (
     WavelengthAxisStatus,
 )
 from NEAT.services.agent_vision import (
-    LocalVisionInspector,
+    OpenAIVisionInspector,
     VisionCancelled,
     VisionError,
-    VisionSettingsRepository,
     VisionStale,
     VisionUnavailable,
     _roi_from_response,
     render_roi_overlay,
     run_visual_rehearsal,
     trusted_phase_edges,
-    validate_vision_settings,
 )
 from NEAT.services.scientific_observation import (
     create_dataset_handle,
@@ -46,6 +44,7 @@ from NEAT.services.scientific_observation import (
     inspect_dataset,
 )
 from NEAT.ui.agent_model_settings_dialog import AgentModelSettingsDialog
+from NEAT.ui.agent_vision_worker import VisionWorker
 
 
 def _fixture(*, ambiguous=False):
@@ -285,21 +284,22 @@ class VisionServiceTests(unittest.TestCase):
         with self.assertRaises(VisionError):
             run_visual_rehearsal("run", handle, invalid, FakeVision())
 
-    def test_endpoint_is_numeric_loopback_only(self):
-        for endpoint in (
-            "https://api.openai.com/v1",
-            "http://example.com/v1",
-            "http://localhost:11434/v1",
-            "http://127.0.0.1:11434/redirect",
-        ):
-            with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
-                validate_vision_settings(VisionSettings("vision-model", endpoint))
-        self.assertEqual(
-            validate_vision_settings(
-                VisionSettings("vision-model", "http://127.0.0.1:11434/v1")
-            ).model_id,
-            "vision-model",
+    def test_openai_visual_review_requires_cloud_mode_and_fresh_consent(self):
+        settings = AgentModelSettings(
+            mode=AgentModelMode.OPENAI_CLOUD, model_id="gpt-6-luna"
         )
+        with self.assertRaises(VisionUnavailable):
+            OpenAIVisionInspector(
+                settings, api_key="test-key", cloud_egress_authorized=False
+            )
+        with self.assertRaises(VisionUnavailable):
+            OpenAIVisionInspector(
+                AgentModelSettings(), api_key="test-key", cloud_egress_authorized=True
+            )
+        with self.assertRaises(VisionUnavailable):
+            OpenAIVisionInspector(
+                settings, api_key=None, cloud_egress_authorized=True
+            )
 
     def test_builtin_phase_markers_are_trusted_neat_values(self):
         edges = trusted_phase_edges("Fe_bcc")
@@ -307,7 +307,7 @@ class VisionServiceTests(unittest.TestCase):
         with self.assertRaises(VisionError):
             trusted_phase_edges("user_custom")
 
-    def test_local_multimodal_request_contains_pngs_and_no_cloud_or_credential(self):
+    def test_openai_multimodal_request_uses_shared_model_and_actual_bounded_png(self):
         handle, preflight = _fixture()
         received = []
 
@@ -323,8 +323,12 @@ class VisionServiceTests(unittest.TestCase):
         with patch(
             "httpx.AsyncHTTPTransport", return_value=httpx.MockTransport(respond)
         ):
-            inspector = LocalVisionInspector(
-                VisionSettings("vision-model", "http://127.0.0.1:11434/v1")
+            inspector = OpenAIVisionInspector(
+                AgentModelSettings(
+                    mode=AgentModelMode.OPENAI_CLOUD, model_id="gpt-6-luna"
+                ),
+                api_key="temporary-test-key",
+                cloud_egress_authorized=True,
             )
             self.assertEqual(
                 inspector.inspect(
@@ -336,19 +340,25 @@ class VisionServiceTests(unittest.TestCase):
             )
         self.assertEqual(len(received), 1)
         self.assertEqual(
-            str(received[0].url), "http://127.0.0.1:11434/v1/chat/completions"
+            str(received[0].url), "https://api.openai.com/v1/chat/completions"
         )
-        self.assertNotIn("authorization", received[0].headers)
+        self.assertEqual(
+            received[0].headers["authorization"], "Bearer temporary-test-key"
+        )
         body = json.loads(received[0].content)
         self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertEqual(body["model"], "gpt-6-luna")
+        self.assertIs(body["store"], False)
         self.assertTrue(
             body["messages"][1]["content"][1]["image_url"]["url"].startswith(
                 "data:image/png;base64,"
             )
         )
-        self.assertNotIn("api.openai.com", received[0].content.decode("ascii"))
+        self.assertEqual(inspector._api_key, "temporary-test-key")
+        inspector.release_credential()
+        self.assertIsNone(inspector._api_key)
 
-    def test_active_local_request_is_cooperatively_cancelled(self):
+    def test_active_openai_request_is_cooperatively_cancelled(self):
         _, preflight = _fixture()
         entered = threading.Event()
         errors = []
@@ -366,8 +376,12 @@ class VisionServiceTests(unittest.TestCase):
         with patch(
             "httpx.AsyncHTTPTransport", return_value=httpx.MockTransport(wait_forever)
         ):
-            inspector = LocalVisionInspector(
-                VisionSettings("vision-model", "http://127.0.0.1:11434/v1")
+            inspector = OpenAIVisionInspector(
+                AgentModelSettings(
+                    mode=AgentModelMode.OPENAI_CLOUD, model_id="gpt-6-luna"
+                ),
+                api_key="test-key",
+                cloud_egress_authorized=True,
             )
 
             def run():
@@ -388,7 +402,75 @@ class VisionServiceTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(errors), 1)
 
-    def test_agent_settings_save_and_cancel_local_vision_independently(self):
+    def test_vision_worker_requires_consent_and_drops_resolved_credential(self):
+        import NEAT.ui.agent_vision_worker as worker_module
+
+        handle, preflight = _fixture()
+        settings = AgentModelSettings(
+            mode=AgentModelMode.OPENAI_CLOUD, model_id="shared-model"
+        )
+
+        class Resolver:
+            reads = 0
+
+            def get(self):
+                self.reads += 1
+                return "ephemeral-agent-key"
+
+        no_consent_resolver = Resolver()
+        no_consent_results = []
+        denied = VisionWorker(
+            "denied-run",
+            handle,
+            preflight,
+            settings,
+            credential_resolver=no_consent_resolver,
+            cloud_egress_authorized=False,
+        )
+        denied.completed.connect(no_consent_results.append)
+        denied.run()
+        self.assertEqual(no_consent_resolver.reads, 0)
+        self.assertEqual(no_consent_results[0].status, VisionStatus.UNAVAILABLE)
+
+        handle, preflight = _fixture()
+        resolver = Resolver()
+        retained = []
+
+        class ReleasableFake(FakeVision):
+            released = False
+
+            def release_credential(self):
+                self.released = True
+
+        fake = ReleasableFake()
+
+        def make_inspector(settings_arg, *, api_key, cloud_egress_authorized):
+            retained.append((settings_arg.model_id, api_key, cloud_egress_authorized))
+            return fake
+
+        worker = VisionWorker(
+            "authorized-run",
+            handle,
+            preflight,
+            settings,
+            credential_resolver=resolver,
+            cloud_egress_authorized=True,
+        )
+        results = []
+        worker.completed.connect(results.append)
+        with patch.object(
+            worker_module, "OpenAIVisionInspector", side_effect=make_inspector
+        ):
+            worker.run()
+        self.assertEqual(resolver.reads, 1)
+        self.assertEqual(retained, [("shared-model", "ephemeral-agent-key", True)])
+        self.assertTrue(fake.released)
+        self.assertIsNone(worker._credential_resolver)
+        self.assertIsNone(worker._handle)
+        self.assertNotIn("ephemeral-agent-key", repr(vars(worker)))
+        self.assertEqual(results[0].status, VisionStatus.NEEDS_REVIEW)
+
+    def test_agent_settings_use_one_model_configuration_for_planning_and_vision(self):
         app = QApplication.instance() or QApplication([])
 
         class MemoryRepo:
@@ -401,31 +483,19 @@ class VisionServiceTests(unittest.TestCase):
             def save(self, value):
                 self.value = value
 
-            def clear(self):
-                self.value = VisionSettings()
-
         planning_repo = MemoryRepo(AgentModelSettings())
-        vision_repo = MemoryRepo(VisionSettings())
-        dialog = AgentModelSettingsDialog(
-            settings_repository=planning_repo,
-            vision_settings_repository=vision_repo,
-        )
-        dialog.vision_model_edit.setText("local-vision")
-        dialog.vision_endpoint_edit.setText("http://127.0.0.1:11434/v1")
-        dialog.reject()
-        self.assertEqual(vision_repo.load(), VisionSettings())
         saved = AgentModelSettingsDialog(
             settings_repository=planning_repo,
-            vision_settings_repository=vision_repo,
         )
-        saved.vision_model_edit.setText("local-vision")
-        saved.vision_endpoint_edit.setText("http://127.0.0.1:11434/v1")
+        self.assertFalse(hasattr(saved, "vision_model_edit"))
+        self.assertFalse(hasattr(saved, "vision_endpoint_edit"))
+        saved.mode_combo.setCurrentIndex(
+            saved.mode_combo.findData(AgentModelMode.OPENAI_CLOUD.value)
+        )
+        saved.model_edit.setText("gpt-6-luna")
         saved.save_and_accept()
-        self.assertEqual(
-            vision_repo.load(),
-            VisionSettings("local-vision", "http://127.0.0.1:11434/v1"),
-        )
-        self.assertEqual(planning_repo.load().mode.value, "offline_deterministic")
+        self.assertEqual(planning_repo.load().model_id, "gpt-6-luna")
+        self.assertEqual(planning_repo.load().mode, AgentModelMode.OPENAI_CLOUD)
         app.processEvents()
 
 

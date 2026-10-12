@@ -1,4 +1,4 @@
-"""Typed, bounded proposals for optional local visual pre-fitting review."""
+"""Typed, bounded proposals for optional OpenAI visual pre-fitting review."""
 
 from __future__ import annotations
 
@@ -14,14 +14,6 @@ class VisionStatus(str, Enum):
     BLOCKED = "blocked_invalid_evidence"
     CANCELLED = "cancelled"
     STALE = "stale"
-
-
-@dataclass(frozen=True)
-class VisionSettings:
-    """Separate, non-secret settings; never grant run-level permission."""
-
-    model_id: str = ""
-    endpoint: str = ""
 
 
 @dataclass(frozen=True)
@@ -51,4 +43,4 @@ class VisionOutcome:
     phase_reason: str = ""
 
 
-__all__ = ["VisionOutcome", "VisionSettings", "VisionStatus"]
+__all__ = ["VisionOutcome", "VisionStatus"]

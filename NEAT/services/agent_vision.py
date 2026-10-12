@@ -1,7 +1,8 @@
-"""Optional local visual review of real, bounded scientific previews.
+"""Optional OpenAI visual review of real, bounded scientific previews.
 
 This module never applies a proposal to NEAT's fitting controls. The model sees
-PNG previews only through an explicitly configured loopback endpoint.
+PNG previews only after explicit per-run consent, using the same Agent model
+configuration and credential as the read-only planner.
 """
 
 from __future__ import annotations
@@ -10,15 +11,10 @@ import asyncio
 import base64
 import json
 import math
-import os
-import re
 import time
-from dataclasses import asdict
 from io import BytesIO
-from pathlib import Path
 from threading import Lock
 from typing import Callable, Mapping, Protocol, cast
-from urllib.parse import urlparse
 
 import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -26,8 +22,9 @@ from matplotlib.figure import Figure
 from PIL import Image, ImageDraw
 
 from ..core import PHASE_DATA, calculate_theoretical_bragg_edges
+from ..domain.agent_model import AgentModelMode, AgentModelSettings
 from ..domain.agent_preflight import PreflightResult
-from ..domain.agent_vision import VisionOutcome, VisionSettings, VisionStatus
+from ..domain.agent_vision import VisionOutcome, VisionStatus
 from ..domain.observation import (
     DatasetMode,
     ObservationStatus,
@@ -40,6 +37,7 @@ from .scientific_observation import (
     get_roi_spectrum,
     render_spectrum_preview,
 )
+from .agent_model import validate_agent_settings
 
 MAX_VISION_FRAMES = 3
 MAX_VISION_PHASES = 3
@@ -52,15 +50,14 @@ VISION_TOTAL_SECONDS = 150.0
 MIN_ROI_WIDTH = 3
 MAX_ROI_WIDTH = 128
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
 
 
 class VisionError(ValueError):
-    """The local model or its proposal could not be trusted for this review."""
+    """The model or its proposal could not be trusted for this review."""
 
 
 class VisionUnavailable(VisionError):
-    """A compatible configured local vision service is unavailable."""
+    """The configured OpenAI visual review service is unavailable."""
 
 
 class VisionCancelled(VisionError):
@@ -81,93 +78,34 @@ class VisionInspector(Protocol):
     def cancel(self) -> None: ...
 
 
-def validate_vision_settings(settings: VisionSettings) -> VisionSettings:
-    if not isinstance(settings, VisionSettings):
-        raise ValueError("Local vision settings are malformed.")
-    if not _MODEL_ID.fullmatch(settings.model_id):
-        raise ValueError("Enter an exact local vision model ID.")
-    parsed = urlparse(settings.endpoint.strip().rstrip("/"))
-    if (
-        parsed.scheme != "http"
-        or parsed.hostname not in {"127.0.0.1", "::1"}
-        or parsed.username
-        or parsed.password
-        or parsed.query
-        or parsed.fragment
-        or parsed.path not in {"", "/v1"}
-    ):
-        raise ValueError(
-            "Vision endpoint must be an explicit numeric loopback HTTP URL, optionally ending in /v1."
-        )
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("Vision endpoint port is invalid.") from exc
-    if port is None or port <= 0:
-        raise ValueError("Vision endpoint requires a port.")
-    return VisionSettings(settings.model_id, settings.endpoint.strip().rstrip("/"))
-
-
-def default_vision_settings_path() -> Path:
-    base = os.environ.get("LOCALAPPDATA", "").strip()
-    return (
-        (Path(base) if base else Path.home() / ".local" / "share")
-        / "NEAT"
-        / "agent_vision_settings.json"
-    )
-
-
-class VisionSettingsRepository:
-    """Separate, non-secret local-vision configuration."""
-
-    def __init__(self, path: Path | None = None) -> None:
-        self.path = Path(path or default_vision_settings_path())
-
-    def load(self) -> VisionSettings:
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-            if (
-                set(raw) != {"schema_version", "model_id", "endpoint"}
-                or raw["schema_version"] != 1
-            ):
-                return VisionSettings()
-            return validate_vision_settings(
-                VisionSettings(raw["model_id"], raw["endpoint"])
-            )
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return VisionSettings()
-
-    def save(self, settings: VisionSettings) -> None:
-        selected = validate_vision_settings(settings)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps({"schema_version": 1, **asdict(selected)}, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(self.path)
-
-    def clear(self) -> None:
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
-
-
 def _bounded_png(data: bytes) -> None:
     if (
         not isinstance(data, bytes)
         or not data.startswith(PNG_SIGNATURE)
         or not 0 < len(data) <= MAX_VISION_PNG_BYTES
     ):
-        raise VisionError("A local vision input is not a bounded PNG preview.")
+        raise VisionError("A visual input is not a bounded PNG preview.")
 
 
-class LocalVisionInspector:
-    """OpenAI-compatible multimodal chat adapter; no cloud URL or credential path."""
+class OpenAIVisionInspector:
+    """Bounded OpenAI multimodal adapter sharing Agent model and credentials."""
 
-    def __init__(self, settings: VisionSettings) -> None:
-        self.settings = validate_vision_settings(settings)
+    def __init__(
+        self,
+        settings: AgentModelSettings,
+        *,
+        api_key: str | None,
+        cloud_egress_authorized: bool,
+    ) -> None:
+        selected = validate_agent_settings(settings)
+        if selected.mode is not AgentModelMode.OPENAI_CLOUD:
+            raise VisionUnavailable("Visual review requires the configured OpenAI model.")
+        if not cloud_egress_authorized:
+            raise VisionUnavailable("Preview transmission was not approved for this run.")
+        if not api_key:
+            raise VisionUnavailable("No Agent-specific OpenAI key is configured.")
+        self.settings = selected
+        self._api_key: str | None = api_key
         self._started = time.monotonic()
         self._cancelled = False
         self._lock = Lock()
@@ -217,8 +155,9 @@ class LocalVisionInspector:
                 {"role": "user", "content": content},
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": 700,
+            "max_completion_tokens": 700,
             "stream": False,
+            "store": False,
         }
         if (
             len(json.dumps(body, ensure_ascii=True).encode("ascii"))
@@ -229,11 +168,10 @@ class LocalVisionInspector:
             import httpx
         except ImportError as exc:
             raise VisionUnavailable(
-                "Local vision requires the optional agent-llm dependency."
+                "OpenAI visual review requires the optional agent-llm dependency."
             ) from exc
 
         async def send() -> bytes:
-            # The endpoint was restricted to a numeric loopback address above.
             client = httpx.AsyncClient(
                 timeout=VISION_REQUEST_TIMEOUT_SECONDS,
                 follow_redirects=False,
@@ -257,13 +195,17 @@ class LocalVisionInspector:
             try:
                 async with client.stream(
                     "POST",
-                    self.settings.endpoint + "/chat/completions",
+                    "https://api.openai.com/v1/chat/completions",
                     json=body,
-                    headers={"Content-Type": "application/json"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {self._api_key}",
+                    },
                 ) as response:
                     if response.status_code != 200:
                         raise VisionUnavailable(
-                            "Local vision server rejected the multimodal request."
+                            f"OpenAI rejected the visual-review request (HTTP {response.status_code})."
                         )
                     length = response.headers.get("content-length", "")
                     if length.isdecimal() and int(length) > MAX_VISION_RESPONSE_BYTES:
@@ -291,12 +233,12 @@ class LocalVisionInspector:
         except asyncio.CancelledError as exc:
             raise VisionCancelled("Visual review stopped.") from exc
         except asyncio.TimeoutError as exc:
-            raise VisionUnavailable("Local vision request timed out.") from exc
+            raise VisionUnavailable("OpenAI visual-review request timed out.") from exc
         except (VisionError, VisionUnavailable):
             raise
         except Exception as exc:
             raise VisionUnavailable(
-                "Local vision server did not return a usable response."
+                "OpenAI did not return a usable visual-review response."
             ) from exc
         try:
             envelope = json.loads(raw)
@@ -312,10 +254,10 @@ class LocalVisionInspector:
             json.JSONDecodeError,
         ) as exc:
             raise VisionError(
-                "Local model did not return compatible JSON vision output."
+                "OpenAI model did not return compatible JSON vision output."
             ) from exc
         if not isinstance(result, dict):
-            raise VisionError("Local model returned a non-object response.")
+            raise VisionError("OpenAI model returned a non-object response.")
         return result
 
     def cancel(self) -> None:
@@ -327,6 +269,10 @@ class LocalVisionInspector:
                 cancel_request()
             except RuntimeError:
                 pass
+
+    def release_credential(self) -> None:
+        """Drop the only retained credential reference after the run ends."""
+        self._api_key = None
 
 
 def _text(value: object, label: str) -> str:
@@ -514,7 +460,7 @@ def run_visual_rehearsal(
         or not preflight.frames
     ):
         raise VisionUnavailable(
-            "Image-stack previews are required for local visual review."
+            "Image-stack previews are required for visual review."
         )
     if dataset.wavelength_axis_status is not WavelengthAxisStatus.VALID:
         raise VisionError(
@@ -562,7 +508,7 @@ def run_visual_rehearsal(
             handle.dataset_id,
             handle.revision,
             VisionStatus.NEEDS_REVIEW,
-            "Local vision could not select a usable sample ROI; review the frames manually.",
+            "OpenAI visual review could not select a usable sample ROI; review the frames manually.",
             roi_reason=_text(response["reason"], "ROI reason"),
             confidence="low",
             ambiguity_flags=_texts(response["ambiguity_flags"], "ROI ambiguity", 4),
@@ -694,7 +640,7 @@ def run_visual_rehearsal(
             handle.dataset_id,
             handle.revision,
             VisionStatus.NEEDS_REVIEW,
-            "Local vision could not select a phase; review the actual evidence.",
+            "OpenAI visual review could not select a phase; review the actual evidence.",
             roi,
             roi_reason,
             confidence,
@@ -777,9 +723,8 @@ def run_visual_rehearsal(
 
 
 __all__ = [
-    "LocalVisionInspector",
+    "OpenAIVisionInspector",
     "VisionInspector",
-    "VisionSettingsRepository",
     "VisionError",
     "VisionUnavailable",
     "VisionCancelled",
@@ -788,5 +733,4 @@ __all__ = [
     "render_phase_overlay",
     "render_roi_overlay",
     "trusted_phase_edges",
-    "validate_vision_settings",
 ]

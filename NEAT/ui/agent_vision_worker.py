@@ -1,4 +1,4 @@
-"""Tracked, cancellable Qt worker for optional local visual review."""
+"""Tracked, cancellable Qt worker for consent-gated OpenAI visual review."""
 
 from __future__ import annotations
 
@@ -6,10 +6,11 @@ from threading import Event, Lock
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from ..domain.agent_model import AgentModelSettings
 from ..domain.agent_preflight import PreflightResult
-from ..domain.agent_vision import VisionOutcome, VisionSettings, VisionStatus
+from ..domain.agent_vision import VisionOutcome, VisionStatus
 from ..services.agent_vision import (
-    LocalVisionInspector,
+    OpenAIVisionInspector,
     VisionCancelled,
     VisionError,
     VisionInspector,
@@ -17,6 +18,7 @@ from ..services.agent_vision import (
     VisionUnavailable,
     run_visual_rehearsal,
 )
+from ..services.agent_model import AgentCredentialResolver
 from ..services.scientific_observation import ScientificDatasetHandle
 
 
@@ -31,8 +33,10 @@ class VisionWorker(QThread):
         run_id: str,
         handle: ScientificDatasetHandle,
         preflight: PreflightResult,
-        settings: VisionSettings,
+        settings: AgentModelSettings,
         *,
+        credential_resolver: AgentCredentialResolver | None = None,
+        cloud_egress_authorized: bool = False,
         inspector: VisionInspector | None = None,
         parent=None,
     ) -> None:
@@ -43,6 +47,8 @@ class VisionWorker(QThread):
         self._handle: ScientificDatasetHandle | None = handle
         self._preflight: PreflightResult | None = preflight
         self._settings = settings
+        self._credential_resolver = credential_resolver
+        self._cloud_egress_authorized = cloud_egress_authorized
         self._inspector: VisionInspector | None = inspector
         self._cancel = Event()
         self._lock = Lock()
@@ -64,7 +70,19 @@ class VisionWorker(QThread):
                 raise VisionCancelled("Visual review stopped.")
             with self._lock:
                 if self._inspector is None:
-                    self._inspector = LocalVisionInspector(self._settings)
+                    if not self._cloud_egress_authorized:
+                        raise VisionUnavailable(
+                            "Preview transmission was not approved for this run."
+                        )
+                    if self._credential_resolver is None:
+                        raise VisionUnavailable(
+                            "The Agent OpenAI credential is unavailable."
+                        )
+                    self._inspector = OpenAIVisionInspector(
+                        self._settings,
+                        api_key=self._credential_resolver.get(),
+                        cloud_egress_authorized=self._cloud_egress_authorized,
+                    )
                 inspector = self._inspector
             if self._cancel.is_set():
                 inspector.cancel()
@@ -85,7 +103,7 @@ class VisionWorker(QThread):
                 self.dataset_id,
                 self.revision,
                 VisionStatus.CANCELLED,
-                "Local visual review stopped.",
+                "OpenAI visual review stopped.",
             )
         except VisionStale:
             outcome = VisionOutcome(
@@ -93,7 +111,7 @@ class VisionWorker(QThread):
                 self.dataset_id,
                 self.revision,
                 VisionStatus.STALE,
-                "Dataset changed during local visual review.",
+                "Dataset changed during OpenAI visual review.",
             )
         except VisionUnavailable:
             outcome = VisionOutcome(
@@ -101,7 +119,7 @@ class VisionWorker(QThread):
                 self.dataset_id,
                 self.revision,
                 VisionStatus.UNAVAILABLE,
-                "Local vision service is unavailable or incompatible.",
+                "OpenAI visual review is unavailable or incompatible.",
             )
         except VisionError:
             outcome = VisionOutcome(
@@ -109,7 +127,7 @@ class VisionWorker(QThread):
                 self.dataset_id,
                 self.revision,
                 VisionStatus.BLOCKED,
-                "Local visual proposal or evidence failed validation.",
+                "OpenAI visual proposal or evidence failed validation.",
             )
         except Exception:  # noqa: BLE001 - contain worker failure without leaking model payloads
             outcome = VisionOutcome(
@@ -117,13 +135,18 @@ class VisionWorker(QThread):
                 self.dataset_id,
                 self.revision,
                 VisionStatus.BLOCKED,
-                "Local visual review failed safely.",
+                "OpenAI visual review failed safely.",
             )
         finally:
             self._handle = None
             self._preflight = None
             with self._lock:
+                inspector = self._inspector
                 self._inspector = None
+            release_credential = getattr(inspector, "release_credential", None)
+            if callable(release_credential):
+                release_credential()
+            self._credential_resolver = None
         self.completed.emit(outcome)
 
 
