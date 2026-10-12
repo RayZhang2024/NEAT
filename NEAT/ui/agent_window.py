@@ -339,8 +339,9 @@ class AgentWindow(QMainWindow):
         self.stop_button.setEnabled(
             self._can_stop_active_run() and not self._parent_closing
         )
-        if not self._can_stop_active_run():
-            self.stop_button.setText("Stop")
+        self.stop_button.setText(
+            "Stopping…" if active and self._cancellation_requested else "Stop"
+        )
 
     def _update_model_readiness(self) -> None:
         settings = self._agent_settings
@@ -585,14 +586,12 @@ class AgentWindow(QMainWindow):
             lambda rid=run_id, current=worker: self._on_worker_finished(rid, current),
             current_attribute="agent_preflight_worker",
         )
-        self.start_autonomous_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.stop_button.setText("Stop")
         self._set_status(
             "Checking the dataset. Planning will follow after the evidence and permissions are checked."
             if _agent_run_id is not None
             else "Checking the dataset locally. No model or network request is used."
         )
+        self._update_controls()
         self._revision_timer.start()
         worker.start()
 
@@ -784,6 +783,7 @@ class AgentWindow(QMainWindow):
             f"Preflight is current. The {planner} is preparing a read-only proposal."
         )
         self._set_status("Preflight complete — planning is advancing automatically.")
+        self._update_controls()
         worker.start()
 
     def _on_planning_progress(

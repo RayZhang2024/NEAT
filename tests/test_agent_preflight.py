@@ -149,6 +149,9 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(self.host.selected_area, old_roi)
         self.assertEqual(self.host.scientific_observation_api.revision_clock.current(), old_revision)
         self._wait_for(lambda: self.window._worker is None)
+        self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+        self.assertFalse(self.window.stop_button.isVisible())
+        self.assertFalse(self.window.progress_bar.isVisible())
 
     def test_agent_entry_is_independent_and_reuses_hidden_window(self):
         menu = self.host.menuBar()
@@ -549,6 +552,43 @@ class AgentPreflightTests(unittest.TestCase):
             self.assertIsNone(self.window.result)
             self.assertIn("cancelled", self.window.status_label.text().lower())
 
+    def test_preflight_controls_are_visible_until_cancelled_worker_retires(self):
+        import NEAT.ui.agent_preflight_worker as worker_module
+
+        entered = threading.Event()
+        release = threading.Event()
+        original = worker_module.get_image_preview
+
+        def paused_preview(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release preflight")
+            return original(*args, **kwargs)
+
+        with patch.object(worker_module, "get_image_preview", side_effect=paused_preview):
+            try:
+                self.window.start_autonomous_button.click()
+                self.assertTrue(self.window.stop_button.isVisible())
+                self.assertTrue(self.window.stop_button.isEnabled())
+                self.assertTrue(self.window.progress_bar.isVisible())
+                self.assertFalse(self.window.start_autonomous_button.isEnabled())
+                self.assertTrue(entered.wait(2))
+
+                self.window.stop_button.click()
+                self.assertTrue(self.window.stop_button.isVisible())
+                self.assertFalse(self.window.stop_button.isEnabled())
+                self.assertEqual(self.window.stop_button.text(), "Stopping…")
+                self.assertTrue(self.window.progress_bar.isVisible())
+                self.assertFalse(self.window.start_autonomous_button.isEnabled())
+            finally:
+                release.set()
+            self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+
+        self.assertFalse(self.window.stop_button.isVisible())
+        self.assertFalse(self.window.progress_bar.isVisible())
+        self.assertTrue(self.window.start_autonomous_button.isEnabled())
+        self.assertEqual(self.window._stage, "cancelled")
+
     def test_cancel_before_worker_start_returns_no_evidence(self):
         handle = self.host.scientific_observation_api.capture_dataset()
         roi = self.host.scientific_observation_api.capture_selected_roi(handle)
@@ -658,6 +698,8 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIn("propose_read_only_plan", outcome.transitions)
         self.assertEqual(outcome.transitions[-1], "terminal")
         self.assertTrue(self.window.start_autonomous_button.isEnabled())
+        self.assertFalse(self.window.stop_button.isVisible())
+        self.assertFalse(self.window.progress_bar.isVisible())
         self.assertEqual(self.window.splitter.count(), 2)
         self.assertTrue(self.window.overview_panel.isVisible())
         self.assertTrue(self.window.evidence_panel.isVisible())
@@ -791,6 +833,47 @@ class AgentPreflightTests(unittest.TestCase):
             self._wait_for(lambda: self.window._planning_worker is None)
             self.assertEqual(self.window._planning_outcome.status, PlanningStatus.CANCELLED)
             self.assertIsNone(self.window._main_window.agent_planning_worker)
+
+    def test_planning_controls_are_visible_until_cancelled_worker_retires(self):
+        import NEAT.ui.agent_planning_worker as worker_module
+        from NEAT.services.agent_planning import PlanningCancelled
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def paused_planning(context, *, cancelled=None, **_kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release planning")
+            if cancelled is not None and cancelled():
+                raise PlanningCancelled("stopped")
+            raise RuntimeError("planning was expected to be cancelled")
+
+        with patch.object(worker_module, "run_planning", side_effect=paused_planning):
+            try:
+                self.window.start_autonomous_button.click()
+                self._wait_for(
+                    lambda: entered.is_set() and self.window._planning_worker is not None
+                )
+                self.assertTrue(self.window.stop_button.isVisible())
+                self.assertTrue(self.window.stop_button.isEnabled())
+                self.assertTrue(self.window.progress_bar.isVisible())
+                self.assertGreaterEqual(self.window.progress_bar.value(), 90)
+                self.assertFalse(self.window.start_autonomous_button.isEnabled())
+
+                self.window.stop_button.click()
+                self.assertTrue(self.window.stop_button.isVisible())
+                self.assertFalse(self.window.stop_button.isEnabled())
+                self.assertEqual(self.window.stop_button.text(), "Stopping…")
+                self.assertTrue(self.window.progress_bar.isVisible())
+            finally:
+                release.set()
+            self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+
+        self.assertFalse(self.window.stop_button.isVisible())
+        self.assertFalse(self.window.progress_bar.isVisible())
+        self.assertTrue(self.window.start_autonomous_button.isEnabled())
+        self.assertEqual(self.window._stage, "cancelled")
 
     def test_one_click_reports_optional_planning_unavailable_after_preflight(self):
         import NEAT.ui.agent_planning_worker as worker_module
