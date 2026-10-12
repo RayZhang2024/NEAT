@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..domain.agent_model import AgentModelMode, AgentModelSettings
+from ..domain.agent_vision import VisionSettings
 from ..services.agent_model import (
     AgentCredentialResolver,
     AgentKeyringCredentialStore,
@@ -26,6 +27,7 @@ from ..services.agent_model import (
     run_model_connection_test,
     validate_agent_settings,
 )
+from ..services.agent_vision import VisionSettingsRepository, validate_vision_settings
 
 
 class AgentModelConnectionWorker(QThread):
@@ -89,6 +91,7 @@ class AgentModelSettingsDialog(QDialog):
         *,
         main_window=None,
         settings_repository: AgentModelSettingsRepository | None = None,
+        vision_settings_repository: VisionSettingsRepository | None = None,
         credential_store=None,
         connection_worker_class=AgentModelConnectionWorker,
     ) -> None:
@@ -96,6 +99,7 @@ class AgentModelSettingsDialog(QDialog):
         self.setWindowTitle("NEAT AI Agent Settings")
         self.setMinimumWidth(520)
         self.settings_repository = settings_repository or AgentModelSettingsRepository()
+        self.vision_settings_repository = vision_settings_repository or VisionSettingsRepository()
         self.credential_store = credential_store or AgentKeyringCredentialStore()
         self.connection_worker_class = connection_worker_class
         self.main_window = main_window
@@ -138,16 +142,31 @@ class AgentModelSettingsDialog(QDialog):
         )
         self.environment_checkbox.setChecked(loaded.allow_environment_credential)
         form.addRow("Credential lookup", self.environment_checkbox)
+        vision = self.vision_settings_repository.load()
+        self.vision_model_edit = QLineEdit(vision.model_id, self)
+        self.vision_model_edit.setPlaceholderText("Exact local vision-capable model ID")
+        form.addRow("Local vision model", self.vision_model_edit)
+        self.vision_endpoint_edit = QLineEdit(vision.endpoint, self)
+        self.vision_endpoint_edit.setPlaceholderText("http://127.0.0.1:11434/v1")
+        form.addRow("Local vision endpoint", self.vision_endpoint_edit)
         layout.addLayout(form)
 
         self.privacy_label = QLabel(
-            "Model requests are one-shot, metadata-only, and limited to one request "
+            "M4 planning requests are one-shot, metadata-only, and limited to one request "
             "per analysis run. Local mode accepts only loopback endpoints and does "
             "not use proxy settings.",
             self,
         )
         self.privacy_label.setWordWrap(True)
         layout.addWidget(self.privacy_label)
+        vision_privacy = QLabel(
+            "Local visual review is off for every new run until you opt in in the Agent window. "
+            "When enabled, bounded image and spectrum PNG previews go only to the configured "
+            "numeric loopback endpoint. Cloud planning permission never permits image transfer.",
+            self,
+        )
+        vision_privacy.setWordWrap(True)
+        layout.addWidget(vision_privacy)
         self.status_label = QLabel("No connection is tested automatically.", self)
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -208,6 +227,12 @@ class AgentModelSettingsDialog(QDialog):
     def save_and_accept(self) -> None:
         try:
             settings = self.selected_settings()
+            vision = VisionSettings(
+                self.vision_model_edit.text().strip(),
+                self.vision_endpoint_edit.text().strip(),
+            )
+            if vision.model_id or vision.endpoint:
+                vision = validate_vision_settings(vision)
             pending_key = self.key_edit.text().strip()
             if pending_key:
                 if settings.mode is not AgentModelMode.OPENAI_CLOUD:
@@ -217,6 +242,10 @@ class AgentModelSettingsDialog(QDialog):
                     return
                 self.credential_store.set(pending_key)
             self.settings_repository.save(settings)
+            if vision.model_id:
+                self.vision_settings_repository.save(vision)
+            else:
+                self.vision_settings_repository.clear()
         except (ValueError, RuntimeError) as exc:
             self.status_label.setText(str(exc))
             return

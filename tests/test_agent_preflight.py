@@ -35,6 +35,7 @@ from NEAT.domain.agent_model import (
 )
 from NEAT.domain.agent_planning import PlanningOutcome, PlanningStatus
 from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
+from NEAT.domain.agent_vision import VisionSettings, VisionStatus
 from NEAT.domain.observation import DatasetMode
 from NEAT.ui.agent_model_settings_dialog import (
     AgentModelConnectionWorker,
@@ -94,7 +95,7 @@ class AgentPreflightTests(unittest.TestCase):
         self.window.show()
 
     def tearDown(self):
-        for worker in (self.window._worker, self.window._planning_worker):
+        for worker in (self.window._worker, self.window._planning_worker, self.window._vision_worker):
             if worker is not None:
                 worker.stop()
                 worker.wait(5000)
@@ -710,6 +711,134 @@ class AgentPreflightTests(unittest.TestCase):
                 "Plan prepared — scientific execution is not yet implemented",
                 self.window.plan_text.toPlainText(),
             )
+
+    def _configure_synthetic_vision_dataset(self):
+        wavelengths = np.linspace(1.0, 5.0, 32)
+        self.host.images = []
+        for wavelength in wavelengths:
+            frame = np.zeros((64, 64), dtype=float)
+            frame[18:50, 16:52] = 20 + (wavelength >= 2.4) * 3
+            self.host.images.append(frame)
+        self.host.wavelengths = wavelengths
+        self.host.selected_area = None
+        self.window._vision_settings = VisionSettings("mock-vision", "http://127.0.0.1:11434/v1")
+        self.window.vision_checkbox.setChecked(True)
+
+    def test_local_visual_review_bootstraps_missing_roi_without_changing_fitting_tab(self):
+        from test_agent_vision import FakeVision
+        import NEAT.ui.agent_vision_worker as worker_module
+
+        self._configure_synthetic_vision_dataset()
+        source_images = self.host.images
+        with patch.object(worker_module, "LocalVisionInspector", return_value=FakeVision()):
+            self.window.start_autonomous_analysis()
+            self._wait_for(lambda: self.window._vision_outcome is not None and self.window._vision_worker is None)
+            self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+        outcome = self.window._vision_outcome
+        self.assertEqual(outcome.status, VisionStatus.NEEDS_REVIEW)
+        self.assertEqual(outcome.phase_id, "Fe_bcc")
+        self.assertIsNone(self.window._planning_outcome)
+        self.assertIs(self.host.images, source_images)
+        self.assertIsNone(self.host.selected_area)
+        self.assertTrue(self.window.adjust_roi_button.isVisible())
+        self.assertIn("No fit, mapping", self.window.plan_text.toPlainText())
+        self.assertFalse(self.window.stop_button.isVisible())
+        self.assertFalse(self.window.progress_bar.isVisible())
+        self.window.roi_edits[0].setValue(19)
+        self.window.adjust_roi_button.click()
+        self.assertIsNone(self.window._vision_outcome)
+        self.assertIn("earlier spectrum and phase hypothesis no longer describe this ROI", self.window.plan_text.toPlainText())
+        self.assertIsNone(self.host.selected_area)
+        self.window.reject_visual_proposal()
+        self.assertIsNone(self.window._vision_outcome)
+        self.assertIn("rejected", self.window.status_label.text().lower())
+
+    def test_stop_after_vision_computation_before_queued_completion_discards_result(self):
+        from test_agent_vision import FakeVision
+        import NEAT.ui.agent_vision_worker as worker_module
+
+        self._configure_synthetic_vision_dataset()
+        with patch.object(worker_module, "LocalVisionInspector", return_value=FakeVision()):
+            self.window.start_autonomous_analysis()
+            self._wait_for(lambda: self.window._vision_worker is not None)
+            worker = self.window._vision_worker
+            self.assertTrue(worker.wait(5000))
+            self.assertIsNone(self.window._vision_outcome)
+            self.window.stop_active_run()
+            self._wait_for(lambda: self.window._vision_worker is None)
+            self.assertIsNone(self.window._vision_outcome)
+            self.assertEqual(self.window._stage, "cancelled")
+            self.assertNotIn("Provisional phase", self.window.plan_text.toPlainText())
+            self.assertTrue(self.window.start_autonomous_button.isEnabled())
+
+    def test_local_vision_stop_and_retirement_keep_controls_visible(self):
+        from test_agent_vision import FakeVision
+        import NEAT.ui.agent_vision_worker as worker_module
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingVision(FakeVision):
+            def inspect(self, stage, images, prompt):
+                if stage == "sample_roi":
+                    entered.set()
+                    release.wait(5)
+                return super().inspect(stage, images, prompt)
+
+            def cancel(self):
+                super().cancel()
+                release.set()
+
+        self._configure_synthetic_vision_dataset()
+        with patch.object(worker_module, "LocalVisionInspector", return_value=BlockingVision()):
+            self.window.start_autonomous_analysis()
+            self._wait_for(entered.is_set)
+            self.assertTrue(self.window.stop_button.isVisible())
+            self.assertTrue(self.window.progress_bar.isVisible())
+            self.window.stop_active_run()
+            self.assertIn("Stopping", self.window.stop_button.text())
+            self.assertFalse(self.window.start_autonomous_button.isEnabled())
+            release.set()
+            self._wait_for(lambda: self.window._vision_worker is None and not self.host._shutdown_worker_inventory.workers)
+            self.assertIsNone(self.window._vision_outcome)
+            self.assertTrue(self.window.start_autonomous_button.isEnabled())
+
+    def test_missing_local_vision_configuration_is_explicit_and_does_not_call_cloud(self):
+        self._configure_synthetic_vision_dataset()
+        self.window._vision_settings = VisionSettings()
+        self.window._agent_settings = AgentModelSettings(mode=AgentModelMode.OPENAI_CLOUD, model_id="gpt-test")
+        with patch("NEAT.ui.agent_window.PlanningWorker", side_effect=AssertionError("cloud planner started")):
+            self.window.start_autonomous_analysis()
+            self._wait_for(lambda: self.window._stage == VisionStatus.UNAVAILABLE.value)
+        self.assertIn("unavailable", self.window.status_label.text().lower())
+        self.assertIsNone(self.window._planning_worker)
+        self.assertIsNone(self.window._vision_worker)
+
+    def test_parent_shutdown_retires_active_visual_worker(self):
+        from test_agent_vision import FakeVision
+        import NEAT.ui.agent_vision_worker as worker_module
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingVision(FakeVision):
+            def inspect(self, stage, images, prompt):
+                if stage == "sample_roi":
+                    entered.set()
+                    release.wait(5)
+                return super().inspect(stage, images, prompt)
+
+            def cancel(self):
+                release.set()
+
+        self._configure_synthetic_vision_dataset()
+        with patch.object(worker_module, "LocalVisionInspector", return_value=BlockingVision()):
+            self.window.start_autonomous_analysis()
+            self._wait_for(entered.is_set)
+            self.assertFalse(self.host.close())
+            release.set()
+            self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+            self.assertIsNone(self.window._vision_worker)
 
     def test_manual_preflight_and_autonomous_start_cannot_overlap(self):
         import NEAT.ui.agent_preflight_worker as worker_module
