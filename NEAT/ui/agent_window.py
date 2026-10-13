@@ -8,10 +8,10 @@ from uuid import uuid4
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
-    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -19,6 +19,8 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
+    QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -32,6 +34,7 @@ from ..domain.agent_model import (
 )
 from ..domain.agent_planning import (
     PlanningContext,
+    PlanningErrorCode,
     PlanningObjective,
     PlanningOutcome,
     PlanningStatus,
@@ -44,13 +47,20 @@ from ..domain.agent_preflight import (
     PreflightResult,
     PreflightRunState,
 )
-from ..domain.observation import DatasetMode, RoiBounds
+from ..domain.agent_vision import VisionOutcome, VisionStatus
+from ..domain.observation import (
+    DatasetMode,
+    ObservationStatus,
+    RoiBounds,
+    WavelengthAxisStatus,
+)
 from ..services.agent_model import (
     AgentCredentialResolver,
     AgentKeyringCredentialStore,
     AgentModelSettingsRepository,
     canonical_payload_for_context,
 )
+from ..services.agent_vision import render_roi_overlay
 from ..services.scientific_observation import (
     DatasetUnavailableError,
     ObservationErrorBase,
@@ -58,6 +68,7 @@ from ..services.scientific_observation import (
 from .agent_model_settings_dialog import AgentModelSettingsDialog
 from .agent_planning_worker import PlanningWorker
 from .agent_preflight_worker import PreflightWorker
+from .agent_vision_worker import VisionWorker
 
 
 class AgentWindow(QMainWindow):
@@ -68,12 +79,19 @@ class AgentWindow(QMainWindow):
         self._main_window = main_window
         self._worker: PreflightWorker | None = None
         self._planning_worker: PlanningWorker | None = None
+        self._vision_worker: VisionWorker | None = None
         self._active_run_id: str | None = None
         self._agent_run_id: str | None = None
         self._stage = "idle"
         self._dataset_token: tuple[str, int] | None = None
         self._result: PreflightResult | None = None
         self._planning_outcome: PlanningOutcome | None = None
+        self._planning_display_text = ""
+        self._vision_outcome: VisionOutcome | None = None
+        self._pending_vision_result: PreflightResult | None = None
+        self._vision_run_enabled = False
+        self._adjusted_roi: RoiBounds | None = None
+        self._adjusted_roi_dataset_token: tuple[str, int] | None = None
         self._stale = False
         self._parent_closing = False
         self._preflight_completion_received = False
@@ -85,31 +103,44 @@ class AgentWindow(QMainWindow):
         self._run_snapshot: AgentRunSnapshot | None = None
         self._run_credential_resolver: AgentCredentialResolver | None = None
 
-        self.setWindowTitle("NEAT AI Agent — Autonomous Analysis (M4)")
+        self.setWindowTitle("NEAT AI Agent — Visual Review (M5A-1)")
         self.setMinimumSize(820, 520)
-        self.resize(1000, 720)
+        self.resize(1280, 820)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
 
         self.splitter = QSplitter(Qt.Horizontal, self)
         self.splitter.setObjectName("preflightOverviewEvidenceSplitter")
         self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(10)
+        self.splitter.setOpaqueResize(True)
+        self.splitter.setAccessibleName("Adjustable divider between Overview and Visual Evidence")
+        self.splitter.setToolTip("Drag the divider to resize Overview and Visual Evidence.")
+        self.splitter.setStyleSheet(
+            "QSplitter::handle:horizontal { background: #c5cbd3; border: 1px solid #aab2bc; }"
+            "QSplitter::handle:horizontal:hover { background: #7b9fc8; }"
+        )
         self.setCentralWidget(self.splitter)
 
         self.overview_scroll = QScrollArea(self.splitter)
         self.overview_scroll.setWidgetResizable(True)
         self.overview_scroll.setFrameShape(QFrame.NoFrame)
+        self.overview_scroll.setMinimumWidth(0)
+        self.overview_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.overview_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.overview_scroll.setAccessibleName("Overview")
         self.overview_panel = QWidget(self.overview_scroll)
         self.overview_panel.setObjectName("preflightOverviewPanel")
+        self.overview_panel.setMinimumWidth(0)
+        self.overview_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         overview_layout = QVBoxLayout(self.overview_panel)
         overview_layout.setSpacing(6)
         overview_heading = QLabel("Overview", self.overview_panel)
         overview_heading.setStyleSheet("font-size: 15px; font-weight: bold;")
         overview_layout.addWidget(overview_heading)
-        title = QLabel("Prepare an analysis plan", self.overview_panel)
+        title = QLabel("Prepare a read-only analysis", self.overview_panel)
         overview_layout.addWidget(title)
         self.scope_label = QLabel(
-            "NEAT checks the current dataset and suggests next steps. This version stops before fitting or mapping.",
+            "NEAT checks the dataset, prepares a read-only plan when the required evidence is available, and reviews bounded visual evidence with the configured model. In OpenAI mode, pressing Start authorizes a metadata-only request when eligible and up to 7 bounded PNGs in 3 visual requests (up to 3 representative image previews, 1 spectrum plot, up to 3 phase overlays). Saving settings sends nothing. Model failures stop with a reason; no offline plan is substituted. No fitting or mapping is run.",
             self.overview_panel,
         )
         self.scope_label.setWordWrap(True)
@@ -122,24 +153,6 @@ class AgentWindow(QMainWindow):
         self.model_readiness_label.setWordWrap(True)
         self.model_readiness_label.setAccessibleName("Agent model readiness")
         overview_layout.addWidget(self.model_readiness_label)
-        self.cloud_consent_checkbox = QCheckBox(self.overview_panel)
-        self.cloud_consent_checkbox.setObjectName("agentRunCloudConsent")
-        self.cloud_consent_checkbox.setAccessibleName(
-            "Allow planning-summary transmission for this run"
-        )
-        self.cloud_consent_checkbox.setChecked(False)
-        self.cloud_consent_checkbox.setVisible(False)
-        overview_layout.addWidget(self.cloud_consent_checkbox)
-        self.fallback_checkbox = QCheckBox(
-            "Use the offline plan if the selected model fails",
-            self.overview_panel,
-        )
-        self.fallback_checkbox.setAccessibleName("Allow deterministic model fallback")
-        self.fallback_checkbox.setToolTip(
-            "If the model is unavailable or its proposal is rejected, prepare a validated offline plan instead."
-        )
-        self.fallback_checkbox.setChecked(False)
-        overview_layout.addWidget(self.fallback_checkbox)
         self.status_label = QLabel("No analysis has been started.", self.overview_panel)
         self.status_label.setAccessibleName("Preflight status")
         self.status_label.setWordWrap(True)
@@ -188,23 +201,47 @@ class AgentWindow(QMainWindow):
         self.dataset_summary_label.setAccessibleName("Dataset check summary")
         overview_layout.addWidget(self.dataset_summary_label)
 
-        plan_heading = QLabel("Suggested next steps — not executed", self.overview_panel)
+        plan_heading = QLabel("Plan and visual review", self.overview_panel)
         plan_heading.setStyleSheet("font-weight: bold;")
         overview_layout.addWidget(plan_heading)
         self.plan_text = QPlainTextEdit(self.overview_panel)
         self.plan_text.setReadOnly(True)
+        self.plan_text.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.plan_text.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.plan_text.setMinimumHeight(140)
-        self.plan_text.setMaximumHeight(220)
+        self.plan_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.plan_text.setAccessibleName("Read-only plan proposal")
         self.plan_text.setPlainText(
             "Start Autonomous Analysis to check the dataset and prepare a plan."
         )
         overview_layout.addWidget(self.plan_text)
+        roi_review = QGridLayout()
+        roi_review.setColumnStretch(0, 1)
+        roi_review.setColumnStretch(1, 1)
+        self.roi_review_label = QLabel("Review ROI (original pixels):", self.overview_panel)
+        roi_review.addWidget(self.roi_review_label, 0, 0, 1, 2)
+        self.roi_edits = tuple(QSpinBox(self.overview_panel) for _ in range(4))
+        for index, (edit, name) in enumerate(
+            zip(self.roi_edits, ("x min", "x max", "y min", "y max"))
+        ):
+            edit.setPrefix(name + " ")
+            edit.setRange(0, 100000)
+            roi_review.addWidget(edit, 1 + index // 2, index % 2)
+        self.adjust_roi_button = QPushButton("Preview adjusted ROI", self.overview_panel)
+        self.adjust_roi_button.clicked.connect(self.preview_adjusted_roi)
+        self.reject_vision_button = QPushButton("Reject visual proposal", self.overview_panel)
+        self.reject_vision_button.clicked.connect(self.reject_visual_proposal)
+        roi_review.addWidget(self.adjust_roi_button, 3, 0)
+        roi_review.addWidget(self.reject_vision_button, 3, 1)
+        overview_layout.addLayout(roi_review)
+        self._set_vision_review_visible(False)
 
         self.overview_scroll.setWidget(self.overview_panel)
 
         self.evidence_panel = QWidget(self.splitter)
         self.evidence_panel.setObjectName("preflightEvidencePanel")
+        self.evidence_panel.setMinimumWidth(0)
+        self.evidence_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         evidence_layout = QVBoxLayout(self.evidence_panel)
         evidence_heading = QLabel("Visual Evidence", self.evidence_panel)
         evidence_heading.setStyleSheet("font-size: 15px; font-weight: bold;")
@@ -216,17 +253,25 @@ class AgentWindow(QMainWindow):
         evidence_layout.addWidget(evidence_explanation)
         self.evidence_scroll = QScrollArea(self.evidence_panel)
         self.evidence_scroll.setWidgetResizable(True)
+        self.evidence_scroll.setMinimumWidth(0)
+        self.evidence_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.evidence_scroll.setAccessibleName("Visual evidence")
         self.evidence_content = QWidget(self.evidence_scroll)
         self.evidence_layout = QVBoxLayout(self.evidence_content)
         self.evidence_layout.setAlignment(Qt.AlignTop)
+        self._evidence_pixmaps: list[tuple[QLabel, QPixmap]] = []
         self.evidence_scroll.setWidget(self.evidence_content)
         evidence_layout.addWidget(self.evidence_scroll)
         self.splitter.addWidget(self.overview_scroll)
         self.splitter.addWidget(self.evidence_panel)
         self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 2)
-        self.splitter.setSizes([430, 570])
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([560, 720])
+        self.splitter.splitterMoved.connect(self._rescale_evidence_images)
+        self.splitter.handle(1).setCursor(Qt.SplitHCursor)
+        self.splitter.handle(1).setToolTip(
+            "Drag to give more space to Overview or Visual Evidence."
+        )
         self._show_evidence_message(
             "No measured evidence yet. Start Autonomous Analysis to review the dataset."
         )
@@ -245,6 +290,7 @@ class AgentWindow(QMainWindow):
         self.status_label.setText(message)
 
     def _clear_evidence(self) -> None:
+        self._evidence_pixmaps.clear()
         while self.evidence_layout.count():
             item = self.evidence_layout.takeAt(0)
             widget = item.widget()
@@ -255,7 +301,209 @@ class AgentWindow(QMainWindow):
         self._clear_evidence()
         label = QLabel(message, self.evidence_content)
         label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.evidence_layout.addWidget(label)
+
+    def _add_evidence_text(self, text: str) -> QLabel:
+        label = QLabel(text, self.evidence_content)
+        label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.evidence_layout.addWidget(label)
+        return label
+
+    def _set_vision_review_visible(self, visible: bool) -> None:
+        self.roi_review_label.setVisible(visible)
+        for edit in self.roi_edits:
+            edit.setVisible(visible)
+        self.adjust_roi_button.setVisible(visible)
+        self.reject_vision_button.setVisible(visible)
+
+    def _add_vision_png(self, caption: str, png: bytes | None) -> None:
+        caption_label = QLabel(caption, self.evidence_content)
+        caption_label.setWordWrap(True)
+        caption_label.setMinimumWidth(0)
+        self.evidence_layout.addWidget(caption_label)
+        if png is None:
+            return
+        pixmap = QPixmap()
+        if pixmap.loadFromData(png, "PNG"):
+            self._add_evidence_pixmap(caption, pixmap)
+
+    def _add_evidence_pixmap(self, accessible_name: str, pixmap: QPixmap) -> None:
+        label = QLabel(self.evidence_content)
+        label.setAccessibleName(accessible_name)
+        label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.evidence_layout.addWidget(label)
+        self._evidence_pixmaps.append((label, pixmap))
+        self._rescale_evidence_images()
+        QTimer.singleShot(0, self._rescale_evidence_images)
+
+    def _rescale_evidence_images(self, *_args) -> None:
+        if not hasattr(self, "_evidence_pixmaps"):
+            return
+        available_width = max(1, self.evidence_scroll.viewport().width() - 8)
+        for label, source in self._evidence_pixmaps:
+            width = min(available_width, source.width())
+            scaled = source.scaled(
+                width,
+                source.height(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            label.setPixmap(scaled)
+            label.setFixedSize(scaled.size())
+
+    def _render_vision_outcome(self, outcome: VisionOutcome) -> None:
+        roi = outcome.roi
+        if roi is None:
+            self.plan_text.setPlainText(
+                self._planning_display_text
+                + "\n\nOpenAI visual review\n"
+                + outcome.message
+                + "\nNo ROI was proposed. Review the available evidence manually."
+            )
+            return
+        self._set_vision_review_visible(True)
+        self.reject_vision_button.setText("Reject visual proposal")
+        if self._result is not None and self._result.roi is None:
+            self.dataset_summary_label.setText(
+                self.dataset_summary_label.text()
+                + "\nOpenAI visual review extracted the actual spectrum from a proposed ROI; "
+                "NEAT's selected fitting ROI remains unchanged."
+            )
+        for edit, value in zip(self.roi_edits, (roi.x_min, roi.x_max, roi.y_min, roi.y_max)):
+            edit.setValue(value)
+        review_heading = (
+            "OpenAI visual proposal — user review required; no settings applied"
+            if outcome.phase_id
+            else "OpenAI visual review — manual evidence review required; no settings applied"
+        )
+        lines = [
+            self._planning_display_text,
+            "",
+            review_heading,
+            f"Review status: {outcome.message}",
+            "Provider/model: OpenAI / "
+            + (
+                self._run_snapshot.settings.model_id
+                if self._run_snapshot is not None
+                else "configured Agent model"
+            ),
+            f"Dataset: {outcome.dataset_id} revision {outcome.revision}",
+            f"Original-pixel ROI: x[{roi.x_min},{roi.x_max}), y[{roi.y_min},{roi.y_max})",
+        ]
+        if outcome.confidence == "user-selected":
+            lines.extend((
+                "ROI source: user-adjusted by the user.",
+                "No image frames were sent for ROI selection in this run.",
+                outcome.roi_reason,
+            ))
+        else:
+            lines.extend((
+                f"Inspected frames: {', '.join(map(str, outcome.inspected_frames))}",
+                f"ROI confidence: {outcome.confidence}; visual reason: {outcome.roi_reason}",
+            ))
+        if outcome.ambiguity_flags:
+            lines.append("Image ambiguities: " + "; ".join(outcome.ambiguity_flags))
+        lines.append("Compared trusted overlays: " + (", ".join(outcome.inspected_phases) or "none"))
+        if outcome.phase_id:
+            lines.append(f"Provisional phase: {outcome.phase_id}")
+            lines.append(f"Visual reason: {outcome.phase_reason}")
+            for hkl, reason in zip(outcome.hkls, outcome.edge_reasons):
+                lines.append(f"Candidate edge {hkl}: {reason}")
+            if outcome.display_window is not None:
+                lines.append(
+                    "Review display interval (includes NEAT's default edge-fit flanks; not applied): "
+                    f"{outcome.display_window[0]:.6g}–{outcome.display_window[1]:.6g} Å"
+                )
+        else:
+            lines.append("No provisional phase or candidate-edge suggestion was accepted.")
+            if outcome.phase_reason:
+                lines.append(f"Validation/review note: {outcome.phase_reason}")
+        if outcome.alternatives:
+            lines.append("Other plausible candidates: " + ", ".join(outcome.alternatives))
+        if outcome.unresolved:
+            lines.append("Unresolved: " + "; ".join(outcome.unresolved))
+        if outcome.display_interval_diagnostic:
+            lines.append("Display interval check: " + outcome.display_interval_diagnostic)
+        lines.extend((
+            "Visual agreement is not crystallographic identification or proof of fit quality.",
+            "Physical d/strain interpretation still needs separate validation, including the legacy d_fit/factor-of-two caveat.",
+            "No fit, mapping, phase-table edit or fitting-tab change occurred.",
+        ))
+        self.plan_text.setPlainText("\n".join(lines))
+        self._clear_evidence()
+        self._add_vision_png("Actual frame with proposed ROI (yellow); image row zero at top.", outcome.roi_preview_png)
+        self._add_vision_png("Actual measured spectrum from proposed ROI; full source wavelength axis.", outcome.spectrum_png)
+        for phase, png in outcome.phase_overlays:
+            self._add_vision_png(f"Measured spectrum and NEAT theoretical dashed markers: {phase} (provisional).", png)
+        self.evidence_layout.addStretch()
+
+    def preview_adjusted_roi(self) -> None:
+        if self._result is None or not self._result.frames or self._vision_outcome is None or self._has_active_worker():
+            return
+        self._check_revision()
+        if self._stale:
+            return
+        roi = RoiBounds(
+            x_min=self.roi_edits[0].value(),
+            x_max=self.roi_edits[1].value(),
+            y_min=self.roi_edits[2].value(),
+            y_max=self.roi_edits[3].value(),
+        )
+        shape = self._result.dataset.image_shape
+        if shape is None or not (0 <= roi.x_min < roi.x_max <= shape[1] and 0 <= roi.y_min < roi.y_max <= shape[0]):
+            self._set_status("Adjusted ROI is outside the current image or empty.")
+            return
+        frame = self._result.frames[0].image
+        if frame.coordinate_mapping is None or frame.png_bytes is None:
+            self._set_status("Original image preview is unavailable.")
+            return
+        try:
+            png = render_roi_overlay(frame.png_bytes, frame.coordinate_mapping, roi)
+        except ValueError:
+            self._set_status("Adjusted ROI could not be previewed.")
+            return
+        self._adjusted_roi = roi
+        self._adjusted_roi_dataset_token = self._dataset_token
+        self._vision_outcome = None
+        self._clear_evidence()
+        self._add_vision_png("User-adjusted ROI on actual frame; the next run will extract a fresh spectrum.", png)
+        self.plan_text.setPlainText(
+            f"User-adjusted ROI x[{roi.x_min},{roi.x_max}), y[{roi.y_min},{roi.y_max}). "
+            "The earlier spectrum and phase hypothesis no longer describe this ROI. "
+            "No fitting setting was applied. Start Autonomous Analysis to reuse this ROI, "
+            "extract its spectrum again, and regenerate phase overlays and recommendations."
+        )
+        self._set_status("Adjusted ROI saved for the next visual review; earlier spectral findings were withdrawn.")
+        self._set_vision_review_visible(False)
+        self.reject_vision_button.setText("Discard adjusted ROI")
+        self.reject_vision_button.setVisible(True)
+
+    def _discard_adjusted_roi(self) -> None:
+        self._adjusted_roi = None
+        self._adjusted_roi_dataset_token = None
+
+    def reject_visual_proposal(self) -> None:
+        if self._has_active_worker():
+            return
+        had_adjusted_roi = self._adjusted_roi is not None
+        self._vision_outcome = None
+        self._discard_adjusted_roi()
+        self.reject_vision_button.setText("Reject visual proposal")
+        self._set_vision_review_visible(False)
+        message = (
+            "Adjusted ROI discarded. No fitting configuration was changed."
+            if had_adjusted_roi
+            else "Visual proposal rejected. No fitting configuration was changed."
+        )
+        self.plan_text.setPlainText(message)
+        self._show_evidence_message(message + " Start another run to review current evidence.")
+        self._set_status(message)
 
     def _check_revision(self) -> None:
         if self._dataset_token is None:
@@ -271,10 +519,17 @@ class AgentWindow(QMainWindow):
         self._stale = True
         self._result = None
         self._planning_outcome = None
+        self._planning_display_text = ""
+        self._vision_outcome = None
+        self._pending_vision_result = None
+        self._discard_adjusted_roi()
+        self._set_vision_review_visible(False)
         if self._worker is not None:
             self._worker.stop()
         if self._planning_worker is not None:
             self._planning_worker.stop()
+        if self._vision_worker is not None:
+            self._vision_worker.stop()
         self._stage = "stale"
         stale_message = (
             "Dataset changed — rerun autonomous analysis."
@@ -289,7 +544,7 @@ class AgentWindow(QMainWindow):
             if self._agent_run_id is not None
             else "Dataset changed — rerun preflight to see current evidence."
         )
-        if self._worker is None and self._planning_worker is None:
+        if self._worker is None and self._planning_worker is None and self._vision_worker is None:
             self._revision_timer.stop()
         self._update_controls()
 
@@ -299,14 +554,16 @@ class AgentWindow(QMainWindow):
             inventory is not None
             and any(
                 inventory.has_role(role)
-                for role in ("agent_preflight", "agent_planning")
+                for role in ("agent_preflight", "agent_planning", "agent_vision")
             )
         )
         return bool(
             self._worker is not None
             or self._planning_worker is not None
+            or self._vision_worker is not None
             or self._awaiting_preflight_completion
             or self._pending_planning_context is not None
+            or self._pending_vision_result is not None
             or tracked_worker
         )
 
@@ -316,6 +573,7 @@ class AgentWindow(QMainWindow):
         return bool(
             self._awaiting_preflight_completion
             or self._pending_planning_context is not None
+            or self._pending_vision_result is not None
             or (
                 self._worker is not None
                 and not self._preflight_completion_received
@@ -324,6 +582,7 @@ class AgentWindow(QMainWindow):
                 self._planning_worker is not None
                 and self._planning_outcome is None
             )
+            or (self._vision_worker is not None and self._vision_outcome is None)
         )
 
     def _update_controls(self) -> None:
@@ -346,39 +605,35 @@ class AgentWindow(QMainWindow):
     def _update_model_readiness(self) -> None:
         settings = self._agent_settings
         if settings.mode is AgentModelMode.OFFLINE:
-            self.model_readiness_label.setText(
-                "Planning method: Offline. No model or network request."
+            readiness = (
+                "No LLM model is selected. Choose OpenAI cloud or a local model in "
+                "Agent settings; autonomous analysis will stop with an error instead "
+                "of preparing an offline substitute plan."
             )
-            self.cloud_consent_checkbox.setVisible(False)
-            self.fallback_checkbox.setVisible(False)
-            self.fallback_checkbox.setEnabled(False)
-            self.preview_data_button.setVisible(False)
-            return
-        self.fallback_checkbox.setVisible(True)
-        self.fallback_checkbox.setEnabled(True)
-        self.preview_data_button.setVisible(True)
-        if settings.mode is AgentModelMode.LOCAL:
+        elif settings.mode is AgentModelMode.LOCAL:
             configured = bool(settings.model_id and settings.endpoint)
             readiness = (
-                f"Local model: {settings.model_id} at {settings.endpoint}. "
-                "Only this computer's loopback endpoint is allowed."
+                f"Local LLM: {settings.model_id} at {settings.endpoint}. "
+                "Requests stay on this computer's loopback endpoint. OpenAI visual "
+                "review is not sent in local-model mode. If the model is unavailable "
+                "or returns an invalid response, the run stops with the reason."
                 if configured
-                else "Local model not configured. Enter a loopback endpoint and exact model ID in Agent settings."
+                else "Local LLM is not configured. Enter a loopback endpoint and exact "
+                "model ID in Agent settings. No offline plan will be substituted."
             )
-            self.cloud_consent_checkbox.setVisible(False)
         else:
             configured = bool(settings.model_id)
             readiness = (
-                f"OpenAI model: {settings.model_id}. "
-                "Each run needs separate permission before a metadata request."
+                f"OpenAI LLM: {settings.model_id}. Each run automatically sends the "
+                "metadata-only dataset summary. Eligible image-stack reviews may send "
+                "up to 7 bounded PNGs in 3 visual requests: up to 3 image previews, 1 measured "
+                "spectrum plot, and up to 3 phase-overlay plots. No full image stack or source "
+                "files are sent. If the model is unavailable, the run stops with its "
+                "reason; no offline plan is substituted."
                 if configured
-                else "Model not configured. Enter an exact OpenAI model ID in Agent settings."
+                else "OpenAI LLM is not configured. Enter an exact model ID in Agent "
+                "settings. No request or visual evidence will be sent until configured."
             )
-            self.cloud_consent_checkbox.setText(
-                "For this run, send only the previewed metadata summary to OpenAI — "
-                + (settings.model_id or "model not configured")
-            )
-            self.cloud_consent_checkbox.setVisible(True)
         self.model_readiness_label.setText("Planning method: " + readiness)
 
     def open_model_settings(self) -> None:
@@ -389,21 +644,16 @@ class AgentWindow(QMainWindow):
         )
         if dialog.exec_() == QDialog.Accepted:
             self._agent_settings = self._agent_settings_repository.load()
-            self.cloud_consent_checkbox.setChecked(False)
             self._update_model_readiness()
 
     def _snapshot_run_configuration(self) -> AgentRunSnapshot:
         settings = self._agent_settings
-        consent = (
-            self.cloud_consent_checkbox.isChecked()
-            if settings.mode is AgentModelMode.OPENAI_CLOUD
-            else False
-        )
+        consent = settings.mode is AgentModelMode.OPENAI_CLOUD
         snapshot = AgentRunSnapshot(
             settings=settings,
             objective=PlanningObjective.DATASET_READINESS,
             cloud_egress_consent=consent,
-            deterministic_fallback=self.fallback_checkbox.isChecked(),
+            deterministic_fallback=False,
         )
         resolver = None
         if settings.mode is AgentModelMode.OPENAI_CLOUD:
@@ -412,14 +662,13 @@ class AgentWindow(QMainWindow):
                 environment_allowed=settings.allow_environment_credential,
             )
         self._run_credential_resolver = resolver
-        self.cloud_consent_checkbox.setChecked(False)
         return snapshot
 
     def show_data_preview(self) -> None:
         self._check_revision()
         settings = self._agent_settings
         if settings.mode is AgentModelMode.OFFLINE:
-            destination = "Offline deterministic mode — no model destination or request."
+            destination = "No LLM model selected — autonomous analysis will report that no model is configured."
         elif settings.mode is AgentModelMode.LOCAL:
             destination = (
                 f"Local model {settings.model_id or '(model not configured)'} at "
@@ -430,7 +679,7 @@ class AgentWindow(QMainWindow):
             destination = (
                 "OpenAI cloud model "
                 + (settings.model_id or "(model not configured)")
-                + "; dataset transmission still requires the unchecked run-level consent."
+                + "; Start authorizes one canonical metadata-only planning request when eligible, plus up to 7 bounded PNGs across 3 visual requests: up to 3 image previews, 1 measured-spectrum plot and up to 3 phase-overlay plots. A no-ROI run may skip metadata planning and start visual ROI discovery directly."
             )
         content = [
             "Configured destination:",
@@ -440,11 +689,12 @@ class AgentWindow(QMainWindow):
             "",
             json.dumps(canonical_planning_schema(), indent=2),
             "",
-            "Request limits: at most 1 analysis request per run; complete serialized request body ≤ 4,096 ASCII bytes (conservative input-token bound: 4,096); output ≤ 384 tokens; response ≤ 4,096 bytes; HTTP operation timeout 10 seconds; total request deadline 15 seconds.",
+            "Planning limits: at most 1 request per run; complete serialized body ≤ 4,096 ASCII bytes; output ≤ 384 tokens; response ≤ 4,096 bytes; HTTP timeout 10 seconds and total deadline 15 seconds.",
+            "For OpenAI mode, visual review runs automatically using the same model and key: at most 3 vision requests with at most 7 PNGs total (up to 3 measured frames + 1 ROI spectrum plot + up to 3 trusted phase-overlay plots). Each request is ≤ 4 MB, each PNG ≤ 1 MB; responses ≤ 12 KB; 45-second per-request and 150-second total visual-stage limits. A separate metadata-only planning request may run when its preflight requirements are met.",
             "The connection test is a separate user-initiated operation and sends only its fixed test payload.",
             "",
-            "This request never contains image bytes, thumbnails, spectra or arrays, actual wavelength/intensity values, file paths or names, sample titles, free-form observations/warnings, dataset/run IDs, credentials, or local files.",
-            "The request is metadata-only and is not sent by opening this preview.",
+                "This metadata planning request never contains image bytes, thumbnails, spectra or arrays, actual wavelength/intensity values, file paths or names, sample titles, free-form observations/warnings, dataset/run IDs, credentials, or local files.",
+            "Opening this preview and saving settings send nothing. Pressing Start in OpenAI mode authorizes only the disclosed metadata and bounded PNG transfers for that run. Local mode uses loopback and sends no visual evidence to OpenAI; model failure does not trigger an offline fallback.",
         ]
         if self._result is not None and not self._stale:
             try:
@@ -488,6 +738,32 @@ class AgentWindow(QMainWindow):
         """Run existing preflight and automatically continue to read-only planning."""
         if self._has_active_worker() or self._parent_closing:
             return
+        if self._adjusted_roi is not None:
+            adapter = getattr(self._main_window, "scientific_observation_api", None)
+            if (
+                adapter is None
+                or adapter.revision_clock.current() != self._adjusted_roi_dataset_token
+            ):
+                self._discard_adjusted_roi()
+        if self._agent_settings.mode is AgentModelMode.OFFLINE:
+            message = (
+                "LLM model is not available: no LLM is selected. Choose OpenAI cloud "
+                "or a local model in Agent settings. No offline plan was substituted."
+            )
+            self._stage = "failed"
+            self._set_status(message)
+            self.plan_text.setPlainText(message)
+            self._update_controls()
+            return
+        vision_enabled = self._agent_settings.mode is AgentModelMode.OPENAI_CLOUD
+        if vision_enabled and (
+            self._agent_settings.mode is not AgentModelMode.OPENAI_CLOUD
+            or not self._agent_settings.model_id
+        ):
+            self._set_status(
+                "LLM unavailable: enter an exact OpenAI model ID in Agent settings before starting an analysis run."
+            )
+            return
         try:
             self._run_snapshot = self._snapshot_run_configuration()
         except ValueError as exc:
@@ -496,6 +772,10 @@ class AgentWindow(QMainWindow):
         run_id = uuid4().hex
         self._agent_run_id = run_id
         self._planning_outcome = None
+        self._planning_display_text = ""
+        self._vision_outcome = None
+        self._set_vision_review_visible(False)
+        self._vision_run_enabled = vision_enabled
         self._stage = "preflight_running"
         self.plan_text.clear()
         self.plan_text.setPlainText("Waiting for the current dataset preflight.")
@@ -525,11 +805,14 @@ class AgentWindow(QMainWindow):
         self._preflight_completion_received = False
         self._awaiting_preflight_completion = True
         self._pending_planning_context = None
+        self._pending_vision_result = None
         self._planning_outcome = None
+        self._vision_outcome = None
         if _agent_run_id is None:
             self._agent_run_id = None
             self._run_snapshot = None
             self._run_credential_resolver = None
+            self._vision_run_enabled = False
             self._stage = "preflight_running"
         self._revision_timer.stop()
         self.progress_bar.setValue(0)
@@ -587,7 +870,7 @@ class AgentWindow(QMainWindow):
             current_attribute="agent_preflight_worker",
         )
         self._set_status(
-            "Checking the dataset. Planning will follow after the evidence and permissions are checked."
+            "Checking the dataset. Planning will follow after the configured model and dataset evidence are checked."
             if _agent_run_id is not None
             else "Checking the dataset locally. No model or network request is used."
         )
@@ -607,7 +890,8 @@ class AgentWindow(QMainWindow):
         # Qt callback has not reached this window yet.
         self._cancellation_requested = True
         self._pending_planning_context = None
-        for worker in (self._worker, self._planning_worker):
+        self._pending_vision_result = None
+        for worker in (self._worker, self._planning_worker, self._vision_worker):
             if worker is not None:
                 try:
                     worker.stop()
@@ -643,6 +927,7 @@ class AgentWindow(QMainWindow):
         self._awaiting_preflight_completion = False
         if self._cancellation_requested:
             self._pending_planning_context = None
+            self._pending_vision_result = None
             self._result = None
             self._planning_outcome = None
             self._stage = "cancelled"
@@ -663,9 +948,53 @@ class AgentWindow(QMainWindow):
             return
         if outcome.state is PreflightRunState.COMPLETE and outcome.result is not None:
             self._result = outcome.result
+            if self._adjusted_roi is not None and self._adjusted_roi_dataset_token != (
+                outcome.dataset_id,
+                outcome.revision,
+            ):
+                self._discard_adjusted_roi()
             self.progress_bar.setValue(100)
             self._render_result(outcome.result)
             if self._agent_run_id is not None:
+                if outcome.result.roi is None:
+                    problem = self._visual_roi_discovery_problem(outcome.result)
+                    if problem is not None:
+                        message = (
+                            "No selected NEAT ROI; M4 metadata planning was not run, "
+                            "and no plan is claimed. "
+                            + problem
+                        )
+                        self._planning_display_text = message
+                        self._stage = "blocked_no_roi"
+                        self.plan_text.setPlainText(message)
+                        self._set_status(message)
+                        self._update_controls()
+                        return
+                    if self._adjusted_roi is not None:
+                        self._planning_display_text = (
+                            "No selected NEAT fitting ROI. Reusing the validated "
+                            "user-adjusted Agent ROI. M4 metadata planning was skipped; "
+                            "no planning result is claimed. NEAT will re-extract the "
+                            "spectrum and regenerate the phase comparison."
+                        )
+                    else:
+                        self._planning_display_text = (
+                            "No selected NEAT fitting ROI. M4 metadata planning was "
+                            "skipped; no planning result is claimed. The configured "
+                            "OpenAI model will inspect the bounded image previews, "
+                            "propose an ROI, and NEAT will extract its measured spectrum "
+                            "for the visual phase comparison."
+                        )
+                    self._pending_vision_result = outcome.result
+                    self._stage = "visual_roi_discovery_pending"
+                    self.plan_text.setPlainText(self._planning_display_text)
+                    self._set_status(
+                        "No fitting ROI is selected. Starting visual-first ROI discovery after preflight retires."
+                    )
+                    if self._worker is None:
+                        self._start_pending_vision()
+                    self._update_controls()
+                    return
                 try:
                     context = context_from_preflight(
                         outcome.result,
@@ -716,6 +1045,199 @@ class AgentWindow(QMainWindow):
             return
         self._pending_planning_context = None
         self._start_planning(context)
+
+    def _start_pending_vision(self) -> None:
+        result = self._pending_vision_result
+        if (
+            result is None or self._worker is not None or self._vision_worker is not None
+            or self._planning_worker is not None
+            or self._cancellation_requested or self._stale or self._parent_closing
+            or getattr(self._main_window, "_shutdown_close_pending", False)
+            or getattr(self._main_window, "_shutdown_committed", False)
+        ):
+            return
+        self._pending_vision_result = None
+        if (
+            self._run_snapshot is None
+            or self._run_snapshot.settings.mode is not AgentModelMode.OPENAI_CLOUD
+            or not self._vision_run_enabled
+            or self._run_credential_resolver is None
+        ):
+            self._stage = VisionStatus.UNAVAILABLE.value
+            self._set_status("OpenAI visual review is unavailable. Check the configured model and Agent key.")
+            self.plan_text.setPlainText("No visual finding was generated. The dataset preflight remains available for manual review.")
+            self._update_controls()
+            return
+        adapter = getattr(self._main_window, "scientific_observation_api", None)
+        if adapter is None or adapter.revision_clock.current() != self._dataset_token:
+            self._mark_stale()
+            return
+        try:
+            handle = adapter.capture_dataset()
+        except (ObservationErrorBase, ValueError):
+            self._stage = VisionStatus.UNAVAILABLE.value
+            self._set_status("OpenAI visual review could not capture the current dataset.")
+            self._update_controls()
+            return
+        if (handle.dataset_id, handle.revision) != self._dataset_token:
+            self._mark_stale()
+            return
+        run_id = self._agent_run_id
+        if run_id is None:
+            return
+        roi_override = None
+        if self._adjusted_roi is not None:
+            if self._adjusted_roi_dataset_token == self._dataset_token:
+                roi_override = self._adjusted_roi
+            else:
+                self._discard_adjusted_roi()
+        worker = VisionWorker(
+            run_id,
+            handle,
+            result,
+            self._run_snapshot.settings,
+            roi_override=roi_override,
+            credential_resolver=self._run_credential_resolver,
+            cloud_egress_authorized=self._vision_run_enabled,
+            parent=self._main_window,
+        )
+        self._vision_worker = worker
+        self._main_window.agent_vision_worker = worker
+        self._main_window._track_shutdown_worker(worker, "agent_vision")
+        self._main_window._connect_shutdown_worker_signal(
+            worker, worker.progress,
+            lambda percent, message, rid=run_id, current=worker: self._on_vision_progress(rid, current, percent, message),
+            current_attribute="agent_vision_worker",
+        )
+        self._main_window._connect_shutdown_worker_signal(
+            worker, worker.completed,
+            lambda outcome, rid=run_id, current=worker: self._on_vision_completed(rid, current, outcome),
+            current_attribute="agent_vision_worker",
+        )
+        self._main_window._connect_shutdown_worker_signal(
+            worker, worker.finished,
+            lambda rid=run_id, current=worker: self._on_vision_finished(rid, current),
+            current_attribute="agent_vision_worker",
+        )
+        self._stage = "vision_running"
+        visual_status = (
+            "The configured OpenAI model is inspecting bounded previews. This may propose settings for your review; nothing will be applied."
+        )
+        self.plan_text.setPlainText(
+            self._planning_display_text + "\n\n" + visual_status
+            if self._planning_display_text
+            else visual_status
+        )
+        self._set_status(
+            "Planning is complete. OpenAI visual review is now inspecting bounded previews."
+            if self._planning_outcome is not None
+            else "No plan was claimed. OpenAI visual review is starting with the available bounded evidence."
+        )
+        self._update_controls()
+        worker.start()
+
+    def _visual_roi_discovery_problem(self, result: PreflightResult) -> str | None:
+        """Return why this run cannot safely start image-based ROI discovery."""
+        if not self._vision_run_enabled or self._run_snapshot is None or (
+            self._run_snapshot.settings.mode is not AgentModelMode.OPENAI_CLOUD
+        ):
+            return (
+                "Visual ROI discovery requires OpenAI mode. Select OpenAI in Agent "
+                "settings and start again; no offline plan will be substituted."
+            )
+        dataset = result.dataset
+        if dataset.mode is not DatasetMode.IMAGES or not dataset.capabilities.images_available:
+            return "The current dataset does not provide an image stack for ROI discovery."
+        if dataset.image_shape is None or not dataset.frame_count:
+            return "The current image stack has no usable frame dimensions."
+        if dataset.wavelength_axis_status is not WavelengthAxisStatus.VALID:
+            return "A valid wavelength calibration is required before spectrum-based visual review."
+        if not result.frames:
+            return "NEAT could not create any bounded image preview for visual review."
+        for frame in result.frames[:3]:
+            image = frame.image
+            if (
+                image.status is not ObservationStatus.OK
+                or not image.png_bytes
+                or image.coordinate_mapping is None
+                or image.preview_shape is None
+            ):
+                return "A representative image preview is invalid or incomplete; no model request was made."
+        return None
+
+    def _on_vision_progress(self, run_id: str, worker: VisionWorker, percent: int, message: str) -> None:
+        if run_id != self._agent_run_id or worker is not self._vision_worker or self._parent_closing or self._stale:
+            return
+        self._check_revision()
+        if not self._stale and not self._cancellation_requested:
+            self.progress_bar.setValue(min(99, 80 + percent // 5))
+            self._set_status(message)
+
+    def _on_vision_completed(self, run_id: str, worker: VisionWorker, outcome: VisionOutcome) -> None:
+        if (
+            run_id != self._agent_run_id or worker is not self._vision_worker
+            or outcome.run_id != run_id or self._parent_closing
+            or getattr(self._main_window, "_shutdown_close_pending", False)
+        ):
+            return
+        if self._cancellation_requested:
+            self._vision_outcome = None
+            self._stage = "cancelled"
+            self._set_status("Autonomous analysis stopped during OpenAI visual review.")
+            self.plan_text.setPlainText(
+                self._planning_display_text
+                + "\n\nOpenAI visual review stopped. No proposal was accepted."
+            )
+            self._update_controls()
+            return
+        self._check_revision()
+        if self._stale or self._dataset_token != (outcome.dataset_id, outcome.revision):
+            self._mark_stale()
+            return
+        self._vision_outcome = outcome
+        self._stage = outcome.status.value
+        if outcome.status is VisionStatus.STALE:
+            self._mark_stale()
+            return
+        if outcome.status is not VisionStatus.NEEDS_REVIEW:
+            self.plan_text.setPlainText(
+                self._planning_display_text
+                + "\n\nOpenAI visual review: "
+                + outcome.message
+                + "\nNo visual settings were applied."
+            )
+            self._set_status(outcome.message)
+        else:
+            self._render_vision_outcome(outcome)
+            if outcome.phase_id:
+                self._set_status("Provisional visual suggestions are ready for your review. No fitting or configuration change occurred.")
+            else:
+                self._set_status("Visual evidence is ready for manual review; no phase or edge suggestion was accepted.")
+            self.progress_bar.setValue(100)
+        self._update_controls()
+
+    def _on_vision_finished(self, run_id: str, worker: VisionWorker) -> None:
+        if self._vision_worker is worker:
+            self._vision_worker = None
+        if getattr(self._main_window, "agent_vision_worker", None) is worker:
+            self._main_window.agent_vision_worker = None
+        if run_id == self._agent_run_id and self._cancellation_requested and not self._stale:
+            self._stage = "cancelled"
+            self._set_status("Autonomous analysis stopped during OpenAI visual review.")
+        self._update_controls()
+
+    def vision_worker_retired(self, worker: VisionWorker, callbacks_suppressed: bool) -> None:
+        if self._vision_worker is worker:
+            self._vision_worker = None
+        if not self._parent_closing:
+            if self._cancellation_requested and not self._stale:
+                self._vision_outcome = None
+                self._stage = "cancelled"
+                self._set_status("Autonomous analysis stopped during OpenAI visual review.")
+            elif callbacks_suppressed and not self._stale:
+                self._vision_outcome = None
+                self._set_status("OpenAI visual review stopped while NEAT was closing.")
+            self._update_controls()
 
     def _start_planning(self, context: PlanningContext) -> None:
         if (
@@ -777,7 +1299,7 @@ class AgentWindow(QMainWindow):
         planner = {
             AgentModelMode.OFFLINE: "local deterministic planner",
             AgentModelMode.LOCAL: "configured loopback structured model",
-            AgentModelMode.OPENAI_CLOUD: "consent-gated OpenAI structured model",
+            AgentModelMode.OPENAI_CLOUD: "OpenAI structured model",
         }[mode]
         self.plan_text.setPlainText(
             f"Preflight is current. The {planner} is preparing a read-only proposal."
@@ -874,9 +1396,19 @@ class AgentWindow(QMainWindow):
         if self._run_snapshot is not None:
             if self._run_snapshot.settings.mode is AgentModelMode.OPENAI_CLOUD:
                 lines.append(
-                    "Cloud permission: granted for this run"
+                    "Dataset summary transfer: enabled for this OpenAI run"
                     if self._run_snapshot.cloud_egress_consent
-                    else "Cloud permission: not granted; no cloud request was made"
+                    else "Dataset summary transfer: disabled; no OpenAI request was made"
+                )
+                visual_stage_available = (
+                    self._vision_run_enabled
+                    and self._result is not None
+                    and self._result.dataset.mode is DatasetMode.IMAGES
+                )
+                lines.append(
+                    "Bounded visual review is configured; it starts after successful planning"
+                    if visual_stage_available
+                    else "No preview images are sent for this dataset or model mode"
                 )
             elif self._run_snapshot.settings.mode is AgentModelMode.LOCAL:
                 lines.append("Network scope: configured loopback endpoint only")
@@ -910,9 +1442,7 @@ class AgentWindow(QMainWindow):
         elif outcome.status is PlanningStatus.BLOCKED_INVALID_DATA:
             self._set_status("Autonomous analysis stopped — preflight data or evidence is invalid.")
         elif outcome.status is PlanningStatus.UNAVAILABLE:
-            self._set_status(
-                "Preflight complete — planning is unavailable; install the optional [agent] extra."
-            )
+            self._set_status("LLM model is not available: " + outcome.message)
         elif outcome.status is PlanningStatus.NEEDS_PERMISSION:
             self._set_status(
                 "Planning stopped — cloud permission was not granted for this run."
@@ -922,11 +1452,39 @@ class AgentWindow(QMainWindow):
         elif outcome.status is PlanningStatus.STALE:
             self._mark_stale()
             return
+        elif outcome.status is PlanningStatus.FAILED:
+            if outcome.error_code in {
+                PlanningErrorCode.MODEL_UNAVAILABLE,
+                PlanningErrorCode.MISSING_CREDENTIAL,
+            }:
+                self._set_status("LLM model is not available: " + outcome.message)
+            elif outcome.error_code is PlanningErrorCode.MODEL_OUTPUT_REJECTED:
+                self._set_status("LLM returned an unusable response: " + outcome.message)
+            else:
+                self._set_status("LLM planning failed: " + outcome.message)
         else:
             self._set_status("Planning failed safely; no scientific action was run.")
         if outcome.message:
             lines.extend(("", outcome.message))
-        self.plan_text.setPlainText("\n".join(lines))
+        self._planning_display_text = "\n".join(lines)
+        self.plan_text.setPlainText(self._planning_display_text)
+        if (
+            self._vision_run_enabled
+            and self._result.dataset.mode is DatasetMode.IMAGES
+            and outcome.status
+            not in {
+                PlanningStatus.CANCELLED,
+                PlanningStatus.STALE,
+                PlanningStatus.BLOCKED_INVALID_DATA,
+                PlanningStatus.UNAVAILABLE,
+                PlanningStatus.FAILED,
+                PlanningStatus.NEEDS_PERMISSION,
+            }
+        ):
+            self._pending_vision_result = self._result
+            self._set_status(
+                "Planning finished. OpenAI visual review will start when the planning worker retires."
+            )
 
     def _on_planning_finished(self, run_id: str, worker: PlanningWorker) -> None:
         if self._planning_worker is worker:
@@ -943,6 +1501,8 @@ class AgentWindow(QMainWindow):
             self._stage = "failed"
             self._set_status("Planning stopped before a result was received.")
             self.plan_text.setPlainText("No plan was produced.")
+        if self._pending_vision_result is not None and not self._cancellation_requested:
+            self._start_pending_vision()
         self._update_controls()
         if not self._has_active_worker() and self._result is None:
             self._revision_timer.stop()
@@ -952,6 +1512,8 @@ class AgentWindow(QMainWindow):
             self._worker = None
         if getattr(self._main_window, "agent_preflight_worker", None) is worker:
             self._main_window.agent_preflight_worker = None
+        if self._pending_vision_result is not None and not self._cancellation_requested:
+            self._start_pending_vision()
         if (
             run_id == self._active_run_id
             and not self._cancellation_requested
@@ -961,7 +1523,7 @@ class AgentWindow(QMainWindow):
         ):
             self._stage = "complete"
         self._update_controls()
-        if self._result is None and self._planning_worker is None:
+        if self._result is None and self._planning_worker is None and self._vision_worker is None:
             self._revision_timer.stop()
 
     def worker_retired(self, worker: PreflightWorker, callbacks_suppressed: bool) -> None:
@@ -973,6 +1535,7 @@ class AgentWindow(QMainWindow):
         if not self._parent_closing:
             if self._cancellation_requested and not self._stale:
                 self._pending_planning_context = None
+                self._pending_vision_result = None
                 self._result = None
                 self._planning_outcome = None
                 if self._stage == "cancellation_requested":
@@ -984,11 +1547,14 @@ class AgentWindow(QMainWindow):
                 self._stage = "cancelled"
             elif callbacks_suppressed and not self._stale:
                 self._pending_planning_context = None
+                self._pending_vision_result = None
                 self._result = None
                 self._revision_timer.stop()
                 self._set_status("Preflight stopped while NEAT was closing. Start again if NEAT remains open.")
             elif self._pending_planning_context is not None:
                 self._start_pending_planning()
+            elif self._pending_vision_result is not None:
+                self._start_pending_vision()
             self._update_controls()
 
     def planning_worker_retired(
@@ -1015,6 +1581,8 @@ class AgentWindow(QMainWindow):
                 self._set_status(
                     "Planning stopped while NEAT was closing. Start again if NEAT remains open."
                 )
+            elif self._pending_vision_result is not None:
+                self._start_pending_vision()
             self._update_controls()
 
     @staticmethod
@@ -1068,48 +1636,45 @@ class AgentWindow(QMainWindow):
         self.dataset_summary_label.setText(summary)
         self._clear_evidence()
         if dataset.mode is DatasetMode.PROFILE:
-            self.evidence_layout.addWidget(QLabel("Spectrum-only input: image controls do not apply."))
+            self._add_evidence_text("Spectrum-only input: image controls do not apply.")
         elif result.frames:
-            self.evidence_layout.addWidget(QLabel("Measured image previews; image row zero is at the top."))
+            self._add_evidence_text("Measured image previews; image row zero is at the top.")
             for frame in result.frames:
                 caption = f"Frame {frame.frame_index}"
                 if frame.wavelength is not None:
                     caption += f" — {frame.wavelength:.6g} Å"
-                self.evidence_layout.addWidget(QLabel(caption))
-                label = QLabel(self.evidence_content)
-                label.setAccessibleName(caption + " image preview")
-                label.setPixmap(self._preview_pixmap(frame.image, result.roi))
-                self.evidence_layout.addWidget(label)
+                self._add_evidence_text(caption)
+                self._add_evidence_pixmap(
+                    caption + " image preview",
+                    self._preview_pixmap(frame.image, result.roi),
+                )
         else:
-            self.evidence_layout.addWidget(QLabel("Image previews are unavailable."))
+            self._add_evidence_text("Image previews are unavailable.")
 
         if result.roi is not None:
             roi = result.roi
-            self.evidence_layout.addWidget(QLabel(
+            self._add_evidence_text(
                 f"Selected NEAT ROI overlay and spectrum source: "
                 f"x[{roi.x_min},{roi.x_max}), y[{roi.y_min},{roi.y_max}) (half-open pixels)."
-            ))
+            )
         if result.spectrum is None:
-            self.evidence_layout.addWidget(QLabel(
+            self._add_evidence_text(
                 "ROI spectrum not yet available." if dataset.mode is DatasetMode.IMAGES
                 else "Measured spectrum unavailable."
-            ))
+            )
         else:
             spectrum = result.spectrum
-            self.evidence_layout.addWidget(QLabel(
+            self._add_evidence_text(
                 f"Measured intensity ({spectrum.intensity_unit}); full source: "
                 f"{spectrum.sample_count} points, {spectrum.finite_pair_count} finite pairs, "
                 f"{spectrum.nonfinite_intensity_count} non-finite intensities. "
                 f"Axis: {spectrum.wavelength_axis_status.value}. "
                 f"Plot window (Å): {result.plot.display_window if result.plot else 'unavailable'}."
-            ))
+            )
             if result.plot is not None and result.plot.png_bytes is not None:
-                plot = QLabel(self.evidence_content)
-                plot.setAccessibleName("Measured spectrum plot")
                 pixmap = QPixmap()
                 if pixmap.loadFromData(result.plot.png_bytes, "PNG"):
-                    plot.setPixmap(pixmap)
-                    self.evidence_layout.addWidget(plot)
+                    self._add_evidence_pixmap("Measured spectrum plot", pixmap)
         self.evidence_layout.addStretch()
 
     def shutdown_for_parent_close(self) -> None:
@@ -1118,26 +1683,37 @@ class AgentWindow(QMainWindow):
         self._active_run_id = None
         self._agent_run_id = None
         self._pending_planning_context = None
+        self._pending_vision_result = None
         self._awaiting_preflight_completion = False
         self._revision_timer.stop()
         self._result = None
         self._planning_outcome = None
+        self._vision_outcome = None
+        self._vision_worker = None
         self._run_snapshot = None
         self._run_credential_resolver = None
         self._dataset_token = None
+        self._discard_adjusted_roi()
         self.plan_text.clear()
         self._show_evidence_message("NEAT is closing.")
         self.hide()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._rescale_evidence_images()
 
     def closeEvent(self, event) -> None:
         self.stop_active_run()
         self._active_run_id = None
         self._agent_run_id = None
         self._pending_planning_context = None
+        self._pending_vision_result = None
         self._awaiting_preflight_completion = False
         self._result = None
         self._planning_outcome = None
+        self._vision_outcome = None
         self._dataset_token = None
+        self._discard_adjusted_roi()
         self._run_snapshot = None
         self._run_credential_resolver = None
         self.plan_text.clear()

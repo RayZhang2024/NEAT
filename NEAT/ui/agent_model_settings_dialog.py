@@ -104,9 +104,11 @@ class AgentModelSettingsDialog(QDialog):
         loaded = self.settings_repository.load()
         layout = QVBoxLayout(self)
         explanation = QLabel(
-            "These settings are separate from NEAT AI Assistant. Saving a cloud "
-            "provider does not permit data transmission. Cloud planning also needs "
-            "a fresh permission for each analysis run.",
+            "These settings are separate from NEAT AI Assistant. In OpenAI cloud "
+            "mode, pressing Start authorizes a metadata-only planning request when "
+            "eligible and up to 7 bounded PNGs across 3 visual requests for image-stack "
+            "review: up to 3 representative image previews, 1 measured-spectrum plot and up to 3 phase-overlay "
+            "plots. Saving settings alone sends nothing.",
             self,
         )
         explanation.setWordWrap(True)
@@ -114,7 +116,7 @@ class AgentModelSettingsDialog(QDialog):
 
         form = QFormLayout()
         self.mode_combo = QComboBox(self)
-        self.mode_combo.addItem("Offline deterministic", AgentModelMode.OFFLINE.value)
+        self.mode_combo.addItem("No LLM (analysis unavailable)", AgentModelMode.OFFLINE.value)
         self.mode_combo.addItem("Local model (loopback only)", AgentModelMode.LOCAL.value)
         self.mode_combo.addItem("OpenAI cloud", AgentModelMode.OPENAI_CLOUD.value)
         self.mode_combo.setCurrentIndex(
@@ -141,9 +143,13 @@ class AgentModelSettingsDialog(QDialog):
         layout.addLayout(form)
 
         self.privacy_label = QLabel(
-            "Model requests are one-shot, metadata-only, and limited to one request "
-            "per analysis run. Local mode accepts only loopback endpoints and does "
-            "not use proxy settings.",
+            "OpenAI analysis uses at most one bounded planning request. For image stacks, "
+            "visual review may send up to 7 bounded PNGs in 3 requests: up to 3 measured "
+            "frames, 1 ROI-spectrum plot and up to 3 trusted phase-overlay plots. These "
+            "requests use the same model ID and Agent API key. Local mode stays on the "
+            "configured loopback endpoint and sends no visual evidence to OpenAI; model "
+            "failure does not fall back to an offline plan. A run without a selected ROI "
+            "may start visual ROI discovery directly and skip metadata planning.",
             self,
         )
         self.privacy_label.setWordWrap(True)
