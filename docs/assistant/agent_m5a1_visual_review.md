@@ -6,22 +6,23 @@ file. It does not establish crystallographic identity or fitness for strain
 analysis. The legacy `d_fit`/factor-of-two physical-interpretation caveat
 remains unresolved.
 
-## One model and explicit per-run permissions
+## One model and automatic OpenAI evidence transfer
 
 - The OpenAI model ID and Agent-only API key saved in **Agent settings** are
   shared by metadata planning and visual review. There is no second vision-model
   configuration. The optional loopback text planner remains available, but
   visual review is only offered for OpenAI Cloud mode.
-- Each new run starts with both permissions unchecked. The metadata permission
-  allows one canonical, metadata-only planning request. The separate visual
-  permission allows the configured OpenAI model to receive bounded image and
-  spectrum PNG previews. Checking either permission does not save a preference
-  or authorize a later run.
+- OpenAI mode automatically sends one canonical, metadata-only planning
+  request for each analysis run. For image-stack datasets, it also sends the
+  bounded image/spectrum PNG previews described below. The Agent window
+  discloses these transfers before the run. No
+  checkbox is shown. Local-model mode keeps requests on the loopback endpoint
+  and does not send visual evidence to OpenAI.
 - Visual review sends at most three actual frame previews and two further
   measured-spectrum/phase-overlay requests (three requests total for vision).
-  Together with the optional planning request, a run has at most four model
-  requests. A run with visual permission follows preflight → planning → visual
-  review; each worker remains tracked and stoppable before the next stage.
+  Together with the planning request, an OpenAI run has at most four model
+  requests. It follows preflight → planning → visual review; each worker remains
+  tracked and stoppable before the next stage.
 - The OpenAI endpoint is fixed to `https://api.openai.com/v1/chat/completions`.
   The Agent keyring key is sent in the authorization header only. Requests set
   `store: false`; redirects, proxy environment settings and retries are disabled.
@@ -67,10 +68,10 @@ writes to the fitting tab.
    key. The same model is used for planning and vision. No API key is required
    for CI or offline tests.
 2. Load an image stack with a valid wavelength axis and start **Autonomous
-   Analysis**. The metadata permission authorizes only the planning summary.
-   For visual review, separately check the option that says bounded image and
-   spectrum previews will be sent to OpenAI. Both permissions reset for the next
-   run.
+   Analysis**. In OpenAI mode, the run automatically sends the disclosed
+   canonical dataset summary and bounded evidence PNGs. If the model is
+   unavailable or returns unusable output, the run stops with the reported
+   reason; no deterministic offline plan is substituted.
 3. Confirm the rendered frame/ROI overlay uses original pixel coordinates, the
    spectrum corresponds to that ROI, and any phase overlays use trusted NEAT
    markers. Confirm the main fitting tab and its phase/window/ROI settings have

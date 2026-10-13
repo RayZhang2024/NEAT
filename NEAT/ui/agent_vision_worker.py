@@ -1,4 +1,4 @@
-"""Tracked, cancellable Qt worker for consent-gated OpenAI visual review."""
+"""Tracked, cancellable Qt worker for authorized OpenAI visual review."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from ..domain.agent_model import AgentModelSettings
 from ..domain.agent_preflight import PreflightResult
 from ..domain.agent_vision import VisionOutcome, VisionStatus
+from ..services.agent_model import AgentCredentialResolver, AgentModelError
 from ..services.agent_vision import (
     OpenAIVisionInspector,
     VisionCancelled,
@@ -18,7 +19,6 @@ from ..services.agent_vision import (
     VisionUnavailable,
     run_visual_rehearsal,
 )
-from ..services.agent_model import AgentCredentialResolver
 from ..services.scientific_observation import ScientificDatasetHandle
 
 
@@ -113,21 +113,29 @@ class VisionWorker(QThread):
                 VisionStatus.STALE,
                 "Dataset changed during OpenAI visual review.",
             )
-        except VisionUnavailable:
+        except AgentModelError as exc:
             outcome = VisionOutcome(
                 self.run_id,
                 self.dataset_id,
                 self.revision,
                 VisionStatus.UNAVAILABLE,
-                "OpenAI visual review is unavailable or incompatible.",
+                f"OpenAI visual review is unavailable: {exc}",
             )
-        except VisionError:
+        except VisionUnavailable as exc:
+            outcome = VisionOutcome(
+                self.run_id,
+                self.dataset_id,
+                self.revision,
+                VisionStatus.UNAVAILABLE,
+                f"OpenAI visual review is unavailable: {exc}",
+            )
+        except VisionError as exc:
             outcome = VisionOutcome(
                 self.run_id,
                 self.dataset_id,
                 self.revision,
                 VisionStatus.BLOCKED,
-                "OpenAI visual proposal or evidence failed validation.",
+                f"OpenAI visual review was blocked: {exc}",
             )
         except Exception:  # noqa: BLE001 - contain worker failure without leaking model payloads
             outcome = VisionOutcome(
@@ -141,9 +149,9 @@ class VisionWorker(QThread):
             self._handle = None
             self._preflight = None
             with self._lock:
-                inspector = self._inspector
+                retained_inspector = self._inspector
                 self._inspector = None
-            release_credential = getattr(inspector, "release_credential", None)
+            release_credential = getattr(retained_inspector, "release_credential", None)
             if callable(release_credential):
                 release_credential()
             self._credential_resolver = None

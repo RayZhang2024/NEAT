@@ -1,8 +1,8 @@
 """Optional OpenAI visual review of real, bounded scientific previews.
 
-This module never applies a proposal to NEAT's fitting controls. The model sees
-PNG previews only after explicit per-run consent, using the same Agent model
-configuration and credential as the read-only planner.
+This module never applies a proposal to NEAT's fitting controls. It requires
+run-level cloud authorization before sending bounded PNG previews, using the
+same Agent model configuration and credential as the read-only planner.
 """
 
 from __future__ import annotations
@@ -12,9 +12,10 @@ import base64
 import json
 import math
 import time
+from collections.abc import Callable, Mapping
 from io import BytesIO
 from threading import Lock
-from typing import Callable, Mapping, Protocol, cast
+from typing import Protocol, cast
 
 import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -31,20 +32,22 @@ from ..domain.observation import (
     RoiBounds,
     WavelengthAxisStatus,
 )
+from .agent_model import validate_agent_settings
 from .scientific_observation import (
     _PLOT_LOCK,
     ScientificDatasetHandle,
     get_roi_spectrum,
     render_spectrum_preview,
 )
-from .agent_model import validate_agent_settings
 
 MAX_VISION_FRAMES = 3
 MAX_VISION_PHASES = 3
+MAX_VISION_CANDIDATE_EDGES = 5
 MAX_VISION_REQUESTS = 3
 MAX_VISION_PNG_BYTES = 1_000_000
 MAX_VISION_REQUEST_BYTES = 4_000_000
 MAX_VISION_RESPONSE_BYTES = 12_000
+MAX_VISION_COMPLETION_TOKENS = 2_048
 VISION_REQUEST_TIMEOUT_SECONDS = 45.0
 VISION_TOTAL_SECONDS = 150.0
 MIN_ROI_WIDTH = 3
@@ -85,6 +88,106 @@ def _bounded_png(data: bytes) -> None:
         or not 0 < len(data) <= MAX_VISION_PNG_BYTES
     ):
         raise VisionError("A visual input is not a bounded PNG preview.")
+
+
+def _object_schema(properties: Mapping[str, object]) -> dict[str, object]:
+    """Build a strict-schema object; semantic constraints remain locally checked."""
+    return {
+        "type": "object",
+        "properties": dict(properties),
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def _visual_response_schema(stage: str) -> dict[str, object]:
+    """Return the bounded JSON schema for one visual-review stage."""
+    text_schema: dict[str, object] = {"type": "string"}
+    text_list: dict[str, object] = {
+        "type": "array",
+        "items": text_schema,
+    }
+    phase_ids = sorted(phase for phase in PHASE_DATA if phase != "Unknown_Phase")
+    phase_value: dict[str, object] = {"type": "string", "enum": phase_ids}
+    nullable_phase: dict[str, object] = {
+        "anyOf": [phase_value, {"type": "null"}]
+    }
+    if stage == "sample_roi":
+        roi_object = _object_schema(
+            {
+                name: {"type": "integer"}
+                for name in ("x_min", "x_max", "y_min", "y_max")
+            }
+        )
+        return _object_schema(
+            {
+                "roi": {"anyOf": [roi_object, {"type": "null"}]},
+                "reason": text_schema,
+                "confidence": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                },
+                "ambiguity_flags": text_list,
+            }
+        )
+    if stage == "phase_shortlist":
+        return _object_schema(
+            {
+                "candidate_phase_ids": {
+                    "type": "array",
+                    "items": phase_value,
+                }
+            }
+        )
+    if stage == "phase_overlay":
+        hkl = {"type": "array", "items": {"type": "integer"}}
+        nullable_number = {
+            "anyOf": [{"type": "number"}, {"type": "null"}]
+        }
+        return _object_schema(
+            {
+                "status": {
+                    "type": "string",
+                    "enum": ["hypothesis", "uncertain"],
+                },
+                "phase_id": nullable_phase,
+                "hkls": {"type": "array", "items": hkl},
+                "edge_reasons": text_list,
+                "display_min": nullable_number,
+                "display_max": nullable_number,
+                "reason": text_schema,
+                "alternatives": {"type": "array", "items": phase_value},
+                "unresolved": text_list,
+            }
+        )
+    raise VisionError("Vision stage is not allowlisted.")
+
+
+def _message_text_content(message: object) -> str:
+    """Extract only textual JSON from a chat response without exposing it in errors."""
+    if not isinstance(message, Mapping):
+        raise VisionError("OpenAI returned an invalid visual-review message.")
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if (
+                not isinstance(item, Mapping)
+                or item.get("type") not in {"text", "output_text"}
+                or not isinstance(item.get("text"), str)
+            ):
+                raise VisionError(
+                    "OpenAI returned non-text content for structured visual output."
+                )
+            parts.append(item["text"])
+        if parts:
+            return "".join(parts)
+    content_kind = "missing" if content is None else "non-text"
+    raise VisionError(
+        f"OpenAI returned {content_kind} content for structured visual output."
+    )
 
 
 class OpenAIVisionInspector:
@@ -154,8 +257,15 @@ class OpenAIVisionInspector:
                 },
                 {"role": "user", "content": content},
             ],
-            "response_format": {"type": "json_object"},
-            "max_completion_tokens": 700,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": f"neat_visual_{stage}",
+                    "strict": True,
+                    "schema": _visual_response_schema(stage),
+                },
+            },
+            "max_completion_tokens": MAX_VISION_COMPLETION_TOKENS,
             "stream": False,
             "store": False,
         }
@@ -242,17 +352,26 @@ class OpenAIVisionInspector:
             ) from exc
         try:
             envelope = json.loads(raw)
-            message = envelope["choices"][0]["message"]
-            if envelope["choices"][0].get("finish_reason") != "stop":
+            if not isinstance(envelope, Mapping):
+                raise VisionError("OpenAI returned an invalid visual-review response.")
+            choices = envelope.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise VisionError("OpenAI returned no visual-review choice.")
+            choice = choices[0]
+            if not isinstance(choice, Mapping):
+                raise VisionError("OpenAI returned an invalid visual-review choice.")
+            message = choice.get("message")
+            if not isinstance(message, Mapping):
+                raise VisionError("OpenAI returned an invalid visual-review message.")
+            if choice.get("finish_reason") != "stop":
                 raise VisionError("Vision response was truncated.")
-            result = json.loads(message["content"])
-        except (
-            KeyError,
-            IndexError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-        ) as exc:
+            if message.get("refusal"):
+                raise VisionError("OpenAI refused the visual-review request.")
+            message_content = _message_text_content(message)
+            result = json.loads(message_content)
+        except VisionError:
+            raise
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise VisionError(
                 "OpenAI model did not return compatible JSON vision output."
             ) from exc
@@ -362,6 +481,29 @@ def trusted_phase_edges(
         for hkl, wavelength in edges
         if math.isfinite(float(wavelength))
     )
+
+
+def _default_edge_display_envelope(
+    phase_id: str,
+    hkls: list[tuple[int, int, int]],
+    measured_bounds: tuple[float, float],
+) -> tuple[tuple[float, float], bool]:
+    """Cover NEAT's default pre/post-edge windows for the selected markers."""
+    positions = dict(trusted_phase_edges(phase_id))
+    edge_positions = [positions[hkl] for hkl in hkls]
+    if not edge_positions:
+        raise VisionError("At least one selected edge is required for a display range.")
+
+    # Keep this envelope consistent with FittingMixin._default_bragg_edge_windows:
+    # Region 1 is the pre-edge baseline and Region 2 is the post-edge baseline.
+    requested_min = min(max(position * 0.90, position - 0.3) for position in edge_positions)
+    requested_max = max(min(position * 1.12, position + 0.4) for position in edge_positions)
+    measured_min, measured_max = measured_bounds
+    complete = requested_min >= measured_min and requested_max <= measured_max
+    return (
+        max(measured_min, requested_min),
+        min(measured_max, requested_max),
+    ), complete
 
 
 def render_phase_overlay(spectrum, phase_id: str) -> bytes:
@@ -490,6 +632,8 @@ def run_visual_rehearsal(
         "These are real NEAT frame previews in order, row zero at top. Original image shape (rows, columns): "
         f"{dataset.image_shape}; preview sizes: {[f.image.preview_shape for f in frames]}. "
         "Suggest a likely usable sample-interior ROI in ORIGINAL half-open pixel coordinates. "
+        f"Each side must be between {MIN_ROI_WIDTH} and {MAX_ROI_WIDTH} original pixels inclusive. "
+        "Use x coordinates for columns and y coordinates for rows; keep all four bounds inside the original image. "
         "Brightness does not universally mean sample; dark/filtered areas may be unusable. "
         "Do not claim measured SNR. Return exactly JSON keys roi {x_min,x_max,y_min,y_max}, reason, "
         "confidence (low/medium/high), ambiguity_flags (array of short strings).",
@@ -593,21 +737,121 @@ def run_visual_rehearsal(
         )
     overlays = tuple(render_phase_overlay(spectrum, phase) for phase in phases)
     _checkpoint(handle, cancelled, started)
+
+    def manual_phase_review(
+        message: str,
+        *,
+        phase_reason: str,
+        alternatives: tuple[str, ...] = (),
+        unresolved: tuple[str, ...] = (),
+        display_interval_diagnostic: str = "",
+    ) -> VisionOutcome:
+        return VisionOutcome(
+            run_id,
+            handle.dataset_id,
+            handle.revision,
+            VisionStatus.NEEDS_REVIEW,
+            message,
+            roi,
+            roi_reason,
+            confidence,
+            flags,
+            roi_png,
+            plot.png_bytes,
+            alternatives=alternatives,
+            unresolved=unresolved,
+            inspected_frames=tuple(f.frame_index for f in frames),
+            inspected_phases=tuple(phases),
+            request_stages=("sample_roi", "phase_shortlist", "phase_overlay"),
+            phase_overlays=tuple(zip(phases, overlays)),
+            phase_reason=phase_reason,
+            display_interval_diagnostic=display_interval_diagnostic,
+        )
+
+    recommended_display_window: tuple[float, float] | None = None
+
+    def provisional_interval_review(diagnostic: str) -> VisionOutcome:
+        return VisionOutcome(
+            run_id=run_id,
+            dataset_id=handle.dataset_id,
+            revision=handle.revision,
+            status=VisionStatus.NEEDS_REVIEW,
+            message=(
+                "A provisional phase and edge proposal is available for review. The model's "
+                "display interval was unavailable or invalid; NEAT shows its locally "
+                "calculated edge-flank envelope where possible. No settings were applied."
+            ),
+            roi=roi,
+            roi_reason=roi_reason,
+            confidence=confidence,
+            ambiguity_flags=flags,
+            roi_preview_png=roi_png,
+            spectrum_png=plot.png_bytes,
+            phase_id=phase_id,
+            hkls=tuple(hkls),
+            edge_reasons=edge_reasons,
+            display_window=recommended_display_window,
+            overlay_png=overlays[phases.index(phase_id)],
+            alternatives=tuple(alternatives),
+            unresolved=unresolved,
+            inspected_frames=tuple(f.frame_index for f in frames),
+            inspected_phases=tuple(phases),
+            request_stages=("sample_roi", "phase_shortlist", "phase_overlay"),
+            phase_overlays=tuple(zip(phases, overlays)),
+            phase_reason=reason,
+            display_interval_diagnostic=diagnostic,
+        )
+
+    marker_summaries = []
+    for candidate_phase in phases:
+        visible_markers = [
+            f"({hkl[0]},{hkl[1]},{hkl[2]}) at {position:.5g} Å"
+            for hkl, position in trusted_phase_edges(candidate_phase)
+            if bounds[0] <= position <= bounds[1]
+        ]
+        marker_summaries.append(
+            f"{candidate_phase}: " + (", ".join(visible_markers) or "no markers")
+        )
     progress(78, "Comparing measured spectrum with candidate edge overlays locally")
     proposal = inspector.inspect(
         "phase_overlay",
         overlays,
         "These are real measured ROI spectra with trusted theoretical dashed Bragg-edge markers for phases "
         f"{phases}, in the same order. Full wavelength extent is {bounds[0]:.6g} to {bounds[1]:.6g} Å. "
+        "Trusted marker HKLs and exact wavelengths in the plotted range are: "
+        + "; ".join(marker_summaries)
+        + ". Assess the complete marker pattern for every overlay, not just the best-looking match. "
+        "For each candidate phase, compare each in-range predicted marker with the measured trace. "
+        "A clear predicted marker with no corresponding step or feature is negative evidence and can disfavor that phase, "
+        "even when another marker matches. Do not keep a phase as an alternative solely because one edge matches "
+        "if another prominent in-range marker is visibly unsupported. Mark a phase disfavored only when the "
+        "unmatched marker is within the measured range and the plot provides a fair visual comparison; otherwise "
+        "describe the ambiguity in unresolved. Exclude clearly disfavored phases from alternatives. State the strongest "
+        "contradicting marker and phase explicitly in reason or unresolved, including its HKL and approximate wavelength. "
+        "The requested display interval is for examining complete edge shapes, not just locating marker centers. "
+        "For every selected edge at wavelength λ, include NEAT's default pre-edge Region 1 (from max(0.90λ, λ−0.3 Å) "
+        "to 0.98λ) and post-edge Region 2 (from 1.04λ to min(1.12λ, λ+0.4 Å)). "
+        "Set display_min/display_max outside the outermost selected edge centers far enough to include both flanks; "
+        "never use the first and last selected marker positions as the interval bounds. "
         "Visually propose one PROVISIONAL phase and clean candidate edges, or mark uncertain. "
         "A marker near a step-like feature is visual plausibility only, not crystallographic identification or fit quality. "
+        f"For a hypothesis, choose 1 to {MAX_VISION_CANDIDATE_EDGES} unique HKLs, each copied exactly from the selected phase's trusted marker list; "
+        "include one short edge_reasons entry per selected HKL. Never return an empty or longer edge list. "
+        "If no edge list satisfies those limits or the comparison is ambiguous, set status to uncertain, phase_id to null, "
+        "hkls and edge_reasons to empty arrays, and display_min/display_max to null. "
         "Do not invent SNR, strain or d-spacing. Return exactly JSON keys status (hypothesis/uncertain), "
         "phase_id (phase string or null), hkls (array of [h,k,l]), edge_reasons (one short reason per HKL), "
-        "display_min, display_max (Å numeric or null), reason, alternatives (phase IDs), unresolved (short strings).",
+        "display_min, display_max (Å numeric or null), reason (summarize support and strongest contradiction), "
+        "alternatives (other plausible phase IDs only; exclude clearly disfavored phases), unresolved (short strings).",
     )
     _checkpoint(handle, cancelled, started)
     if not isinstance(proposal, Mapping):
-        raise VisionError("Phase proposal was not a JSON object.")
+        return manual_phase_review(
+            "The visual model response could not be read in NEAT's expected format. "
+            "The image, measured spectrum, and trusted overlays are available for manual review.",
+            phase_reason="No phase or edge suggestion passed validation.",
+            unresolved=("NEAT did not accept a phase or candidate-edge suggestion.",),
+        )
     required = {
         "status",
         "phase_id",
@@ -624,45 +868,86 @@ def run_visual_rehearsal(
         or not isinstance(proposal["status"], str)
         or proposal["status"] not in {"hypothesis", "uncertain"}
     ):
-        raise VisionError("Visual phase proposal schema is invalid.")
-    reason = _text(proposal["reason"], "Visual phase reason")
-    alternatives = proposal["alternatives"]
-    if (
-        not isinstance(alternatives, list)
-        or len(alternatives) > MAX_VISION_PHASES
-        or any(not isinstance(p, str) or p not in phases for p in alternatives)
-    ):
-        raise VisionError("Alternative phases are unsupported.")
-    unresolved = _texts(proposal["unresolved"], "Unresolved check", 5)
+        return manual_phase_review(
+            "The visual model response did not match NEAT's review format. "
+            "The image, measured spectrum, and trusted overlays are available for manual review.",
+            phase_reason="No phase or edge suggestion passed validation.",
+            unresolved=("NEAT did not accept a phase or candidate-edge suggestion.",),
+        )
+    try:
+        reason = _text(proposal["reason"], "Visual phase reason")
+    except VisionError:
+        return manual_phase_review(
+            "The visual model response did not include a usable explanation. "
+            "The image, measured spectrum, and trusted overlays are available for manual review.",
+            phase_reason="No phase or edge suggestion passed validation.",
+            unresolved=("NEAT did not accept a phase or candidate-edge suggestion.",),
+        )
+    try:
+        alternatives = _texts(
+            proposal["alternatives"], "Alternative phase", MAX_VISION_PHASES
+        )
+    except VisionError:
+        return manual_phase_review(
+            "The visual model returned unsupported alternative phases. "
+            "The image, measured spectrum, and trusted overlays are available for manual review.",
+            phase_reason="No phase or edge suggestion passed validation.",
+            unresolved=("NEAT did not accept a phase or candidate-edge suggestion.",),
+        )
+    if any(candidate not in phases for candidate in alternatives):
+        return manual_phase_review(
+            "The visual model returned unsupported alternative phases. "
+            "The image, measured spectrum, and trusted overlays are available for manual review.",
+            phase_reason="No phase or edge suggestion passed validation.",
+            unresolved=("NEAT did not accept a phase or candidate-edge suggestion.",),
+        )
+    try:
+        unresolved = _texts(proposal["unresolved"], "Unresolved check", 5)
+    except VisionError:
+        return manual_phase_review(
+            "The visual model's unresolved checks could not be validated. "
+            "The image, measured spectrum, and trusted overlays are available for manual review.",
+            phase_reason="No phase or edge suggestion passed validation.",
+            alternatives=tuple(alternatives),
+            unresolved=("NEAT did not accept a phase or candidate-edge suggestion.",),
+        )
     if proposal["status"] == "uncertain":
-        return VisionOutcome(
-            run_id,
-            handle.dataset_id,
-            handle.revision,
-            VisionStatus.NEEDS_REVIEW,
-            "OpenAI visual review could not select a phase; review the actual evidence.",
-            roi,
-            roi_reason,
-            confidence,
-            flags,
-            roi_png,
-            plot.png_bytes,
+        return manual_phase_review(
+            "The visual model marked the overlay comparison as uncertain. "
+            "Review the measured spectrum and trusted overlays; no phase or edge suggestion was accepted.",
+            phase_reason=reason,
             alternatives=tuple(alternatives),
             unresolved=unresolved,
-            inspected_frames=tuple(f.frame_index for f in frames),
-            inspected_phases=tuple(phases),
-            request_stages=("sample_roi", "phase_shortlist", "phase_overlay"),
-            phase_overlays=tuple(zip(phases, overlays)),
-            phase_reason=reason,
         )
     proposed_phase = proposal["phase_id"]
     if not isinstance(proposed_phase, str) or proposed_phase not in phases:
-        raise VisionError("Proposed phase was not among the inspected overlays.")
+        return manual_phase_review(
+            "The visual model selected a phase that NEAT did not compare. "
+            "Review the displayed evidence manually; no phase or edge suggestion was accepted.",
+            phase_reason="The selected phase was not in the trusted overlay set.",
+            alternatives=tuple(alternatives),
+            unresolved=unresolved,
+        )
     phase_id = proposed_phase
     raw_hkls = proposal["hkls"]
-    if not isinstance(raw_hkls, list) or not raw_hkls or len(raw_hkls) > 5:
-        raise VisionError("Candidate edge list is invalid.")
-    allowed_hkls = {hkl for hkl, _ in trusted_phase_edges(phase_id)}
+    if (
+        not isinstance(raw_hkls, list)
+        or not raw_hkls
+        or len(raw_hkls) > MAX_VISION_CANDIDATE_EDGES
+    ):
+        return manual_phase_review(
+            "Visual review is incomplete: the model's edge list must contain 1 to "
+            f"{MAX_VISION_CANDIDATE_EDGES} edges. NEAT did not accept a phase or edge suggestion. "
+            "Review the displayed measured spectrum and trusted overlays manually.",
+            phase_reason="The candidate-edge count failed NEAT's deterministic validation.",
+            alternatives=tuple(alternatives),
+            unresolved=("No candidate edges were accepted.",),
+        )
+    allowed_hkls = {
+        hkl
+        for hkl, wavelength in trusted_phase_edges(phase_id)
+        if bounds[0] <= wavelength <= bounds[1]
+    }
     hkls: list[tuple[int, int, int]] = []
     for raw_hkl in raw_hkls:
         if (
@@ -670,30 +955,99 @@ def run_visual_rehearsal(
             or len(raw_hkl) != 3
             or any(type(v) is not int for v in raw_hkl)
         ):
-            raise VisionError("Candidate HKL is malformed.")
+            return manual_phase_review(
+                "Visual review is incomplete: a candidate edge did not use an integer [h, k, l] triplet. "
+                "NEAT did not accept a phase or edge suggestion; review the displayed evidence manually.",
+                phase_reason="A candidate edge failed NEAT's deterministic validation.",
+                alternatives=tuple(alternatives),
+                unresolved=("No candidate edges were accepted.",),
+            )
         hkl = tuple(raw_hkl)
         if hkl not in allowed_hkls or hkl in hkls:
-            raise VisionError("Candidate HKL is not supported by the proposed phase.")
+            return manual_phase_review(
+                "Visual review is incomplete: a candidate edge was unsupported or duplicated. "
+                "NEAT did not accept a phase or edge suggestion; review the displayed evidence manually.",
+                phase_reason="A candidate edge failed NEAT's deterministic validation.",
+                alternatives=tuple(alternatives),
+                unresolved=("No candidate edges were accepted.",),
+            )
         hkls.append(hkl)
-    edge_reasons = _texts(proposal["edge_reasons"], "Edge reason", 5)
+    try:
+        edge_reasons = _texts(
+            proposal["edge_reasons"], "Edge reason", MAX_VISION_CANDIDATE_EDGES
+        )
+    except VisionError:
+        return manual_phase_review(
+            "Visual review is incomplete: the candidate-edge explanations could not be validated. "
+            "NEAT did not accept a phase or edge suggestion; review the displayed evidence manually.",
+            phase_reason="Candidate-edge explanations failed NEAT's deterministic validation.",
+            alternatives=tuple(alternatives),
+            unresolved=("No candidate edges were accepted.",),
+        )
     if len(edge_reasons) != len(hkls):
-        raise VisionError("Each proposed edge needs a visual reason.")
+        return manual_phase_review(
+            "Visual review is incomplete: each candidate edge needs one explanation. "
+            "NEAT did not accept a phase or edge suggestion; review the displayed evidence manually.",
+            phase_reason="Candidate-edge explanations did not match the edge list.",
+            alternatives=tuple(alternatives),
+            unresolved=("No candidate edges were accepted.",),
+        )
+    recommended_display_window, complete_flanks_available = (
+        _default_edge_display_envelope(phase_id, hkls, bounds)
+    )
     raw_lo, raw_hi = proposal["display_min"], proposal["display_max"]
+    if raw_lo is None and raw_hi is None:
+        return provisional_interval_review(
+            "No display interval was proposed; NEAT calculated a display range from the "
+            "default left and right edge-fitting regions."
+        )
     if any(
         isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
         for v in (raw_lo, raw_hi)
     ):
-        raise VisionError("Proposed display interval must contain finite numbers.")
+        return provisional_interval_review(
+            "The proposed interval was missing one bound or was nonnumeric/non-finite; "
+            f"measured axis is {bounds[0]:.6g}–{bounds[1]:.6g} Å."
+        )
     lo, hi = float(cast(float, raw_lo)), float(cast(float, raw_hi))
     if not bounds[0] <= lo < hi <= bounds[1]:
-        raise VisionError(
-            "Proposed display interval is outside the measured wavelength axis."
+        outside: list[str] = []
+        if lo < bounds[0]:
+            outside.append(f"lower bound is {bounds[0] - lo:.6g} Å below the measured minimum")
+        if hi > bounds[1]:
+            outside.append(f"upper bound is {hi - bounds[1]:.6g} Å above the measured maximum")
+        if lo >= hi:
+            outside.append("the interval is reversed or has zero width")
+        return provisional_interval_review(
+            f"Model proposed {lo:.6g}–{hi:.6g} Å; measured axis is "
+            f"{bounds[0]:.6g}–{bounds[1]:.6g} Å. " + "; ".join(outside) + "."
         )
-    if np.count_nonzero((finite_wl >= lo) & (finite_wl <= hi)) < 10:
-        raise VisionError("Proposed display interval contains too few measured points.")
     positions = dict(trusted_phase_edges(phase_id))
     if any(not lo <= positions[hkl] <= hi for hkl in hkls):
-        raise VisionError("Proposed display interval omits a selected edge marker.")
+        return provisional_interval_review(
+            f"Model proposed {lo:.6g}–{hi:.6g} Å, which omits at least one selected "
+            "edge marker; NEAT uses its locally calculated edge-flank envelope instead."
+        )
+    model_interval = (lo, hi)
+    lo = min(lo, recommended_display_window[0])
+    hi = max(hi, recommended_display_window[1])
+    interval_notes = []
+    if (lo, hi) != model_interval:
+        interval_notes.append(
+            f"Model proposed {model_interval[0]:.6g}–{model_interval[1]:.6g} Å, "
+            "which bracketed edge centers but clipped the default left/right fitting regions; "
+            f"NEAT extended the display interval to {lo:.6g}–{hi:.6g} Å."
+        )
+    if not complete_flanks_available:
+        interval_notes.append(
+            "The measured wavelength axis does not contain the complete default fitting-side "
+            "regions for every selected edge."
+        )
+    if np.count_nonzero((finite_wl >= lo) & (finite_wl <= hi)) < 10:
+        return provisional_interval_review(
+            "Fewer than 10 measured wavelengths fall in the locally calculated edge-flank envelope."
+        )
+    display_interval_diagnostic = " ".join(interval_notes)
     progress(100, "Visual proposal ready for user review")
     return VisionOutcome(
         run_id,
@@ -719,18 +1073,19 @@ def run_visual_rehearsal(
         ("sample_roi", "phase_shortlist", "phase_overlay"),
         tuple(zip(phases, overlays)),
         reason,
+        display_interval_diagnostic=display_interval_diagnostic,
     )
 
 
 __all__ = [
     "OpenAIVisionInspector",
-    "VisionInspector",
-    "VisionError",
-    "VisionUnavailable",
     "VisionCancelled",
+    "VisionError",
+    "VisionInspector",
     "VisionStale",
-    "run_visual_rehearsal",
+    "VisionUnavailable",
     "render_phase_overlay",
     "render_roi_overlay",
+    "run_visual_rehearsal",
     "trusted_phase_edges",
 ]

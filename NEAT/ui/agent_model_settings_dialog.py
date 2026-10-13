@@ -104,9 +104,10 @@ class AgentModelSettingsDialog(QDialog):
         loaded = self.settings_repository.load()
         layout = QVBoxLayout(self)
         explanation = QLabel(
-            "These settings are separate from NEAT AI Assistant. Saving a cloud "
-            "provider does not permit data transmission. Planning and visual review "
-            "use this same model, but each needs fresh permission for each run.",
+            "These settings are separate from NEAT AI Assistant. In OpenAI cloud "
+            "mode, starting an analysis automatically sends the disclosed minimized "
+            "dataset summary and bounded visual previews for image stacks. Saving "
+            "settings alone sends nothing.",
             self,
         )
         explanation.setWordWrap(True)
@@ -114,7 +115,7 @@ class AgentModelSettingsDialog(QDialog):
 
         form = QFormLayout()
         self.mode_combo = QComboBox(self)
-        self.mode_combo.addItem("Offline deterministic", AgentModelMode.OFFLINE.value)
+        self.mode_combo.addItem("No LLM (analysis unavailable)", AgentModelMode.OFFLINE.value)
         self.mode_combo.addItem("Local model (loopback only)", AgentModelMode.LOCAL.value)
         self.mode_combo.addItem("OpenAI cloud", AgentModelMode.OPENAI_CLOUD.value)
         self.mode_combo.setCurrentIndex(
@@ -141,9 +142,11 @@ class AgentModelSettingsDialog(QDialog):
         layout.addLayout(form)
 
         self.privacy_label = QLabel(
-            "Planning uses one bounded request. For OpenAI visual review, the Agent window "
-            "asks separately before each run and sends only bounded preview images/spectra. "
-            "Both tasks use this same model ID and Agent API key.",
+            "OpenAI analysis uses at most one bounded planning request. For image stacks, "
+            "visual review automatically sends only bounded image/spectrum previews, with "
+            "at most three additional requests. Both tasks use the same model ID and Agent "
+            "API key. Local mode stays on the configured loopback endpoint and sends no "
+            "visual evidence to OpenAI.",
             self,
         )
         self.privacy_label.setWordWrap(True)

@@ -33,10 +33,10 @@ from NEAT.domain.agent_model import (
     AgentModelSettings,
     PlanningObjective,
 )
-from NEAT.domain.agent_planning import PlanningOutcome, PlanningStatus
+from NEAT.domain.agent_planning import PlannerSource, PlanningOutcome, PlanningStatus
 from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
-from NEAT.domain.agent_vision import VisionStatus
-from NEAT.domain.observation import DatasetMode
+from NEAT.domain.agent_vision import VisionOutcome, VisionStatus
+from NEAT.domain.observation import DatasetMode, RoiBounds
 from NEAT.ui.agent_model_settings_dialog import (
     AgentModelConnectionWorker,
     AgentModelSettingsDialog,
@@ -92,7 +92,11 @@ class AgentPreflightTests(unittest.TestCase):
         self.host = _Host()
         self.window = AgentWindow(self.host)
         # Keep these tests independent of a developer's saved Agent provider.
-        self.window._agent_settings = AgentModelSettings()
+        self.window._agent_settings = AgentModelSettings(
+            mode=AgentModelMode.LOCAL,
+            model_id="injected-test-model",
+            endpoint="http://127.0.0.1:11434/v1",
+        )
         self.window._update_model_readiness()
         self.host.agent_window = self.window
         self.window.show()
@@ -186,36 +190,41 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertGreater(self.window.splitter.sizes()[0], 0)
         self.assertGreater(self.window.splitter.sizes()[1], 0)
 
-    def test_m4_provider_readiness_and_cloud_consent_are_scoped_to_one_run(self):
+    def test_model_readiness_discloses_cloud_transfer_and_snapshot_authorization(self):
+        self.window._agent_settings = AgentModelSettings()
+        self.window._update_model_readiness()
+        self.assertIn("No LLM model is selected", self.window.model_readiness_label.text())
+        self.assertIn("offline substitute plan", self.window.model_readiness_label.text())
+        self.assertFalse(hasattr(self.window, "cloud_consent_checkbox"))
+        self.assertFalse(hasattr(self.window, "vision_checkbox"))
+        self.assertFalse(hasattr(self.window, "fallback_checkbox"))
+
+        self.window.start_autonomous_analysis()
+        self.assertIn("LLM model is not available", self.window.status_label.text())
+        self.assertIsNone(self.window._worker)
+        self.assertIsNone(self.window._planning_worker)
+
         self.window._agent_settings = AgentModelSettings(
             mode=AgentModelMode.OPENAI_CLOUD,
             model_id="",
         )
         self.window._update_model_readiness()
-        self.assertTrue(self.window.cloud_consent_checkbox.isVisible())
-        self.assertTrue(self.window.vision_checkbox.isVisible())
-        self.assertIn("OpenAI", self.window.cloud_consent_checkbox.text())
-        self.assertFalse(self.window.cloud_consent_checkbox.isEnabled())
-        self.assertIn("metadata summary", self.window.cloud_consent_checkbox.text())
-        self.assertIn("bounded image and spectrum previews", self.window.vision_checkbox.text())
-        self.assertNotIn("Also", self.window.vision_checkbox.text())
-        self.assertFalse(self.window.cloud_consent_checkbox.isChecked())
-        self.assertIn("Model not configured", self.window.model_readiness_label.text())
+        self.assertIn("OpenAI LLM is not configured", self.window.model_readiness_label.text())
+        self.assertIn("No request or visual evidence will be sent", self.window.model_readiness_label.text())
 
         self.window._agent_settings = AgentModelSettings(
             mode=AgentModelMode.OPENAI_CLOUD,
             model_id="configured-model",
         )
         self.window._update_model_readiness()
-        self.assertTrue(self.window.cloud_consent_checkbox.isEnabled())
-        self.assertTrue(self.window.vision_checkbox.isEnabled())
+        self.assertIn("automatically sends", self.window.model_readiness_label.text())
+        self.assertIn("up to 3 bounded image previews", self.window.model_readiness_label.text())
         self.assertIn("configured-model", self.window.model_readiness_label.text())
 
-        self.window.cloud_consent_checkbox.setChecked(True)
         snapshot = self.window._snapshot_run_configuration()
         self.assertEqual(snapshot.objective, PlanningObjective.DATASET_READINESS)
         self.assertTrue(snapshot.cloud_egress_consent)
-        self.assertFalse(self.window.cloud_consent_checkbox.isChecked())
+        self.assertFalse(snapshot.deterministic_fallback)
 
         self.window._agent_settings = AgentModelSettings(
             mode=AgentModelMode.LOCAL,
@@ -224,11 +233,10 @@ class AgentPreflightTests(unittest.TestCase):
         )
         self.window._update_model_readiness()
         self.assertEqual(snapshot.settings.model_id, "configured-model")
-        self.assertEqual(
-            snapshot.settings.mode, AgentModelMode.OPENAI_CLOUD
-        )
-        self.assertFalse(self.window.cloud_consent_checkbox.isVisible())
-        self.assertFalse(self.window.vision_checkbox.isVisible())
+        self.assertEqual(snapshot.settings.mode, AgentModelMode.OPENAI_CLOUD)
+        self.assertTrue(snapshot.cloud_egress_consent)
+        self.assertIn("loopback endpoint", self.window.model_readiness_label.text())
+        self.assertIn("not sent in local-model mode", self.window.model_readiness_label.text())
 
     def test_model_connection_is_user_initiated_and_uses_tracked_worker(self):
         created_workers = []
@@ -688,16 +696,33 @@ class AgentPreflightTests(unittest.TestCase):
 
     @unittest.skipUnless(find_spec("langgraph") is not None, "requires the optional NEAT [agent] extra")
     def test_one_click_runs_current_preflight_then_real_graph_without_second_action(self):
-        self.window.start_autonomous_button.click()
-        first_run_id = self.window._agent_run_id
-        self.window.start_autonomous_button.click()
-        self.assertFalse(hasattr(self.window, "start_button"))
-        self._wait_for(
-            lambda: self.window._planning_outcome is not None
-            and self.window._planning_worker is None
-            and self.window._worker is None
-            and not self.host._shutdown_worker_inventory.workers
-        )
+        from test_agent_model import FakeModel
+
+        import NEAT.ui.agent_window as agent_window_module
+        from NEAT.ui.agent_planning_worker import PlanningWorker as RealPlanningWorker
+
+        model = FakeModel()
+
+        def build_worker(context, revision_clock, snapshot, **kwargs):
+            return RealPlanningWorker(
+                context,
+                revision_clock,
+                snapshot,
+                model=model,
+                **kwargs,
+            )
+
+        with patch.object(agent_window_module, "PlanningWorker", side_effect=build_worker):
+            self.window.start_autonomous_button.click()
+            first_run_id = self.window._agent_run_id
+            self.window.start_autonomous_button.click()
+            self.assertFalse(hasattr(self.window, "start_button"))
+            self._wait_for(
+                lambda: self.window._planning_outcome is not None
+                and self.window._planning_worker is None
+                and self.window._worker is None
+                and not self.host._shutdown_worker_inventory.workers
+            )
         outcome = self.window._planning_outcome
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome.run_id, first_run_id)
@@ -707,6 +732,7 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIn("validate_preflight", outcome.transitions)
         self.assertIn("propose_read_only_plan", outcome.transitions)
         self.assertEqual(outcome.transitions[-1], "terminal")
+        self.assertEqual(len(model.calls), 1)
         self.assertTrue(self.window.start_autonomous_button.isEnabled())
         self.assertFalse(self.window.stop_button.isVisible())
         self.assertFalse(self.window.progress_bar.isVisible())
@@ -734,7 +760,6 @@ class AgentPreflightTests(unittest.TestCase):
             mode=AgentModelMode.OPENAI_CLOUD, model_id="gpt-6-luna"
         )
         self.window._update_model_readiness()
-        self.window.vision_checkbox.setChecked(True)
 
     def _fake_agent_keyring_patch(self):
         import NEAT.ui.agent_window as agent_window_module
@@ -749,14 +774,32 @@ class AgentPreflightTests(unittest.TestCase):
             return_value=FakeKeyStore(),
         )
 
+    @staticmethod
+    def _successful_fake_plan(context, **_kwargs):
+        return PlanningOutcome(
+            run_id=context.run_id,
+            preflight_run_id=context.preflight_run_id,
+            dataset_id=context.dataset_id,
+            revision=context.revision,
+            status=PlanningStatus.READY_PLAN,
+            transitions=(
+                "validate_preflight",
+                "propose_read_only_plan",
+                "validate_plan",
+                "terminal",
+            ),
+            planner_source=PlannerSource.LLM_GENERATED,
+        )
+
     @unittest.skipUnless(
         find_spec("langgraph") is not None,
         "requires the optional NEAT [agent] extra",
     )
-    def test_openai_uses_same_model_for_consented_planning_and_visual_review(self):
+    def test_openai_uses_same_model_for_planning_and_visual_review(self):
         from test_agent_vision import FakeVision
-        import NEAT.ui.agent_window as agent_window_module
+
         import NEAT.ui.agent_vision_worker as worker_module
+        import NEAT.ui.agent_window as agent_window_module
         from NEAT.services.agent_model import ModelCompletion
         from NEAT.ui.agent_planning_worker import PlanningWorker as RealPlanningWorker
 
@@ -773,7 +816,6 @@ class AgentPreflightTests(unittest.TestCase):
                 return None
 
         self._configure_synthetic_vision_dataset()
-        self.window.cloud_consent_checkbox.setChecked(True)
         fake_planner = FakePlanner()
         configured_for_planning = []
         configured_for_vision = []
@@ -819,7 +861,7 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIsNotNone(self.window._planning_outcome)
         self.assertEqual(self.window._planning_outcome.status, PlanningStatus.READY_PLAN)
         self.assertEqual(self.window._planning_outcome.planner_source.value, "llm_generated_plan")
-        self.assertTrue(self._planning_request_was_consented())
+        self.assertTrue(self._planning_request_was_authorized())
         self.assertEqual(fake_planner.calls, 1)
         self.assertEqual(configured_for_planning, ["gpt-6-luna"])
         self.assertEqual(configured_for_vision, configured_for_planning)
@@ -840,7 +882,7 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIsNone(self.window._vision_outcome)
         self.assertIn("rejected", self.window.status_label.text().lower())
 
-    def _planning_request_was_consented(self):
+    def _planning_request_was_authorized(self):
         return bool(
             self.window._run_snapshot
             and self.window._run_snapshot.cloud_egress_consent
@@ -848,11 +890,18 @@ class AgentPreflightTests(unittest.TestCase):
 
     def test_stop_after_vision_computation_before_queued_completion_discards_result(self):
         from test_agent_vision import FakeVision
+
+        import NEAT.ui.agent_planning_worker as planning_worker_module
         import NEAT.ui.agent_vision_worker as worker_module
 
         self._configure_synthetic_vision_dataset()
         with (
             self._fake_agent_keyring_patch(),
+            patch.object(
+                planning_worker_module,
+                "run_planning",
+                side_effect=self._successful_fake_plan,
+            ),
             patch.object(worker_module, "OpenAIVisionInspector", return_value=FakeVision()),
         ):
             self.window.start_autonomous_analysis()
@@ -869,6 +918,8 @@ class AgentPreflightTests(unittest.TestCase):
 
     def test_openai_vision_stop_and_retirement_keep_controls_visible(self):
         from test_agent_vision import FakeVision
+
+        import NEAT.ui.agent_planning_worker as planning_worker_module
         import NEAT.ui.agent_vision_worker as worker_module
 
         entered = threading.Event()
@@ -888,6 +939,11 @@ class AgentPreflightTests(unittest.TestCase):
         self._configure_synthetic_vision_dataset()
         with (
             self._fake_agent_keyring_patch(),
+            patch.object(
+                planning_worker_module,
+                "run_planning",
+                side_effect=self._successful_fake_plan,
+            ),
             patch.object(worker_module, "OpenAIVisionInspector", return_value=BlockingVision()),
         ):
             self.window.start_autonomous_analysis()
@@ -902,18 +958,47 @@ class AgentPreflightTests(unittest.TestCase):
             self.assertIsNone(self.window._vision_outcome)
             self.assertTrue(self.window.start_autonomous_button.isEnabled())
 
+    def test_incomplete_visual_review_explains_manual_review_without_claiming_uncertainty(self):
+        self.window._planning_display_text = "Validated read-only plan."
+        outcome = VisionOutcome(
+            "run",
+            "dataset",
+            3,
+            VisionStatus.NEEDS_REVIEW,
+            "Visual review is incomplete: the model's edge list must contain 1 to 5 edges. "
+            "NEAT did not accept a phase or edge suggestion. Review the displayed measured spectrum and trusted overlays manually.",
+            roi=RoiBounds(10, 20, 12, 22),
+            roi_reason="A possible sample region; review the boundary.",
+            confidence="medium",
+            phase_reason="The candidate-edge count failed NEAT's deterministic validation.",
+            inspected_frames=(0, 2),
+            inspected_phases=("Fe_bcc", "CeO2"),
+        )
+
+        self.window._render_vision_outcome(outcome)
+        displayed = self.window.plan_text.toPlainText()
+
+        self.assertIn("manual evidence review required", displayed)
+        self.assertIn("Review status: Visual review is incomplete", displayed)
+        self.assertIn("No provisional phase or candidate-edge suggestion was accepted.", displayed)
+        self.assertIn("candidate-edge count failed", displayed)
+        self.assertNotIn("model reported uncertainty", displayed)
+
     def test_visual_review_requires_a_configured_openai_model_before_preflight(self):
         self._configure_synthetic_vision_dataset()
         self.window._agent_settings = AgentModelSettings(
             mode=AgentModelMode.OPENAI_CLOUD, model_id=""
         )
         self.window.start_autonomous_analysis()
-        self.assertIn("configure an openai model", self.window.status_label.text().lower())
+        self.assertIn("llm unavailable", self.window.status_label.text().lower())
+        self.assertIn("exact openai model id", self.window.status_label.text().lower())
         self.assertIsNone(self.window._planning_worker)
         self.assertIsNone(self.window._vision_worker)
 
     def test_parent_shutdown_retires_active_visual_worker(self):
         from test_agent_vision import FakeVision
+
+        import NEAT.ui.agent_planning_worker as planning_worker_module
         import NEAT.ui.agent_vision_worker as worker_module
 
         entered = threading.Event()
@@ -932,6 +1017,11 @@ class AgentPreflightTests(unittest.TestCase):
         self._configure_synthetic_vision_dataset()
         with (
             self._fake_agent_keyring_patch(),
+            patch.object(
+                planning_worker_module,
+                "run_planning",
+                side_effect=self._successful_fake_plan,
+            ),
             patch.object(worker_module, "OpenAIVisionInspector", return_value=BlockingVision()),
         ):
             self.window.start_autonomous_analysis()
@@ -1011,7 +1101,6 @@ class AgentPreflightTests(unittest.TestCase):
             )
 
         self._configure_synthetic_vision_dataset()
-        self.window.cloud_consent_checkbox.setChecked(True)
         with (
             patch.object(worker_module, "run_planning", side_effect=successful_planning),
             patch.object(

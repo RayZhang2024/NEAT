@@ -41,6 +41,7 @@ class VisionOutcome:
     request_stages: tuple[str, ...] = ()
     phase_overlays: tuple[tuple[str, bytes], ...] = ()
     phase_reason: str = ""
+    display_interval_diagnostic: str = ""
 
 
 __all__ = ["VisionOutcome", "VisionStatus"]

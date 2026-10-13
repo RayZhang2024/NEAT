@@ -134,7 +134,22 @@ class PlanningWorker(QThread):
 
         self.progress.emit(10, "Validating the preflight before planning")
         try:
-            if (
+            if snapshot is not None and snapshot.settings.mode is AgentModelMode.OFFLINE:
+                outcome = PlanningOutcome(
+                    context.run_id,
+                    context.preflight_run_id,
+                    context.dataset_id,
+                    context.revision,
+                    PlanningStatus.FAILED,
+                    error_code=PlanningErrorCode.MODEL_UNAVAILABLE,
+                    message=(
+                        "No LLM model is configured. Select OpenAI cloud or a local "
+                        "model in Agent settings. No offline plan was substituted."
+                    ),
+                    planner_source=PlannerSource.NONE,
+                    objective=context.objective,
+                )
+            elif (
                 snapshot is not None
                 and snapshot.settings.mode is AgentModelMode.OPENAI_CLOUD
                 and not snapshot.cloud_egress_consent
@@ -143,7 +158,6 @@ class PlanningWorker(QThread):
                 outcome = self._needs_permission_outcome(context)
             elif (
                 snapshot is not None
-                and snapshot.settings.mode is not AgentModelMode.OFFLINE
                 and context.readiness is PreflightReadiness.READY
                 and context.preflight_complete
             ):
@@ -207,31 +221,30 @@ class PlanningWorker(QThread):
                 except AgentModelError as exc:
                     if self._cancel.is_set():
                         raise PlanningCancelled("Planning was stopped.") from exc
-                    if snapshot.deterministic_fallback:
-                        self.progress.emit(80, "Using the selected deterministic fallback")
-                        outcome = run_planning(
-                            context,
-                            cancelled=self._cancel.is_set,
-                            current_dataset_token=revision_clock.current,
-                            planner_source=PlannerSource.DETERMINISTIC_FALLBACK,
-                            provider=provider,
-                            model_id=model_id,
-                        )
-                        outcome = replace(
-                            outcome,
-                            message=(
-                                "LLM unavailable / output rejected — deterministic fallback. "
-                                + outcome.message
-                            ),
-                            planner_source=PlannerSource.DETERMINISTIC_FALLBACK,
-                            provider=provider,
-                            model_id=model_id,
-                        )
-                    else:
-                        outcome = self._error_outcome(context, exc, snapshot)
+                    outcome = self._error_outcome(context, exc, snapshot)
+            elif snapshot is not None:
+                # Do not make an offline proposal when the selected LLM cannot
+                # safely be called for this preflight.
+                outcome = PlanningOutcome(
+                    context.run_id,
+                    context.preflight_run_id,
+                    context.dataset_id,
+                    context.revision,
+                    PlanningStatus.FAILED,
+                    error_code=PlanningErrorCode.INVALID_PREFLIGHT,
+                    message=(
+                        "LLM planning was not run because the preflight is "
+                        f"{context.readiness.value.replace('_', ' ')}. Review the "
+                        "dataset check and correct the data before retrying."
+                    ),
+                    planner_source=PlannerSource.NONE,
+                    provider=provider,
+                    model_id=model_id,
+                    objective=context.objective,
+                )
             else:
-                # A limited or invalid preflight remains deterministic. It is
-                # never sent to a model, even when local/cloud was selected.
+                # The legacy no-snapshot worker mode remains deterministic for
+                # internal callers; Agent runs always supply an explicit snapshot.
                 outcome = run_planning(
                     context,
                     cancelled=self._cancel.is_set,

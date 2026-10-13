@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt5.QtWidgets import QApplication  # noqa: E402
+from PyQt5.QtWidgets import QApplication
 
 from NEAT.domain.agent_model import AgentModelMode, AgentModelSettings
 from NEAT.domain.agent_preflight import FrameEvidence, PreflightResult, assess_dataset
@@ -28,12 +28,15 @@ from NEAT.domain.observation import (
     WavelengthAxisStatus,
 )
 from NEAT.services.agent_vision import (
+    MAX_VISION_COMPLETION_TOKENS,
     OpenAIVisionInspector,
     VisionCancelled,
     VisionError,
     VisionStale,
     VisionUnavailable,
+    _message_text_content,
     _roi_from_response,
+    _visual_response_schema,
     render_roi_overlay,
     run_visual_rehearsal,
     trusted_phase_edges,
@@ -96,19 +99,23 @@ class FakeVision:
         bad_roi=None,
         bad_phase=None,
         bad_hkl=None,
+        candidate_hkls=None,
         bad_window=None,
         uncertain=False,
         no_roi=False,
         no_phase=False,
+        roi_reason="Visually inside the bright band; background remains ambiguous.",
     ):
         self.calls = []
         self.bad_roi = bad_roi
         self.bad_phase = bad_phase
         self.bad_hkl = bad_hkl
+        self.candidate_hkls = candidate_hkls
         self.bad_window = bad_window
         self.uncertain = uncertain
         self.no_roi = no_roi
         self.no_phase = no_phase
+        self.roi_reason = roi_reason
         self.cancelled = False
 
     def inspect(self, stage, images, prompt):
@@ -128,7 +135,7 @@ class FakeVision:
             return {
                 "roi": self.bad_roi
                 or {"x_min": 20, "x_max": 36, "y_min": 24, "y_max": 40},
-                "reason": "Visually inside the bright band; background remains ambiguous.",
+                "reason": self.roi_reason,
                 "confidence": "medium",
                 "ambiguity_flags": ["brightness alone is not sample proof"],
             }
@@ -149,7 +156,11 @@ class FakeVision:
         return {
             "status": "hypothesis",
             "phase_id": self.bad_phase or "Fe_bcc",
-            "hkls": [self.bad_hkl or [2, 1, 1]],
+            "hkls": (
+                self.candidate_hkls
+                if self.candidate_hkls is not None
+                else [self.bad_hkl or [2, 1, 1]]
+            ),
             "edge_reasons": ["Marker appears near a visible step."],
             "display_min": 2.0,
             "display_max": self.bad_window or 4.5,
@@ -179,6 +190,10 @@ class VisionServiceTests(unittest.TestCase):
         )
         self.assertEqual([call[0] for call in model.calls], list(result.request_stages))
         self.assertEqual([len(call[1]) for call in model.calls], [3, 1, 2])
+        self.assertIn("between 3 and 128 original pixels inclusive", model.calls[0][2])
+        self.assertIn("x coordinates for columns and y coordinates for rows", model.calls[0][2])
+        self.assertIn("choose 1 to 5 unique HKLs", model.calls[2][2])
+        self.assertIn("set status to uncertain", model.calls[2][2])
         self.assertIsNotNone(result.roi_preview_png)
         self.assertIsNotNone(result.spectrum_png)
         self.assertEqual(len(result.phase_overlays), 2)
@@ -189,7 +204,7 @@ class VisionServiceTests(unittest.TestCase):
             np.testing.assert_array_equal(before, after)
 
     def test_preview_original_coordinate_mapping_is_preserved(self):
-        handle, preflight = _fixture()
+        _handle, preflight = _fixture()
         frame = preflight.frames[0].image
         roi, *_ = _roi_from_response(
             {
@@ -207,18 +222,60 @@ class VisionServiceTests(unittest.TestCase):
             frame.coordinate_mapping.preview_pixel_to_original(10, 12), (21, 25)
         )
 
-    def test_rejects_false_coordinates_phase_hkl_and_display_interval(self):
+    def test_rejects_false_coordinates_and_uninspected_phase(self):
         for kwargs in (
             {"bad_roi": {"x_min": True, "x_max": 36, "y_min": 24, "y_max": 40}},
             {"bad_roi": {"x_min": 60, "x_max": 70, "y_min": 24, "y_max": 40}},
-            {"bad_phase": "unsupported_phase"},
-            {"bad_hkl": [9, 9, 9]},
-            {"bad_window": 9.0},
         ):
             with self.subTest(kwargs=kwargs):
                 handle, preflight = _fixture()
                 with self.assertRaises(VisionError):
                     run_visual_rehearsal("run", handle, preflight, FakeVision(**kwargs))
+
+    def test_invalid_candidate_edge_lists_preserve_evidence_for_manual_review(self):
+        for hkls in ([], [[2, 1, 1]] * 6):
+            with self.subTest(hkls=hkls):
+                handle, preflight = _fixture()
+                model = FakeVision(candidate_hkls=hkls)
+                result = run_visual_rehearsal("run", handle, preflight, model)
+                self.assertEqual(result.status, VisionStatus.NEEDS_REVIEW)
+                self.assertEqual(result.phase_id, "")
+                self.assertEqual(result.hkls, ())
+                self.assertIn("1 to 5 edges", result.message)
+                self.assertIn("did not accept a phase or edge suggestion", result.message)
+                self.assertIsNotNone(result.roi_preview_png)
+                self.assertIsNotNone(result.spectrum_png)
+                self.assertEqual(len(result.phase_overlays), 2)
+
+    def test_unsupported_hkl_and_display_interval_are_not_presented_as_valid(self):
+        for kwargs in (
+            {"bad_phase": "unsupported_phase"},
+            {"bad_hkl": [9, 9, 9]},
+        ):
+            with self.subTest(kwargs=kwargs):
+                handle, preflight = _fixture()
+                result = run_visual_rehearsal("run", handle, preflight, FakeVision(**kwargs))
+                self.assertEqual(result.status, VisionStatus.NEEDS_REVIEW)
+                self.assertEqual(result.phase_id, "")
+                self.assertEqual(result.hkls, ())
+                self.assertIn("phase", result.message.lower())
+                self.assertIsNotNone(result.roi_preview_png)
+                self.assertIsNotNone(result.spectrum_png)
+
+        handle, preflight = _fixture()
+        result = run_visual_rehearsal(
+            "run", handle, preflight, FakeVision(bad_window=9.0)
+        )
+        self.assertEqual(result.status, VisionStatus.NEEDS_REVIEW)
+        self.assertEqual(result.phase_id, "Fe_bcc")
+        self.assertEqual(result.hkls, ((2, 1, 1),))
+        self.assertIsNotNone(result.display_window)
+        assert result.display_window is not None
+        self.assertLess(result.display_window[0], 2.3352)
+        self.assertGreater(result.display_window[1], 2.3352)
+        self.assertIn("Model proposed 2–9 Å", result.display_interval_diagnostic)
+        self.assertIn("above the measured maximum", result.display_interval_diagnostic)
+        self.assertIn("NEAT shows its locally calculated edge-flank envelope", result.message)
 
     def test_uncertainty_is_not_fabricated_as_phase_selection(self):
         handle, preflight = _fixture()
@@ -308,7 +365,7 @@ class VisionServiceTests(unittest.TestCase):
             trusted_phase_edges("user_custom")
 
     def test_openai_multimodal_request_uses_shared_model_and_actual_bounded_png(self):
-        handle, preflight = _fixture()
+        _handle, preflight = _fixture()
         received = []
 
         async def respond(request):
@@ -346,7 +403,19 @@ class VisionServiceTests(unittest.TestCase):
             received[0].headers["authorization"], "Bearer temporary-test-key"
         )
         body = json.loads(received[0].content)
-        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertEqual(
+            body["max_completion_tokens"], MAX_VISION_COMPLETION_TOKENS
+        )
+        response_format = body["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        self.assertEqual(
+            response_format["json_schema"]["name"], "neat_visual_sample_roi"
+        )
+        self.assertEqual(
+            set(response_format["json_schema"]["schema"]["required"]),
+            {"roi", "reason", "confidence", "ambiguity_flags"},
+        )
         self.assertEqual(body["model"], "gpt-6-luna")
         self.assertIs(body["store"], False)
         self.assertTrue(
@@ -357,6 +426,68 @@ class VisionServiceTests(unittest.TestCase):
         self.assertEqual(inspector._api_key, "temporary-test-key")
         inspector.release_credential()
         self.assertIsNone(inspector._api_key)
+
+    def test_each_visual_stage_has_a_closed_strict_output_schema(self):
+        for stage, required in (
+            (
+                "sample_roi",
+                {"roi", "reason", "confidence", "ambiguity_flags"},
+            ),
+            ("phase_shortlist", {"candidate_phase_ids"}),
+            (
+                "phase_overlay",
+                {
+                    "status",
+                    "phase_id",
+                    "hkls",
+                    "edge_reasons",
+                    "display_min",
+                    "display_max",
+                    "reason",
+                    "alternatives",
+                    "unresolved",
+                },
+            ),
+        ):
+            schema = _visual_response_schema(stage)
+            self.assertEqual(schema["type"], "object")
+            self.assertEqual(set(schema["required"]), required)
+            self.assertIs(schema["additionalProperties"], False)
+            self.assertEqual(set(schema["properties"]), required)
+
+    def test_openai_visual_response_accepts_text_only_content_blocks(self):
+        self.assertEqual(
+            _message_text_content(
+                {"content": [{"type": "text", "text": '{"ok":true}'}]}
+            ),
+            '{"ok":true}',
+        )
+        with self.assertRaisesRegex(VisionError, "non-text content"):
+            _message_text_content(
+                {"content": [{"type": "image", "data": "private"}]}
+            )
+        with self.assertRaisesRegex(VisionError, "missing content"):
+            _message_text_content({"content": None})
+
+    def test_worker_exposes_safe_validator_diagnostic_without_model_text(self):
+        handle, preflight = _fixture()
+        model = FakeVision(
+            bad_roi={"x_min": -1, "x_max": 10, "y_min": 10, "y_max": 20},
+            roi_reason="private model response must not be shown",
+        )
+        results = []
+        worker = VisionWorker(
+            "diagnostic-run",
+            handle,
+            preflight,
+            AgentModelSettings(),
+            inspector=model,
+        )
+        worker.completed.connect(results.append)
+        worker.run()
+        self.assertEqual(results[0].status, VisionStatus.BLOCKED)
+        self.assertIn("ROI is outside the current image", results[0].message)
+        self.assertNotIn("private model response must not be shown", results[0].message)
 
     def test_active_openai_request_is_cooperatively_cancelled(self):
         _, preflight = _fixture()

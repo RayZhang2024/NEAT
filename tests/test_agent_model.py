@@ -751,7 +751,7 @@ class StructuredPlanningWorkflowTests(unittest.TestCase):
                 "A limited preflight cannot be presented as ready.",
             )
 
-    def test_worker_skips_model_for_no_consent_and_limited_preflight(self):
+    def test_worker_skips_model_without_authorization_or_safe_preflight(self):
         for context, consent in (
             (_context(), False),
             (
@@ -793,9 +793,13 @@ class StructuredPlanningWorkflowTests(unittest.TestCase):
                     completed[0].error_code, PlanningErrorCode.PERMISSION_REQUIRED
                 )
             else:
-                self.assertEqual(completed[0].status, PlanningStatus.NEEDS_INPUT)
+                self.assertEqual(completed[0].status, PlanningStatus.FAILED)
+                self.assertEqual(
+                    completed[0].error_code, PlanningErrorCode.INVALID_PREFLIGHT
+                )
+                self.assertEqual(completed[0].planner_source, PlannerSource.NONE)
 
-    def test_worker_fallback_is_explicit_and_makes_only_one_model_call(self):
+    def test_worker_does_not_fall_back_to_an_offline_plan_after_model_error(self):
         context = _context()
         settings = AgentModelSettings(
             mode=AgentModelMode.LOCAL,
@@ -821,12 +825,35 @@ class StructuredPlanningWorkflowTests(unittest.TestCase):
         self.assertTrue(done.wait(5))
         self.assertTrue(worker.wait(5000))
         self.assertEqual(len(fake.calls), 1)
-        self.assertEqual(completed[0].planner_source, PlannerSource.DETERMINISTIC_FALLBACK)
-        self.assertIn(
-            "LLM unavailable / output rejected — deterministic fallback",
-            completed[0].message,
+        self.assertEqual(completed[0].planner_source, PlannerSource.NONE)
+        self.assertEqual(completed[0].status, PlanningStatus.FAILED)
+        self.assertEqual(completed[0].error_code, PlanningErrorCode.MODEL_UNAVAILABLE)
+        self.assertEqual(completed[0].message, "safe provider error")
+
+    def test_worker_reports_unconfigured_no_llm_without_creating_a_plan(self):
+        context = _context()
+        snapshot = AgentRunSnapshot(
+            settings=AgentModelSettings(mode=AgentModelMode.OFFLINE),
+            objective=context.objective,
         )
-        self.assertIn(completed[0].status, {PlanningStatus.READY_PLAN, PlanningStatus.NEEDS_INPUT})
+        fake = FakeModel()
+        clock = DatasetRevisionClock()
+        clock._dataset_id = context.dataset_id
+        clock._revision = context.revision
+        worker = PlanningWorker(context, clock, snapshot, model=fake)
+        completed = []
+        done = threading.Event()
+        worker.completed.connect(
+            lambda outcome: (completed.append(outcome), done.set()), Qt.DirectConnection
+        )
+        worker.start()
+        self.assertTrue(done.wait(5))
+        self.assertTrue(worker.wait(5000))
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(completed[0].status, PlanningStatus.FAILED)
+        self.assertEqual(completed[0].error_code, PlanningErrorCode.MODEL_UNAVAILABLE)
+        self.assertEqual(completed[0].planner_source, PlannerSource.NONE)
+        self.assertIn("No offline plan was substituted", completed[0].message)
 
     def test_consented_cloud_fake_model_is_called_once_and_reports_usage(self):
         context = _context()
