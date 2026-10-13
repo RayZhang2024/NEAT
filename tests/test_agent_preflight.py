@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 import weakref
+from dataclasses import replace
 from importlib.util import find_spec
 from unittest.mock import Mock, patch
 
@@ -36,7 +37,12 @@ from NEAT.domain.agent_model import (
 from NEAT.domain.agent_planning import PlannerSource, PlanningOutcome, PlanningStatus
 from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
 from NEAT.domain.agent_vision import VisionOutcome, VisionStatus
-from NEAT.domain.observation import DatasetMode, RoiBounds
+from NEAT.domain.observation import (
+    DatasetMode,
+    ObservationStatus,
+    RoiBounds,
+    WavelengthAxisStatus,
+)
 from NEAT.ui.agent_model_settings_dialog import (
     AgentModelConnectionWorker,
     AgentModelSettingsDialog,
@@ -218,7 +224,8 @@ class AgentPreflightTests(unittest.TestCase):
         )
         self.window._update_model_readiness()
         self.assertIn("automatically sends", self.window.model_readiness_label.text())
-        self.assertIn("up to 3 bounded image previews", self.window.model_readiness_label.text())
+        self.assertIn("up to 7 bounded PNGs", self.window.model_readiness_label.text())
+        self.assertIn("up to 3 image previews", self.window.model_readiness_label.text())
         self.assertIn("configured-model", self.window.model_readiness_label.text())
 
         snapshot = self.window._snapshot_run_configuration()
@@ -791,6 +798,135 @@ class AgentPreflightTests(unittest.TestCase):
             planner_source=PlannerSource.LLM_GENERATED,
         )
 
+    def test_openai_visual_first_discovers_roi_when_no_neat_roi_is_selected(self):
+        from test_agent_vision import FakeVision
+
+        import NEAT.ui.agent_vision_worker as worker_module
+
+        self._configure_synthetic_vision_dataset()
+        self.host.selected_area = None
+        model = FakeVision()
+        with (
+            self._fake_agent_keyring_patch(),
+            patch.object(worker_module, "OpenAIVisionInspector", return_value=model),
+        ):
+            self.window.start_autonomous_analysis()
+            self._wait_for(
+                lambda: self.window._vision_outcome is not None
+                and self.window._vision_worker is None
+            )
+            self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+
+        outcome = self.window._vision_outcome
+        self.assertEqual(outcome.status, VisionStatus.NEEDS_REVIEW)
+        self.assertEqual(outcome.roi, RoiBounds(20, 36, 24, 40))
+        self.assertEqual(outcome.phase_id, "Fe_bcc")
+        self.assertIsNone(self.window._planning_outcome)
+        self.assertIsNone(self.window._planning_worker)
+        self.assertIn("M4 metadata planning was skipped", self.window.plan_text.toPlainText())
+        self.assertIn("no planning result is claimed", self.window.plan_text.toPlainText())
+        self.assertEqual(
+            [call[0] for call in model.calls],
+            ["sample_roi", "phase_shortlist", "phase_overlay"],
+        )
+        self.assertTrue(self.window.adjust_roi_button.isVisible())
+        self.assertEqual(self.host.selected_area, None)
+
+    def test_visual_first_reports_missing_calibration_or_invalid_image_previews(self):
+        from test_agent_vision import _fixture
+
+        _handle, result = _fixture()
+        self.window._agent_settings = AgentModelSettings(
+            mode=AgentModelMode.OPENAI_CLOUD, model_id="gpt-6-luna"
+        )
+        self.window._run_snapshot = self.window._snapshot_run_configuration()
+        self.window._vision_run_enabled = True
+
+        missing_axis = replace(
+            result,
+            dataset=replace(
+                result.dataset,
+                wavelength_axis_status=WavelengthAxisStatus.MISSING,
+            ),
+        )
+        self.assertIn(
+            "valid wavelength calibration",
+            self.window._visual_roi_discovery_problem(missing_axis),
+        )
+
+        invalid_image = replace(result.frames[0].image, status=ObservationStatus.INVALID)
+        invalid_preview = replace(
+            result,
+            frames=(replace(result.frames[0], image=invalid_image), *result.frames[1:]),
+        )
+        self.assertIn(
+            "preview is invalid or incomplete",
+            self.window._visual_roi_discovery_problem(invalid_preview),
+        )
+
+    def test_adjusted_roi_is_reused_for_a_new_visual_run_and_recomputed(self):
+        from test_agent_vision import FakeVision
+
+        import NEAT.ui.agent_planning_worker as planning_worker_module
+        import NEAT.ui.agent_vision_worker as vision_worker_module
+
+        self._configure_synthetic_vision_dataset()
+        models = [FakeVision(), FakeVision()]
+        with (
+            self._fake_agent_keyring_patch(),
+            patch.object(
+                planning_worker_module,
+                "run_planning",
+                side_effect=self._successful_fake_plan,
+            ),
+            patch.object(
+                vision_worker_module,
+                "OpenAIVisionInspector",
+                side_effect=models,
+            ),
+        ):
+            self.window.start_autonomous_analysis()
+            self._wait_for(
+                lambda: self.window._vision_outcome is not None
+                and self.window._vision_worker is None
+            )
+            self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+
+            adjusted = RoiBounds(1, 10, 1, 10)
+            for edit, value in zip(
+                self.window.roi_edits,
+                (adjusted.x_min, adjusted.x_max, adjusted.y_min, adjusted.y_max),
+            ):
+                edit.setValue(value)
+            self.window.preview_adjusted_roi()
+            self.assertEqual(self.window._adjusted_roi, adjusted)
+            token = self.window._dataset_token
+            self.assertEqual(self.window._adjusted_roi_dataset_token, token)
+
+            self.window.start_autonomous_analysis()
+            self._wait_for(
+                lambda: self.window._vision_outcome is not None
+                and self.window._vision_worker is None
+            )
+            self._wait_for(lambda: not self.host._shutdown_worker_inventory.workers)
+
+        outcome = self.window._vision_outcome
+        self.assertEqual(outcome.roi, adjusted)
+        self.assertEqual(outcome.confidence, "user-selected")
+        self.assertEqual(
+            [call[0] for call in models[1].calls],
+            ["phase_shortlist", "phase_overlay"],
+        )
+        self.assertIn("ROI x[1,10), y[1,10)", models[1].calls[0][2])
+        self.assertEqual(self.host.selected_area, (16, 52, 18, 50))
+        self.assertEqual(self.window._adjusted_roi, adjusted)
+        self.assertEqual(self.window._adjusted_roi_dataset_token, token)
+        self.host.scientific_observation_api.revision_clock.invalidate()
+        self.window._check_revision()
+        self.assertTrue(self.window._stale)
+        self.assertIsNone(self.window._adjusted_roi)
+        self.assertIsNone(self.window._adjusted_roi_dataset_token)
+
     @unittest.skipUnless(
         find_spec("langgraph") is not None,
         "requires the optional NEAT [agent] extra",
@@ -878,9 +1014,13 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIsNone(self.window._vision_outcome)
         self.assertIn("earlier spectrum and phase hypothesis no longer describe this ROI", self.window.plan_text.toPlainText())
         self.assertEqual(self.host.selected_area, source_roi)
+        self.assertTrue(self.window.reject_vision_button.isVisible())
+        self.assertEqual(self.window.reject_vision_button.text(), "Discard adjusted ROI")
         self.window.reject_visual_proposal()
         self.assertIsNone(self.window._vision_outcome)
-        self.assertIn("rejected", self.window.status_label.text().lower())
+        self.assertIsNone(self.window._adjusted_roi)
+        self.assertIsNone(self.window._adjusted_roi_dataset_token)
+        self.assertIn("discarded", self.window.status_label.text().lower())
 
     def _planning_request_was_authorized(self):
         return bool(

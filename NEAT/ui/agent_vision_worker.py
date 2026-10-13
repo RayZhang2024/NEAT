@@ -9,6 +9,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from ..domain.agent_model import AgentModelSettings
 from ..domain.agent_preflight import PreflightResult
 from ..domain.agent_vision import VisionOutcome, VisionStatus
+from ..domain.observation import RoiBounds
 from ..services.agent_model import AgentCredentialResolver, AgentModelError
 from ..services.agent_vision import (
     OpenAIVisionInspector,
@@ -35,6 +36,7 @@ class VisionWorker(QThread):
         preflight: PreflightResult,
         settings: AgentModelSettings,
         *,
+        roi_override: RoiBounds | None = None,
         credential_resolver: AgentCredentialResolver | None = None,
         cloud_egress_authorized: bool = False,
         inspector: VisionInspector | None = None,
@@ -46,6 +48,7 @@ class VisionWorker(QThread):
         self.revision = handle.revision
         self._handle: ScientificDatasetHandle | None = handle
         self._preflight: PreflightResult | None = preflight
+        self._roi_override = roi_override
         self._settings = settings
         self._credential_resolver = credential_resolver
         self._cloud_egress_authorized = cloud_egress_authorized
@@ -92,6 +95,7 @@ class VisionWorker(QThread):
                 handle,
                 preflight,
                 inspector,
+                roi_override=self._roi_override,
                 cancelled=self._cancel.is_set,
                 progress=self.progress.emit,
             )
@@ -148,6 +152,7 @@ class VisionWorker(QThread):
         finally:
             self._handle = None
             self._preflight = None
+            self._roi_override = None
             with self._lock:
                 retained_inspector = self._inspector
                 self._inspector = None

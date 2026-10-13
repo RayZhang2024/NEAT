@@ -35,7 +35,10 @@ from ..domain.observation import (
 from .agent_model import validate_agent_settings
 from .scientific_observation import (
     _PLOT_LOCK,
+    DatasetUnavailableError,
+    ObservationValidationError,
     ScientificDatasetHandle,
+    StaleDatasetError,
     get_roi_spectrum,
     render_spectrum_preview,
 )
@@ -446,6 +449,19 @@ def _roi_from_response(
     )
 
 
+def _validated_user_roi(roi: RoiBounds, image_shape: tuple[int, int]) -> RoiBounds:
+    """Validate a user-adjusted ROI independently of the model-proposal limits."""
+    if not isinstance(roi, RoiBounds):
+        raise VisionError("The user-adjusted ROI is invalid.")
+    values = (roi.x_min, roi.x_max, roi.y_min, roi.y_max)
+    if any(type(value) is not int for value in values):
+        raise VisionError("The user-adjusted ROI coordinates must be integers.")
+    height, width = image_shape
+    if not (0 <= roi.x_min < roi.x_max <= width and 0 <= roi.y_min < roi.y_max <= height):
+        raise VisionError("The user-adjusted ROI is outside the current image or empty.")
+    return roi
+
+
 def render_roi_overlay(preview_png: bytes, mapping, roi: RoiBounds) -> bytes:
     """Draw a proposed original-coordinate ROI on a trusted image preview."""
     _bounded_png(preview_png)
@@ -554,7 +570,7 @@ def render_phase_overlay(spectrum, phase_id: str) -> bytes:
         )
         ax.set_title(
             f"{phase_id}: theoretical dashed Bragg edges (provisional)\n"
-            f"Dataset {spectrum.dataset_id[:12]} revision {spectrum.revision}; {roi_label}"
+            f"{roi_label}"
         )
         ax.legend(loc="best")
         figure.tight_layout()
@@ -585,6 +601,7 @@ def run_visual_rehearsal(
     preflight: PreflightResult,
     inspector: VisionInspector,
     *,
+    roi_override: RoiBounds | None = None,
     cancelled: Callable[[], bool] = lambda: False,
     progress: Callable[[int, str], None] = lambda _percent, _message: None,
 ) -> VisionOutcome:
@@ -625,48 +642,65 @@ def run_visual_rehearsal(
             raise VisionStale("Frame preview provenance is inconsistent.")
         _bounded_png(image.png_bytes)
         frame_pngs.append(image.png_bytes)
-    progress(15, "Inspecting representative sample images locally")
-    response = inspector.inspect(
-        "sample_roi",
-        tuple(frame_pngs),
-        "These are real NEAT frame previews in order, row zero at top. Original image shape (rows, columns): "
-        f"{dataset.image_shape}; preview sizes: {[f.image.preview_shape for f in frames]}. "
-        "Suggest a likely usable sample-interior ROI in ORIGINAL half-open pixel coordinates. "
-        f"Each side must be between {MIN_ROI_WIDTH} and {MAX_ROI_WIDTH} original pixels inclusive. "
-        "Use x coordinates for columns and y coordinates for rows; keep all four bounds inside the original image. "
-        "Brightness does not universally mean sample; dark/filtered areas may be unusable. "
-        "Do not claim measured SNR. Return exactly JSON keys roi {x_min,x_max,y_min,y_max}, reason, "
-        "confidence (low/medium/high), ambiguity_flags (array of short strings).",
-    )
-    _checkpoint(handle, cancelled, started)
-    if not isinstance(response, Mapping):
-        raise VisionError("ROI response was not a JSON object.")
-    if response.get("roi") is None and set(response) == {
-        "roi",
-        "reason",
-        "confidence",
-        "ambiguity_flags",
-    }:
-        return VisionOutcome(
-            run_id,
-            handle.dataset_id,
-            handle.revision,
-            VisionStatus.NEEDS_REVIEW,
-            "OpenAI visual review could not select a usable sample ROI; review the frames manually.",
-            roi_reason=_text(response["reason"], "ROI reason"),
-            confidence="low",
-            ambiguity_flags=_texts(response["ambiguity_flags"], "ROI ambiguity", 4),
-            inspected_frames=tuple(f.frame_index for f in frames),
-            request_stages=("sample_roi",),
+    progress(15, "Preparing the reference ROI for spectral review")
+    request_stages: list[str] = []
+    model_inspected_frames: tuple[int, ...] = ()
+    if roi_override is None:
+        response = inspector.inspect(
+            "sample_roi",
+            tuple(frame_pngs),
+            "These are real NEAT frame previews in order, row zero at top. Original image shape (rows, columns): "
+            f"{dataset.image_shape}; preview sizes: {[f.image.preview_shape for f in frames]}. "
+            "Suggest a likely usable sample-interior ROI in ORIGINAL half-open pixel coordinates. "
+            f"Each side must be between {MIN_ROI_WIDTH} and {MAX_ROI_WIDTH} original pixels inclusive. "
+            "Use x coordinates for columns and y coordinates for rows; keep all four bounds inside the original image. "
+            "Brightness does not universally mean sample; dark/filtered areas may be unusable. "
+            "Do not claim measured SNR. Return exactly JSON keys roi {x_min,x_max,y_min,y_max}, reason, "
+            "confidence (low/medium/high), ambiguity_flags (array of short strings).",
         )
-    roi, roi_reason, confidence, flags = _roi_from_response(
-        response, dataset.image_shape
-    )
+        request_stages.append("sample_roi")
+        model_inspected_frames = tuple(f.frame_index for f in frames)
+        _checkpoint(handle, cancelled, started)
+        if not isinstance(response, Mapping):
+            raise VisionError("ROI response was not a JSON object.")
+        if response.get("roi") is None and set(response) == {
+            "roi",
+            "reason",
+            "confidence",
+            "ambiguity_flags",
+        }:
+            return VisionOutcome(
+                run_id,
+                handle.dataset_id,
+                handle.revision,
+                VisionStatus.NEEDS_REVIEW,
+                "OpenAI visual review could not select a usable sample ROI; review the frames manually.",
+                roi_reason=_text(response["reason"], "ROI reason"),
+                confidence="low",
+                ambiguity_flags=_texts(response["ambiguity_flags"], "ROI ambiguity", 4),
+                inspected_frames=model_inspected_frames,
+                request_stages=tuple(request_stages),
+            )
+        roi, roi_reason, confidence, flags = _roi_from_response(
+            response, dataset.image_shape
+        )
+    else:
+        roi = _validated_user_roi(roi_override, dataset.image_shape)
+        roi_reason = "User-adjusted reference ROI; NEAT will extract a fresh spectrum for this run."
+        confidence = "user-selected"
+        flags = ()
     mapping = frames[0].image.coordinate_mapping
     assert mapping is not None
     roi_png = render_roi_overlay(frame_pngs[0], mapping, roi)
-    progress(42, "Extracting the proposed ROI's measured spectrum")
-    spectrum = get_roi_spectrum(handle, roi, display_window=None)
+    progress(42, "Extracting the selected ROI's measured spectrum")
+    try:
+        spectrum = get_roi_spectrum(handle, roi, display_window=None)
+    except StaleDatasetError as exc:
+        raise VisionStale("Dataset changed while the ROI spectrum was extracted.") from exc
+    except (ObservationValidationError, DatasetUnavailableError) as exc:
+        raise VisionError(
+            "The selected ROI could not be extracted; check its bounds and size."
+        ) from exc
     _checkpoint(handle, cancelled, started)
     if (
         spectrum.status is not ObservationStatus.OK
@@ -694,6 +728,7 @@ def run_visual_rehearsal(
             if bounds[0] <= position <= bounds[1]
         ]
     progress(60, "Shortlisting provisional phase overlays locally")
+    request_stages.append("phase_shortlist")
     shortlist = inspector.inspect(
         "phase_shortlist",
         (plot.png_bytes,),
@@ -732,8 +767,8 @@ def run_visual_rehearsal(
             roi_png,
             plot.png_bytes,
             unresolved=("No provisional phase was selected.",),
-            inspected_frames=tuple(f.frame_index for f in frames),
-            request_stages=("sample_roi", "phase_shortlist"),
+            inspected_frames=model_inspected_frames,
+            request_stages=tuple(request_stages),
         )
     overlays = tuple(render_phase_overlay(spectrum, phase) for phase in phases)
     _checkpoint(handle, cancelled, started)
@@ -760,9 +795,9 @@ def run_visual_rehearsal(
             plot.png_bytes,
             alternatives=alternatives,
             unresolved=unresolved,
-            inspected_frames=tuple(f.frame_index for f in frames),
+            inspected_frames=model_inspected_frames,
             inspected_phases=tuple(phases),
-            request_stages=("sample_roi", "phase_shortlist", "phase_overlay"),
+            request_stages=tuple(request_stages),
             phase_overlays=tuple(zip(phases, overlays)),
             phase_reason=phase_reason,
             display_interval_diagnostic=display_interval_diagnostic,
@@ -771,6 +806,12 @@ def run_visual_rehearsal(
     recommended_display_window: tuple[float, float] | None = None
 
     def provisional_interval_review(diagnostic: str) -> VisionOutcome:
+        if not complete_flanks_available:
+            diagnostic += (
+                " The measured wavelength axis does not contain the complete default "
+                "left/right fitting regions; NEAT's display envelope is clamped to "
+                "the measured coverage."
+            )
         return VisionOutcome(
             run_id=run_id,
             dataset_id=handle.dataset_id,
@@ -794,9 +835,9 @@ def run_visual_rehearsal(
             overlay_png=overlays[phases.index(phase_id)],
             alternatives=tuple(alternatives),
             unresolved=unresolved,
-            inspected_frames=tuple(f.frame_index for f in frames),
+            inspected_frames=model_inspected_frames,
             inspected_phases=tuple(phases),
-            request_stages=("sample_roi", "phase_shortlist", "phase_overlay"),
+            request_stages=tuple(request_stages),
             phase_overlays=tuple(zip(phases, overlays)),
             phase_reason=reason,
             display_interval_diagnostic=diagnostic,
@@ -813,6 +854,7 @@ def run_visual_rehearsal(
             f"{candidate_phase}: " + (", ".join(visible_markers) or "no markers")
         )
     progress(78, "Comparing measured spectrum with candidate edge overlays locally")
+    request_stages.append("phase_overlay")
     proposal = inspector.inspect(
         "phase_overlay",
         overlays,
@@ -1068,9 +1110,9 @@ def run_visual_rehearsal(
         overlays[phases.index(phase_id)],
         tuple(alternatives),
         unresolved,
-        tuple(f.frame_index for f in frames),
+        model_inspected_frames,
         tuple(phases),
-        ("sample_roi", "phase_shortlist", "phase_overlay"),
+        tuple(request_stages),
         tuple(zip(phases, overlays)),
         reason,
         display_interval_diagnostic=display_interval_diagnostic,

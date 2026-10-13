@@ -105,9 +105,10 @@ class AgentModelSettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         explanation = QLabel(
             "These settings are separate from NEAT AI Assistant. In OpenAI cloud "
-            "mode, starting an analysis automatically sends the disclosed minimized "
-            "dataset summary and bounded visual previews for image stacks. Saving "
-            "settings alone sends nothing.",
+            "mode, pressing Start authorizes a metadata-only planning request when "
+            "eligible and up to 7 bounded PNGs across 3 visual requests for image-stack "
+            "review: up to 3 representative image previews, 1 measured-spectrum plot and up to 3 phase-overlay "
+            "plots. Saving settings alone sends nothing.",
             self,
         )
         explanation.setWordWrap(True)
@@ -143,10 +144,12 @@ class AgentModelSettingsDialog(QDialog):
 
         self.privacy_label = QLabel(
             "OpenAI analysis uses at most one bounded planning request. For image stacks, "
-            "visual review automatically sends only bounded image/spectrum previews, with "
-            "at most three additional requests. Both tasks use the same model ID and Agent "
-            "API key. Local mode stays on the configured loopback endpoint and sends no "
-            "visual evidence to OpenAI.",
+            "visual review may send up to 7 bounded PNGs in 3 requests: up to 3 measured "
+            "frames, 1 ROI-spectrum plot and up to 3 trusted phase-overlay plots. These "
+            "requests use the same model ID and Agent API key. Local mode stays on the "
+            "configured loopback endpoint and sends no visual evidence to OpenAI; model "
+            "failure does not fall back to an offline plan. A run without a selected ROI "
+            "may start visual ROI discovery directly and skip metadata planning.",
             self,
         )
         self.privacy_label.setWordWrap(True)

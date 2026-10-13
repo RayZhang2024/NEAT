@@ -12,25 +12,35 @@ remains unresolved.
   shared by metadata planning and visual review. There is no second vision-model
   configuration. The optional loopback text planner remains available, but
   visual review is only offered for OpenAI Cloud mode.
-- OpenAI mode automatically sends one canonical, metadata-only planning
-  request for each analysis run. For image-stack datasets, it also sends the
-  bounded image/spectrum PNG previews described below. The Agent window
-  discloses these transfers before the run. No
-  checkbox is shown. Local-model mode keeps requests on the loopback endpoint
-  and does not send visual evidence to OpenAI.
-- Visual review sends at most three actual frame previews and two further
-  measured-spectrum/phase-overlay requests (three requests total for vision).
-  Together with the planning request, an OpenAI run has at most four model
-  requests. It follows preflight → planning → visual review; each worker remains
-  tracked and stoppable before the next stage.
+- In OpenAI mode, pressing **Start Autonomous Analysis** authorizes the
+  disclosed run-level transfers. When preflight has enough evidence, the run
+  sends one canonical, metadata-only planning request. A normal image-stack
+  visual review can send up to **7 PNGs in 3 vision requests**: up to 3 actual
+  frame previews, 1 measured ROI-spectrum plot, and up to 3 trusted
+  phase-overlay plots. Together with metadata planning, the run has at most 4
+  model requests. Saving settings or opening the request preview sends nothing.
+  Local-model mode stays on its configured loopback endpoint and sends no
+  visual evidence to OpenAI; model failure does not substitute an offline plan.
+- If an image stack has no selected NEAT ROI, M4 metadata planning is skipped
+  rather than weakening its preflight validator or claiming a plan. With a
+  valid wavelength axis and bounded image previews, the OpenAI model can run a
+  visual-first ROI discovery path: it inspects up to 3 real frames, suggests a
+  bounded ROI, and NEAT extracts that ROI's spectrum with `get_roi_spectrum()`
+  before continuing with the same phase-shortlist and overlay comparison. If
+  the image previews or wavelength calibration are unusable, the run explains
+  why it cannot continue. This direct path does not report an M4 planning
+  result.
 - The OpenAI endpoint is fixed to `https://api.openai.com/v1/chat/completions`.
   The Agent keyring key is sent in the authorization header only. Requests set
   `store: false`; redirects, proxy environment settings and retries are disabled.
   Request/response bodies, previews and model text are not logged.
-- The visual request may contain the bounded image/spectrum preview PNGs, the
-  selected preview context, a short task prompt and the configured model ID. It
-  does not upload the image stack, source files, file paths/names, sample title,
-  dataset/run identifiers, credentials in the request body, or unbounded arrays.
+- The visual request may contain the bounded image/spectrum preview PNGs, a
+  short task prompt and the configured model ID. PNGs retain the scientific
+  labels needed for review (wavelength, intensity, phase, HKL and ROI
+  coordinates where relevant), but omit dataset IDs, run IDs and revision
+  numbers. The request does not upload the image stack, source files, file
+  paths/names, sample title, credentials in the request body, or unbounded
+  arrays.
   Each PNG is at most 1 MB, each serialized request at most 4 MB and each response
   at most 12 KB. A request is limited to 45 seconds and the visual stage to 150
   seconds total.
@@ -58,9 +68,12 @@ remains unresolved.
 
 The Agent window shows the proposed ROI overlay and measured spectrum with
 trusted phase overlays. A user may reject the proposal or adjust the ROI
-rectangle for a preview only. Adjusting the ROI withdraws the prior spectrum
-and phase hypothesis because they describe the earlier ROI. No review control
-writes to the fitting tab.
+rectangle. Adjusting the ROI withdraws the prior spectrum and phase hypothesis
+because they describe the earlier ROI. **Start Autonomous Analysis** then
+reuses the adjusted ROI only within the Agent window, re-extracts its spectrum,
+and regenerates the phase overlays and recommendations. The override is bound
+to the dataset revision and discarded after a dataset change or explicit
+rejection. No review control writes to the fitting tab.
 
 ## Windows GUI smoke procedure (opt-in)
 

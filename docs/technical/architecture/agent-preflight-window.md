@@ -159,13 +159,19 @@ clearly instead of falling back to unrestricted text. A manually activated
 connection test sends one small test-only request, not NEAT data, and does not
 start an analysis run.
 
-Cloud mode requires a configured OpenAI model. Starting an analysis in this
-mode automatically sends the canonical minimized planning summary; for image
-stacks, the M5A-1 visual stage also sends bounded preview PNGs after successful
-planning. Saving settings alone sends nothing. The Agent window discloses these
-transfers before Start. A model call is considered only after a current,
-validated, ready preflight; limited or invalid preflight returns an error without
+Cloud mode requires a configured OpenAI model. Pressing Start authorizes the
+run's disclosed transfers; saving settings alone sends nothing. For an eligible
+image-stack run with a selected NEAT ROI, OpenAI receives the canonical
+minimized planning summary, followed by M5A-1 visual review. The visual stage
+can send up to 7 bounded PNGs in 3 requests: up to 3 image previews, 1 measured
+ROI-spectrum plot, and up to 3 trusted phase-overlay plots. If there is no
+selected ROI but the image stack, bounded previews, and wavelength calibration
+are valid, M4 planning is skipped without weakening its validator or claiming a
+plan; M5A-1 instead starts a visual-first ROI-discovery path and then extracts
+the measured spectrum with the read-only observation API. Unusable previews or
+calibration stop that path with a reason. Limited or invalid data never triggers
 an offline substitute, while stale or cancelled preflight sends no request.
+Local-model mode stays on loopback and does not send visual evidence to OpenAI.
 Changing settings during a run affects only a future run. Missing keys and
 provider failures produce a safe error with the available reason; no Assistant
 key is inherited.

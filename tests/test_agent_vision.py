@@ -25,6 +25,7 @@ from NEAT.domain.observation import (
     DatasetMode,
     DatasetRevisionClock,
     ImageViewSpec,
+    RoiBounds,
     WavelengthAxisStatus,
 )
 from NEAT.services.agent_vision import (
@@ -37,6 +38,7 @@ from NEAT.services.agent_vision import (
     _message_text_content,
     _roi_from_response,
     _visual_response_schema,
+    render_phase_overlay,
     render_roi_overlay,
     run_visual_rehearsal,
     trusted_phase_edges,
@@ -44,14 +46,19 @@ from NEAT.services.agent_vision import (
 from NEAT.services.scientific_observation import (
     create_dataset_handle,
     get_image_preview,
+    get_roi_spectrum,
     inspect_dataset,
 )
 from NEAT.ui.agent_model_settings_dialog import AgentModelSettingsDialog
 from NEAT.ui.agent_vision_worker import VisionWorker
 
 
-def _fixture(*, ambiguous=False):
-    wavelengths = np.linspace(1.0, 5.0, 64)
+def _fixture(*, ambiguous=False, wavelengths=None):
+    wavelengths = (
+        np.linspace(1.0, 5.0, 64)
+        if wavelengths is None
+        else np.asarray(wavelengths, dtype=float)
+    )
     frames = []
     for index, wavelength in enumerate(wavelengths):
         image = np.zeros((64, 64), dtype=float)
@@ -72,7 +79,7 @@ def _fixture(*, ambiguous=False):
             float(wavelengths[index]),
             get_image_preview(handle, index, ImageViewSpec(max_dimension=32)),
         )
-        for index in (0, 31, 63)
+        for index in tuple(dict.fromkeys((0, (len(wavelengths) - 1) // 2, len(wavelengths) - 1)))
     )
     preflight = PreflightResult(
         "preflight",
@@ -104,6 +111,8 @@ class FakeVision:
         uncertain=False,
         no_roi=False,
         no_phase=False,
+        display_min=2.0,
+        display_max=4.5,
         roi_reason="Visually inside the bright band; background remains ambiguous.",
     ):
         self.calls = []
@@ -115,6 +124,8 @@ class FakeVision:
         self.uncertain = uncertain
         self.no_roi = no_roi
         self.no_phase = no_phase
+        self.display_min = display_min
+        self.display_max = display_max
         self.roi_reason = roi_reason
         self.cancelled = False
 
@@ -161,9 +172,12 @@ class FakeVision:
                 if self.candidate_hkls is not None
                 else [self.bad_hkl or [2, 1, 1]]
             ),
-            "edge_reasons": ["Marker appears near a visible step."],
-            "display_min": 2.0,
-            "display_max": self.bad_window or 4.5,
+            "edge_reasons": [
+                "Marker appears near a visible step."
+                for _ in (self.candidate_hkls or [[2, 1, 1]])
+            ],
+            "display_min": self.display_min,
+            "display_max": self.bad_window or self.display_max,
             "reason": "A visible step appears near a trusted marker; not identified.",
             "alternatives": ["CeO2"],
             "unresolved": ["Compare fitting uncertainty later"],
@@ -202,6 +216,49 @@ class VisionServiceTests(unittest.TestCase):
             self.assertEqual(painted.convert("RGB").getpixel((10, 12)), (255, 255, 0))
         for before, after in zip(original, handle.frames):
             np.testing.assert_array_equal(before, after)
+
+    def test_adjusted_roi_is_reextracted_without_repeating_roi_discovery(self):
+        handle, preflight = _fixture()
+        adjusted = RoiBounds(0, 8, 0, 8)
+        model = FakeVision()
+        with patch(
+            "NEAT.services.agent_vision.get_roi_spectrum",
+            wraps=get_roi_spectrum,
+        ) as extractor:
+            result = run_visual_rehearsal(
+                "run",
+                handle,
+                preflight,
+                model,
+                roi_override=adjusted,
+            )
+
+        self.assertEqual(extractor.call_count, 1)
+        self.assertEqual(extractor.call_args.args[1], adjusted)
+        self.assertEqual(result.roi, adjusted)
+        self.assertEqual(result.confidence, "user-selected")
+        self.assertEqual(result.inspected_frames, ())
+        self.assertEqual(
+            result.request_stages, ("phase_shortlist", "phase_overlay")
+        )
+        self.assertEqual(
+            [call[0] for call in model.calls],
+            ["phase_shortlist", "phase_overlay"],
+        )
+        self.assertIn("ROI x[0,8), y[0,8)", model.calls[0][2])
+
+    def test_adjusted_roi_must_be_valid_for_current_image(self):
+        handle, preflight = _fixture()
+        model = FakeVision()
+        with self.assertRaisesRegex(VisionError, "outside the current image"):
+            run_visual_rehearsal(
+                "run",
+                handle,
+                preflight,
+                model,
+                roi_override=RoiBounds(60, 70, 10, 20),
+            )
+        self.assertEqual(model.calls, [])
 
     def test_preview_original_coordinate_mapping_is_preserved(self):
         _handle, preflight = _fixture()
@@ -276,6 +333,58 @@ class VisionServiceTests(unittest.TestCase):
         self.assertIn("Model proposed 2–9 Å", result.display_interval_diagnostic)
         self.assertIn("above the measured maximum", result.display_interval_diagnostic)
         self.assertIn("NEAT shows its locally calculated edge-flank envelope", result.message)
+
+    def test_multiple_selected_edges_use_complete_default_fitting_region_envelope(self):
+        handle, preflight = _fixture()
+        hkls = [[2, 1, 1], [1, 1, 0]]
+        result = run_visual_rehearsal(
+            "run",
+            handle,
+            preflight,
+            FakeVision(candidate_hkls=hkls, display_min=2.4, display_max=4.1),
+        )
+        positions = dict(trusted_phase_edges("Fe_bcc"))
+        selected = [positions[tuple(hkl)] for hkl in hkls]
+        expected_min = min(max(p * 0.90, p - 0.3) for p in selected)
+        expected_max = max(min(p * 1.12, p + 0.4) for p in selected)
+
+        self.assertEqual(result.phase_id, "Fe_bcc")
+        self.assertEqual(result.hkls, ((2, 1, 1), (1, 1, 0)))
+        self.assertEqual(result.display_window, (expected_min, expected_max))
+        self.assertIn("omits at least one selected edge marker", result.display_interval_diagnostic)
+
+    def test_incomplete_measured_coverage_is_reported_after_envelope_clamping(self):
+        handle, preflight = _fixture(wavelengths=np.linspace(2.2, 2.7, 32))
+        position = dict(trusted_phase_edges("Fe_bcc"))[(2, 1, 1)]
+        result = run_visual_rehearsal(
+            "run",
+            handle,
+            preflight,
+            FakeVision(candidate_hkls=[[2, 1, 1]]),
+        )
+
+        self.assertEqual(result.phase_id, "Fe_bcc")
+        self.assertAlmostEqual(result.display_window[0], 2.2)
+        self.assertAlmostEqual(result.display_window[1], min(position * 1.12, position + 0.4))
+        self.assertIn(
+            "does not contain the complete default left/right fitting regions",
+            result.display_interval_diagnostic,
+        )
+
+    def test_phase_overlay_png_raster_does_not_depend_on_private_dataset_provenance(self):
+        handle, _preflight = _fixture()
+        spectrum = get_roi_spectrum(handle, RoiBounds(20, 36, 24, 40))
+        first = replace(spectrum, dataset_id="private-dataset-alpha", revision=3)
+        second = replace(spectrum, dataset_id="private-dataset-beta", revision=987654)
+
+        first_png = render_phase_overlay(first, "Fe_bcc")
+        second_png = render_phase_overlay(second, "Fe_bcc")
+
+        self.assertEqual(first_png, second_png)
+        with Image.open(BytesIO(first_png)) as first_image, Image.open(
+            BytesIO(second_png)
+        ) as second_image:
+            self.assertEqual(first_image.size, second_image.size)
 
     def test_uncertainty_is_not_fabricated_as_phase_selection(self):
         handle, preflight = _fixture()
