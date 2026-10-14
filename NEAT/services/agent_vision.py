@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw
 from ..core import PHASE_DATA, calculate_theoretical_bragg_edges
 from ..domain.agent_model import AgentModelMode, AgentModelSettings
 from ..domain.agent_preflight import PreflightResult
-from ..domain.agent_vision import VisionOutcome, VisionStatus
+from ..domain.agent_vision import SpatialRoiCandidate, VisionOutcome, VisionStatus
 from ..domain.observation import (
     DatasetMode,
     ObservationStatus,
@@ -103,7 +103,9 @@ def _object_schema(properties: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def _visual_response_schema(stage: str) -> dict[str, object]:
+def _visual_response_schema(
+    stage: str, *, include_spatial_rois: bool = False
+) -> dict[str, object]:
     """Return the bounded JSON schema for one visual-review stage."""
     text_schema: dict[str, object] = {"type": "string"}
     text_list: dict[str, object] = {
@@ -122,7 +124,7 @@ def _visual_response_schema(stage: str) -> dict[str, object]:
                 for name in ("x_min", "x_max", "y_min", "y_max")
             }
         )
-        return _object_schema(
+        roi_proposal = _object_schema(
             {
                 "roi": {"anyOf": [roi_object, {"type": "null"}]},
                 "reason": text_schema,
@@ -133,6 +135,21 @@ def _visual_response_schema(stage: str) -> dict[str, object]:
                 "ambiguity_flags": text_list,
             }
         )
+        properties: dict[str, object] = {
+            "roi": {"anyOf": [roi_object, {"type": "null"}]},
+            "reason": text_schema,
+            "confidence": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+            },
+            "ambiguity_flags": text_list,
+        }
+        if include_spatial_rois:
+            properties["additional_rois"] = {
+                "type": "array",
+                "items": roi_proposal,
+            }
+        return _object_schema(properties)
     if stage == "phase_shortlist":
         return _object_schema(
             {
@@ -265,7 +282,9 @@ class OpenAIVisionInspector:
                 "json_schema": {
                     "name": f"neat_visual_{stage}",
                     "strict": True,
-                    "schema": _visual_response_schema(stage),
+                    "schema": _visual_response_schema(
+                        stage, include_spatial_rois="additional_rois" in prompt
+                    ),
                 },
             },
             "max_completion_tokens": MAX_VISION_COMPLETION_TOKENS,
@@ -416,8 +435,11 @@ def _texts(value: object, label: str, maximum: int) -> tuple[str, ...]:
 def _roi_from_response(
     raw: Mapping[str, object], shape: tuple[int, int]
 ) -> tuple[RoiBounds, str, str, tuple[str, ...]]:
-    if set(raw) != {"roi", "reason", "confidence", "ambiguity_flags"} or not isinstance(
-        raw["roi"], dict
+    base_keys = {"roi", "reason", "confidence", "ambiguity_flags"}
+    if (
+        frozenset(raw)
+        not in {frozenset(base_keys), frozenset(base_keys | {"additional_rois"})}
+        or not isinstance(raw["roi"], dict)
     ):
         raise VisionError("ROI proposal schema is invalid.")
     rect = cast(dict[str, object], raw["roi"])
@@ -449,6 +471,161 @@ def _roi_from_response(
     )
 
 
+def _spatial_roi_candidate(
+    value: object,
+    *,
+    label: str,
+    image_shape: tuple[int, int],
+    previously_proposed: tuple[RoiBounds, ...],
+) -> SpatialRoiCandidate:
+    """Validate one visual proposal while retaining safe evidence for review."""
+    expected = {"roi", "reason", "confidence", "ambiguity_flags"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        return SpatialRoiCandidate(
+            label, None, validation_error="Proposal fields are incomplete or invalid."
+        )
+
+    reason = value.get("reason")
+    if not isinstance(reason, str) or not 1 <= len(reason) <= 240 or any(
+        ord(char) < 32 for char in reason
+    ):
+        reason = ""
+        validation_error = "The location rationale is missing or too long."
+    else:
+        validation_error = None
+    confidence = value.get("confidence")
+    if not isinstance(confidence, str) or confidence not in {"low", "medium", "high"}:
+        confidence = ""
+        validation_error = validation_error or "Confidence is not valid."
+    flags_value = value.get("ambiguity_flags")
+    try:
+        flags = _texts(flags_value, "ROI ambiguity", 4)
+    except VisionError:
+        flags = ()
+        validation_error = validation_error or "Ambiguity flags are invalid."
+
+    raw_rect = value.get("roi")
+    if raw_rect is None:
+        return SpatialRoiCandidate(
+            label,
+            None,
+            reason,
+            str(confidence),
+            flags,
+            validation_error=validation_error or "No safe sample location was proposed.",
+        )
+    if not isinstance(raw_rect, Mapping) or set(raw_rect) != {
+        "x_min", "x_max", "y_min", "y_max"
+    }:
+        return SpatialRoiCandidate(
+            label,
+            None,
+            reason,
+            str(confidence),
+            flags,
+            validation_error=validation_error or "Coordinates are incomplete.",
+        )
+    raw_coords = tuple(
+        raw_rect[key] for key in ("x_min", "x_max", "y_min", "y_max")
+    )
+    if any(type(coord) is not int for coord in raw_coords):
+        return SpatialRoiCandidate(
+            label,
+            None,
+            reason,
+            str(confidence),
+            flags,
+            validation_error=validation_error or "Coordinates must be original integer pixels.",
+        )
+    coords = cast(tuple[int, int, int, int], raw_coords)
+    x_min, x_max, y_min, y_max = coords
+    height, width = image_shape
+    if not (0 <= x_min < x_max <= width and 0 <= y_min < y_max <= height):
+        return SpatialRoiCandidate(
+            label,
+            None,
+            reason,
+            str(confidence),
+            flags,
+            coords,
+            validation_error or "The rectangle is outside the original image.",
+        )
+    roi = RoiBounds(x_min, x_max, y_min, y_max)
+    if not (
+        MIN_ROI_WIDTH <= roi.width <= MAX_ROI_WIDTH
+        and MIN_ROI_WIDTH <= roi.height <= MAX_ROI_WIDTH
+    ):
+        return SpatialRoiCandidate(
+            label,
+            roi,
+            reason,
+            str(confidence),
+            flags,
+            coords,
+            validation_error or "ROI width and height must each be 3–128 pixels.",
+        )
+    if confidence != "high" or flags:
+        validation_error = validation_error or (
+            "The model reported low confidence or unresolved visual ambiguity."
+        )
+    for other in previously_proposed:
+        overlap_width = max(0, min(roi.x_max, other.x_max) - max(roi.x_min, other.x_min))
+        overlap_height = max(0, min(roi.y_max, other.y_max) - max(roi.y_min, other.y_min))
+        if overlap_width * overlap_height:
+            validation_error = validation_error or "The rectangle overlaps another proposed ROI."
+            break
+    return SpatialRoiCandidate(
+        label, roi, reason, str(confidence), flags, coords, validation_error
+    )
+
+
+def _additional_spatial_rois(
+    response: Mapping[str, object],
+    *,
+    image_shape: tuple[int, int],
+    reference_roi: RoiBounds | None,
+) -> tuple[SpatialRoiCandidate, ...]:
+    """Return six A–F proposals, preserving rejected coordinates for review."""
+    raw_candidates = response.get("additional_rois")
+    if not isinstance(raw_candidates, list):
+        raw_candidates = []
+    previous: tuple[RoiBounds, ...] = (
+        (reference_roi,) if reference_roi is not None else ()
+    )
+    output: list[SpatialRoiCandidate] = []
+    for index, label in enumerate(("A", "B", "C", "D", "E", "F")):
+        if index >= len(raw_candidates):
+            output.append(
+                SpatialRoiCandidate(
+                    label,
+                    None,
+                    validation_error="The model did not provide this additional sample location.",
+                )
+            )
+            continue
+        candidate = _spatial_roi_candidate(
+            raw_candidates[index],
+            label=label,
+            image_shape=image_shape,
+            previously_proposed=previous,
+        )
+        output.append(candidate)
+        if candidate.roi is not None:
+            previous += (candidate.roi,)
+    if len(raw_candidates) > 6:
+        last = output[-1]
+        output[-1] = SpatialRoiCandidate(
+            last.label,
+            last.roi,
+            last.reason,
+            last.confidence,
+            last.ambiguity_flags,
+            last.proposed_coordinates,
+            last.validation_error or "The model returned more than six additional locations.",
+        )
+    return tuple(output)
+
+
 def _validated_user_roi(roi: RoiBounds, image_shape: tuple[int, int]) -> RoiBounds:
     """Validate a user-adjusted ROI independently of the model-proposal limits."""
     if not isinstance(roi, RoiBounds):
@@ -476,6 +653,50 @@ def render_roi_overlay(preview_png: bytes, mapping, roi: RoiBounds) -> bytes:
     ImageDraw.Draw(image).rectangle(
         (x0, y0, max(x0, x1 - 1), max(y0, y1 - 1)), outline="yellow", width=2
     )
+    output = BytesIO()
+    image.save(output, "PNG")
+    result = output.getvalue()
+    _bounded_png(result)
+    return result
+
+
+def render_spatial_roi_overlay(
+    preview_png: bytes,
+    mapping,
+    candidates: tuple[SpatialRoiCandidate, ...],
+) -> bytes:
+    """Render all accepted/rejected proposal boxes on one actual frame preview."""
+    _bounded_png(preview_png)
+    with Image.open(BytesIO(preview_png)) as source:
+        image = source.convert("RGB")
+    if image.size != (mapping.preview_width, mapping.preview_height):
+        raise VisionError("Image preview mapping does not match its PNG.")
+    palette = ("#ffd92f", "#00e5ff", "#ff4fd8", "#b6ff2e", "#ff9f1c", "#ff5f56", "#8b82ff")
+    draw = ImageDraw.Draw(image)
+    for index, candidate in enumerate(candidates[:7]):
+        coordinates = candidate.proposed_coordinates
+        if coordinates is None and candidate.roi is not None:
+            roi = candidate.roi
+            coordinates = (roi.x_min, roi.x_max, roi.y_min, roi.y_max)
+        if coordinates is None:
+            continue
+        x_min, x_max, y_min, y_max = coordinates
+        x0 = round(x_min * mapping.preview_width / mapping.original_width)
+        x1 = round(x_max * mapping.preview_width / mapping.original_width)
+        y0 = round(y_min * mapping.preview_height / mapping.original_height)
+        y1 = round(y_max * mapping.preview_height / mapping.original_height)
+        left = min(max(x0, 0), image.width - 1)
+        right = min(max(x1 - 1, 0), image.width - 1)
+        top = min(max(y0, 0), image.height - 1)
+        bottom = min(max(y1 - 1, 0), image.height - 1)
+        if x1 <= 0 or y1 <= 0 or x0 >= image.width or y0 >= image.height:
+            continue
+        color = palette[index] if candidate.accepted else "#ff3030"
+        draw.rectangle((left, top, right, bottom), outline=color, width=2)
+        label = candidate.label if candidate.accepted else f"{candidate.label}?"
+        tag_width = min(max(18, len(label) * 8 + 5), image.width - left)
+        draw.rectangle((left, top, left + tag_width, min(image.height - 1, top + 13)), fill="#111111")
+        draw.text((left + 2, top), label, fill=color)
     output = BytesIO()
     image.save(output, "PNG")
     result = output.getvalue()
@@ -602,6 +823,7 @@ def run_visual_rehearsal(
     inspector: VisionInspector,
     *,
     roi_override: RoiBounds | None = None,
+    require_spatial_rois: bool = False,
     cancelled: Callable[[], bool] = lambda: False,
     progress: Callable[[int, str], None] = lambda _percent, _message: None,
 ) -> VisionOutcome:
@@ -645,53 +867,144 @@ def run_visual_rehearsal(
     progress(15, "Preparing the reference ROI for spectral review")
     request_stages: list[str] = []
     model_inspected_frames: tuple[int, ...] = ()
-    if roi_override is None:
+    spatial_roi_candidates: tuple[SpatialRoiCandidate, ...]
+    roi: RoiBounds | None
+    request_sample_locations = roi_override is None or require_spatial_rois
+    if request_sample_locations:
+        if require_spatial_rois:
+            reference_hint = (
+                "Choose the reference rectangle, then six additional distinct sample-interior rectangles."
+                if roi_override is None
+                else "The reference rectangle is fixed by the user; choose six additional distinct sample-interior rectangles."
+            )
+            location_request = (
+                " Return `roi` for Reference and exactly six `additional_rois` in A–F order, each with "
+                "roi, reason, confidence (low/medium/high), and ambiguity_flags. Do not claim measured SNR."
+            )
+        else:
+            reference_hint = (
+                "Choose one reference rectangle inside clearly visible sample material."
+                if roi_override is None
+                else "The reference rectangle is fixed by the user."
+            )
+            location_request = " Return only `roi`, reason, confidence (low/medium/high), and ambiguity_flags."
+        prompt = (
+            "These are real NEAT frame previews from one image stack, in order, with row zero at the top. "
+            f"Original shape (rows, columns): {dataset.image_shape}; preview sizes: "
+            f"{[frame.image.preview_shape for frame in frames]}. {reference_hint} "
+            "Use original-image half-open coordinates: x coordinates for columns and y coordinates for rows. "
+            "Each side must be "
+            f"between {MIN_ROI_WIDTH} and {MAX_ROI_WIDTH} original pixels inclusive and every rectangle must be inside the image. "
+            "Prefer similarly sized rectangles spread across clearly visible sample material; avoid duplicate, "
+            "overlapping, masked, background, boundary or ambiguous locations. Brightness alone does not prove "
+            "sample material. If a requested location is not clearly safe, return roi null for that location and "
+            "explain why."
+            + location_request
+            + " "
+            "Return only the structured fields required by the schema."
+        )
+        if roi_override is not None:
+            prompt += (
+                f" The user-selected Reference ROI is x[{roi_override.x_min},{roi_override.x_max}), "
+                f"y[{roi_override.y_min},{roi_override.y_max}); do not move it or overlap it."
+            )
         response = inspector.inspect(
             "sample_roi",
             tuple(frame_pngs),
-            "These are real NEAT frame previews in order, row zero at top. Original image shape (rows, columns): "
-            f"{dataset.image_shape}; preview sizes: {[f.image.preview_shape for f in frames]}. "
-            "Suggest a likely usable sample-interior ROI in ORIGINAL half-open pixel coordinates. "
-            f"Each side must be between {MIN_ROI_WIDTH} and {MAX_ROI_WIDTH} original pixels inclusive. "
-            "Use x coordinates for columns and y coordinates for rows; keep all four bounds inside the original image. "
-            "Brightness does not universally mean sample; dark/filtered areas may be unusable. "
-            "Do not claim measured SNR. Return exactly JSON keys roi {x_min,x_max,y_min,y_max}, reason, "
-            "confidence (low/medium/high), ambiguity_flags (array of short strings).",
+            prompt,
         )
         request_stages.append("sample_roi")
         model_inspected_frames = tuple(f.frame_index for f in frames)
         _checkpoint(handle, cancelled, started)
         if not isinstance(response, Mapping):
             raise VisionError("ROI response was not a JSON object.")
-        if response.get("roi") is None and set(response) == {
-            "roi",
-            "reason",
-            "confidence",
-            "ambiguity_flags",
-        }:
+        if roi_override is None and not require_spatial_rois and response.get("roi") is not None:
+            roi, roi_reason, confidence, flags = _roi_from_response(
+                response, dataset.image_shape
+            )
+            reference_candidate = SpatialRoiCandidate(
+                "Reference",
+                roi,
+                roi_reason,
+                confidence,
+                flags,
+                (roi.x_min, roi.x_max, roi.y_min, roi.y_max),
+            )
+        elif roi_override is None:
+            reference_raw = {
+                key: response.get(key)
+                for key in ("roi", "reason", "confidence", "ambiguity_flags")
+            }
+            reference_candidate = _spatial_roi_candidate(
+                reference_raw,
+                label="Reference",
+                image_shape=dataset.image_shape,
+                previously_proposed=(),
+            )
+            roi = reference_candidate.roi
+            roi_reason = reference_candidate.reason
+            confidence = reference_candidate.confidence
+            flags = reference_candidate.ambiguity_flags
+        else:
+            roi = _validated_user_roi(roi_override, dataset.image_shape)
+            roi_reason = "User-adjusted reference ROI; NEAT will extract a fresh spectrum for this run."
+            confidence = "user-selected"
+            flags = ()
+            reference_candidate = SpatialRoiCandidate(
+                "Reference",
+                roi,
+                roi_reason,
+                confidence,
+                flags,
+                (roi.x_min, roi.x_max, roi.y_min, roi.y_max),
+            )
+        if require_spatial_rois:
+            additional_candidates = _additional_spatial_rois(
+                response,
+                image_shape=dataset.image_shape,
+                reference_roi=roi,
+            )
+            spatial_roi_candidates = (reference_candidate,) + additional_candidates
+        else:
+            spatial_roi_candidates = (reference_candidate,)
+        if roi is None:
+            spatial_rois_png = render_spatial_roi_overlay(
+                frame_pngs[0], mapping=frames[0].image.coordinate_mapping,
+                candidates=spatial_roi_candidates,
+            )
             return VisionOutcome(
                 run_id,
                 handle.dataset_id,
                 handle.revision,
                 VisionStatus.NEEDS_REVIEW,
                 "OpenAI visual review could not select a usable sample ROI; review the frames manually.",
-                roi_reason=_text(response["reason"], "ROI reason"),
+                roi_reason=reference_candidate.reason,
                 confidence="low",
-                ambiguity_flags=_texts(response["ambiguity_flags"], "ROI ambiguity", 4),
+                ambiguity_flags=reference_candidate.ambiguity_flags,
                 inspected_frames=model_inspected_frames,
                 request_stages=tuple(request_stages),
+                spatial_roi_candidates=spatial_roi_candidates,
+                spatial_rois_png=spatial_rois_png,
             )
-        roi, roi_reason, confidence, flags = _roi_from_response(
-            response, dataset.image_shape
-        )
     else:
+        assert roi_override is not None
         roi = _validated_user_roi(roi_override, dataset.image_shape)
         roi_reason = "User-adjusted reference ROI; NEAT will extract a fresh spectrum for this run."
         confidence = "user-selected"
         flags = ()
+        spatial_roi_candidates = (
+            SpatialRoiCandidate(
+                "Reference", roi, roi_reason, confidence, flags,
+                (roi.x_min, roi.x_max, roi.y_min, roi.y_max),
+            ),
+        )
+    assert roi is not None
     mapping = frames[0].image.coordinate_mapping
     assert mapping is not None
     roi_png = render_roi_overlay(frame_pngs[0], mapping, roi)
+    spatial_rois_png = render_spatial_roi_overlay(
+        frame_pngs[0], mapping, spatial_roi_candidates
+    )
     progress(42, "Extracting the selected ROI's measured spectrum")
     try:
         spectrum = get_roi_spectrum(handle, roi, display_window=None)
@@ -769,6 +1082,8 @@ def run_visual_rehearsal(
             unresolved=("No provisional phase was selected.",),
             inspected_frames=model_inspected_frames,
             request_stages=tuple(request_stages),
+            spatial_roi_candidates=spatial_roi_candidates,
+            spatial_rois_png=spatial_rois_png,
         )
     overlays = tuple(render_phase_overlay(spectrum, phase) for phase in phases)
     _checkpoint(handle, cancelled, started)
@@ -801,6 +1116,8 @@ def run_visual_rehearsal(
             phase_overlays=tuple(zip(phases, overlays)),
             phase_reason=phase_reason,
             display_interval_diagnostic=display_interval_diagnostic,
+            spatial_roi_candidates=spatial_roi_candidates,
+            spatial_rois_png=spatial_rois_png,
         )
 
     recommended_display_window: tuple[float, float] | None = None
@@ -841,6 +1158,8 @@ def run_visual_rehearsal(
             phase_overlays=tuple(zip(phases, overlays)),
             phase_reason=reason,
             display_interval_diagnostic=diagnostic,
+            spatial_roi_candidates=spatial_roi_candidates,
+            spatial_rois_png=spatial_rois_png,
         )
 
     marker_summaries = []
@@ -1116,6 +1435,8 @@ def run_visual_rehearsal(
         tuple(zip(phases, overlays)),
         reason,
         display_interval_diagnostic=display_interval_diagnostic,
+        spatial_roi_candidates=spatial_roi_candidates,
+        spatial_rois_png=spatial_rois_png,
     )
 
 
@@ -1128,6 +1449,7 @@ __all__ = [
     "VisionUnavailable",
     "render_phase_overlay",
     "render_roi_overlay",
+    "render_spatial_roi_overlay",
     "run_visual_rehearsal",
     "trusted_phase_edges",
 ]

@@ -37,6 +37,7 @@ class VisionWorker(QThread):
         settings: AgentModelSettings,
         *,
         roi_override: RoiBounds | None = None,
+        require_spatial_rois: bool = False,
         credential_resolver: AgentCredentialResolver | None = None,
         cloud_egress_authorized: bool = False,
         inspector: VisionInspector | None = None,
@@ -49,6 +50,7 @@ class VisionWorker(QThread):
         self._handle: ScientificDatasetHandle | None = handle
         self._preflight: PreflightResult | None = preflight
         self._roi_override = roi_override
+        self._require_spatial_rois = bool(require_spatial_rois)
         self._settings = settings
         self._credential_resolver = credential_resolver
         self._cloud_egress_authorized = cloud_egress_authorized
@@ -96,6 +98,7 @@ class VisionWorker(QThread):
                 preflight,
                 inspector,
                 roi_override=self._roi_override,
+                require_spatial_rois=self._require_spatial_rois,
                 cancelled=self._cancel.is_set,
                 progress=self.progress.emit,
             )

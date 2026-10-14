@@ -17,6 +17,23 @@ class VisionStatus(str, Enum):
 
 
 @dataclass(frozen=True)
+class SpatialRoiCandidate:
+    """One labelled image-space ROI proposal and its local validation result."""
+
+    label: str
+    roi: RoiBounds | None
+    reason: str = ""
+    confidence: str = ""
+    ambiguity_flags: tuple[str, ...] = ()
+    proposed_coordinates: tuple[int, int, int, int] | None = None
+    validation_error: str | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.roi is not None and self.validation_error is None
+
+
+@dataclass(frozen=True)
 class VisionOutcome:
     run_id: str
     dataset_id: str
@@ -42,6 +59,8 @@ class VisionOutcome:
     phase_overlays: tuple[tuple[str, bytes], ...] = ()
     phase_reason: str = ""
     display_interval_diagnostic: str = ""
+    spatial_roi_candidates: tuple[SpatialRoiCandidate, ...] = ()
+    spatial_rois_png: bytes | None = None
 
 
-__all__ = ["VisionOutcome", "VisionStatus"]
+__all__ = ["SpatialRoiCandidate", "VisionOutcome", "VisionStatus"]

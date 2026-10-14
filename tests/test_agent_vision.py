@@ -16,6 +16,11 @@ import numpy as np
 from PIL import Image
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Keep optional ONNX initialization ahead of Qt, as in NEAT.app.
+# isort: off
+import NEAT  # noqa: F401
+# isort: on
+
 from PyQt5.QtWidgets import QApplication
 
 from NEAT.domain.agent_model import AgentModelMode, AgentModelSettings
@@ -129,6 +134,9 @@ class FakeVision:
         self.roi_reason = roi_reason
         self.cancelled = False
 
+    def cancel(self):
+        self.cancelled = True
+
     def inspect(self, stage, images, prompt):
         self.calls.append((stage, images, prompt))
         for png in images:
@@ -183,11 +191,104 @@ class FakeVision:
             "unresolved": ["Compare fitting uncertainty later"],
         }
 
+
+class FakeSevenRoiVision(FakeVision):
+    """Fake the same bounded request while returning six added locations."""
+
+    def __init__(self, *, medium_location: str | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self.medium_location = medium_location
+
+    def inspect(self, stage, images, prompt):
+        if stage != "sample_roi":
+            return super().inspect(stage, images, prompt)
+        super().inspect(stage, images, prompt)
+        rois = (
+            (18, 23, 20, 25),
+            (25, 30, 20, 25),
+            (32, 37, 20, 25),
+            (39, 44, 20, 25),
+            (18, 23, 30, 35),
+            (25, 30, 30, 35),
+            (32, 37, 30, 35),
+        )
+        reference = {
+            "roi": dict(zip(("x_min", "x_max", "y_min", "y_max"), rois[0])),
+            "reason": "Visible sample interior.",
+            "confidence": "high",
+            "ambiguity_flags": [],
+        }
+        additional = []
+        for index, coordinates in enumerate(rois[1:]):
+            additional.append({
+                "roi": dict(zip(("x_min", "x_max", "y_min", "y_max"), coordinates)),
+                "reason": "Distinct visible sample interior.",
+                "confidence": "medium" if self.medium_location == chr(65 + index) else "high",
+                "ambiguity_flags": [],
+            })
+        return {**reference, "additional_rois": additional}
+
     def cancel(self):
         self.cancelled = True
 
 
 class VisionServiceTests(unittest.TestCase):
+    def test_spatial_seven_roi_proposal_reuses_existing_images_and_request_budget(self):
+        handle, preflight = _fixture()
+        model = FakeSevenRoiVision()
+        outcome = run_visual_rehearsal(
+            "seven-roi-run",
+            handle,
+            preflight,
+            model,
+            require_spatial_rois=True,
+        )
+
+        self.assertEqual(len(outcome.spatial_roi_candidates), 7)
+        self.assertTrue(all(candidate.accepted for candidate in outcome.spatial_roi_candidates))
+        self.assertEqual(tuple(item.label for item in outcome.spatial_roi_candidates), (
+            "Reference", "A", "B", "C", "D", "E", "F"
+        ))
+        self.assertEqual(outcome.request_stages, ("sample_roi", "phase_shortlist", "phase_overlay"))
+        self.assertEqual([call[0] for call in model.calls], list(outcome.request_stages))
+        self.assertEqual([len(call[1]) for call in model.calls], [3, 1, 2])
+        self.assertIn("exactly six `additional_rois`", model.calls[0][2])
+        self.assertIsNotNone(outcome.spatial_rois_png)
+
+    def test_user_reference_still_uses_same_three_previews_for_six_locations(self):
+        handle, preflight = _fixture()
+        model = FakeSevenRoiVision()
+        reference = RoiBounds(18, 23, 20, 25)
+        outcome = run_visual_rehearsal(
+            "seven-roi-run",
+            handle,
+            preflight,
+            model,
+            roi_override=reference,
+            require_spatial_rois=True,
+        )
+
+        self.assertEqual(outcome.roi, reference)
+        self.assertEqual(len(outcome.spatial_roi_candidates), 7)
+        self.assertEqual(len(model.calls), 3)
+        self.assertEqual(len(model.calls[0][1]), 3)
+        self.assertIn("fixed by the user", model.calls[0][2])
+        self.assertEqual(len(outcome.inspected_frames), 3)
+
+    def test_ambiguous_spatial_roi_is_retained_for_review_but_not_accepted(self):
+        handle, preflight = _fixture()
+        outcome = run_visual_rehearsal(
+            "seven-roi-run",
+            handle,
+            preflight,
+            FakeSevenRoiVision(medium_location="C"),
+            require_spatial_rois=True,
+        )
+
+        self.assertEqual(len(outcome.spatial_roi_candidates), 7)
+        self.assertFalse(outcome.spatial_roi_candidates[3].accepted)
+        self.assertIn("confidence", outcome.spatial_roi_candidates[3].validation_error)
+
     def test_actual_pngs_roi_bootstrap_overlay_and_no_scientific_writes(self):
         handle, preflight = _fixture()
         model = FakeVision()

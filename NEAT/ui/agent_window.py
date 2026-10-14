@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import ast
 import json
+from dataclasses import replace
 from uuid import uuid4
 
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
+import numpy as np
+from PyQt5.QtCore import QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QDialog,
     QDialogButtonBox,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QPlainTextEdit,
@@ -22,10 +28,21 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from ..domain.agent_fitting import (
+    SPATIAL_ROI_LABELS,
+    AgentFitCellResult,
+    AgentFitCellState,
+    AgentFitOutcome,
+    AgentFitPlan,
+    AgentFitProgress,
+    AgentFitRunStatus,
+)
 from ..domain.agent_model import (
     AgentModelMode,
     AgentModelSettings,
@@ -47,13 +64,15 @@ from ..domain.agent_preflight import (
     PreflightResult,
     PreflightRunState,
 )
-from ..domain.agent_vision import VisionOutcome, VisionStatus
+from ..domain.agent_vision import SpatialRoiCandidate, VisionOutcome, VisionStatus
+from ..domain.fitting import FittingParameterBounds
 from ..domain.observation import (
     DatasetMode,
     ObservationStatus,
     RoiBounds,
     WavelengthAxisStatus,
 )
+from ..services.agent_fitting import AgentFitBlocked, build_agent_fit_plan
 from ..services.agent_model import (
     AgentCredentialResolver,
     AgentKeyringCredentialStore,
@@ -65,10 +84,235 @@ from ..services.scientific_observation import (
     DatasetUnavailableError,
     ObservationErrorBase,
 )
+from .agent_fitting_worker import AgentFitWorker
 from .agent_model_settings_dialog import AgentModelSettingsDialog
 from .agent_planning_worker import PlanningWorker
 from .agent_preflight_worker import PreflightWorker
 from .agent_vision_worker import VisionWorker
+
+
+class SpatialRoiPreviewWidget(QWidget):
+    """Aspect-preserving actual frame preview with labelled, clickable ROIs."""
+
+    roiSelected = pyqtSignal(int)
+
+    _COLORS = (
+        "#ffd92f", "#00e5ff", "#ff4fd8", "#b6ff2e",
+        "#ff9f1c", "#ff5f56", "#8b82ff",
+    )
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._pixmap = QPixmap()
+        self._mapping = None
+        self._candidates: tuple[SpatialRoiCandidate, ...] = ()
+        self._selected_index: int | None = None
+        self.setMinimumSize(120, 120)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAccessibleName("Actual sample image with labelled, clickable spatial ROIs")
+        self.setAccessibleDescription(
+            "Seven original-pixel sample regions are labelled Reference and A through F. "
+            "Click a rectangle or press 1 through 7 to select its fitting results."
+        )
+        self.setToolTip("Click a labelled ROI to show its result row; keyboard keys 1–7 also select ROIs.")
+
+    def set_preview(self, png_bytes, mapping, candidates=()) -> None:
+        pixmap = QPixmap()
+        pixmap.loadFromData(png_bytes or b"", "PNG")
+        self._pixmap = pixmap
+        self._mapping = mapping
+        self._candidates = tuple(candidates)
+        self.update()
+
+    def set_selected_roi(self, index: int | None) -> None:
+        self._selected_index = index
+        self.update()
+
+    def _image_rect(self) -> QRectF:
+        if self._pixmap.isNull():
+            return QRectF()
+        scale = min(
+            self.width() / max(1, self._pixmap.width()),
+            self.height() / max(1, self._pixmap.height()),
+        )
+        width = self._pixmap.width() * scale
+        height = self._pixmap.height() * scale
+        return QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#f4f6f8"))
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        if self._pixmap.isNull():
+            painter.setPen(QColor("#536273"))
+            painter.drawText(self.rect(), Qt.AlignCenter | Qt.TextWordWrap,
+                             "The sample image and ROI labels will appear here after analysis starts.")
+            return
+        target = self._image_rect()
+        painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
+        mapping = self._mapping
+        if mapping is None:
+            return
+        painter.setFont(self.font())
+        for index, candidate in enumerate(self._candidates[:7]):
+            coords = candidate.proposed_coordinates
+            if coords is None and candidate.roi is not None:
+                roi = candidate.roi
+                coords = (roi.x_min, roi.x_max, roi.y_min, roi.y_max)
+            if coords is None:
+                continue
+            x_min, x_max, y_min, y_max = coords
+            rect = QRectF(
+                target.left() + x_min * target.width() / mapping.original_width,
+                target.top() + y_min * target.height() / mapping.original_height,
+                (x_max - x_min) * target.width() / mapping.original_width,
+                (y_max - y_min) * target.height() / mapping.original_height,
+            ).intersected(target)
+            if rect.isEmpty():
+                continue
+            color = QColor(self._COLORS[index] if candidate.accepted else "#ff3030")
+            pen = QPen(color, 3 if index == self._selected_index else 2)
+            if not candidate.accepted:
+                pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(rect)
+            text = candidate.label if candidate.accepted else f"{candidate.label}?"
+            label_rect = QRectF(rect.left(), rect.top(), max(30, len(text) * 9 + 8), 18)
+            painter.fillRect(label_rect, QColor("#17212b"))
+            painter.setPen(color)
+            painter.drawText(label_rect, Qt.AlignCenter, text)
+
+    def mousePressEvent(self, event) -> None:
+        if self._mapping is None or self._pixmap.isNull():
+            return super().mousePressEvent(event)
+        rect = self._image_rect()
+        point = event.pos()
+        if not rect.contains(point):
+            return super().mousePressEvent(event)
+        px = min(
+            self._mapping.preview_width - 1,
+            max(0, int((point.x() - rect.left()) * self._mapping.preview_width / rect.width())),
+        )
+        py = min(
+            self._mapping.preview_height - 1,
+            max(0, int((point.y() - rect.top()) * self._mapping.preview_height / rect.height())),
+        )
+        original_x, original_y = self._mapping.preview_pixel_to_original(px, py)
+        for index, candidate in enumerate(self._candidates[:7]):
+            roi = candidate.roi
+            if roi is not None and roi.x_min <= original_x < roi.x_max and roi.y_min <= original_y < roi.y_max:
+                self.setFocus(Qt.MouseFocusReason)
+                self.roiSelected.emit(index)
+                return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if Qt.Key_1 <= event.key() <= Qt.Key_7:
+            index = event.key() - Qt.Key_1
+            if index < len(self._candidates):
+                self.roiSelected.emit(index)
+                return
+        super().keyPressEvent(event)
+
+
+class FitCurveWidget(QWidget):
+    """Small, bounded view of actual fit curves or Region 3 residuals."""
+
+    def __init__(self, title: str, *, residuals: bool = False, parent=None) -> None:
+        super().__init__(parent)
+        self._title = title
+        self._curve = None
+        self._residuals = residuals
+        self.setMinimumHeight(112)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setAccessibleName(title)
+
+    def set_curve(self, curve) -> None:
+        self._curve = curve
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("white"))
+        painter.setPen(QColor("#202b37"))
+        painter.drawText(8, 16, self._title)
+        left, top, right, bottom = 34.0, 24.0, self.width() - 8.0, self.height() - 22.0
+        if right <= left or bottom <= top:
+            return
+        painter.setPen(QPen(QColor("#b9c2cc"), 1))
+        painter.drawRect(QRectF(left, top, right - left, bottom - top))
+        curve = self._curve
+        if curve is None:
+            painter.setPen(QColor("#697586"))
+            painter.drawText(QRectF(left, top, right - left, bottom - top), Qt.AlignCenter, "Select a result cell")
+            return
+        try:
+            x = np.asarray(curve.x, dtype=float).reshape(-1)
+            y = np.asarray(curve.y, dtype=float).reshape(-1)
+            fit = None if curve.fit is None else np.asarray(curve.fit, dtype=float).reshape(-1)
+            if x.shape != y.shape:
+                return
+            if fit is not None and fit.shape != y.shape:
+                fit = None
+            if self._residuals and fit is None:
+                painter.setPen(QColor("#697586"))
+                painter.drawText(
+                    QRectF(left, top, right - left, bottom - top),
+                    Qt.AlignCenter,
+                    "Residuals unavailable until the Region 3 fit completes",
+                )
+                return
+            valid = np.isfinite(x) & np.isfinite(y)
+            if fit is not None and self._residuals:
+                valid &= np.isfinite(fit)
+            x, y = x[valid], y[valid]
+            if fit is not None:
+                fit = fit[valid]
+        except (TypeError, ValueError):
+            return
+        if not x.size:
+            return
+        plotted_y = y - fit if self._residuals and fit is not None else y
+        values = plotted_y
+        if fit is not None and not self._residuals:
+            values = np.concatenate((y, fit))
+        xmin, xmax = float(x.min()), float(x.max())
+        ymin, ymax = float(values.min()), float(values.max())
+        if xmax <= xmin:
+            xmax = xmin + 1.0
+        if ymax <= ymin:
+            ymax = ymin + 1.0
+        pad = max((ymax - ymin) * 0.08, 1e-12)
+        ymin, ymax = ymin - pad, ymax + pad
+
+        def point(xvalue, yvalue):
+            return (
+                left + (float(xvalue) - xmin) / (xmax - xmin) * (right - left),
+                bottom - (float(yvalue) - ymin) / (ymax - ymin) * (bottom - top),
+            )
+
+        if self._residuals:
+            zero_y = point(xmin, 0.0)[1]
+            painter.setPen(QPen(QColor("#929eaa"), 1, Qt.DashLine))
+            painter.drawLine(int(left), int(zero_y), int(right), int(zero_y))
+        if fit is not None and not self._residuals:
+            path = QPainterPath()
+            finite_fit = np.isfinite(fit)
+            first = True
+            for xv, yv in zip(x[finite_fit], fit[finite_fit]):
+                px, py = point(xv, yv)
+                if first:
+                    path.moveTo(px, py)
+                    first = False
+                else:
+                    path.lineTo(px, py)
+            painter.setPen(QPen(QColor("#e87522"), 1.6))
+            painter.drawPath(path)
+        painter.setPen(QPen(QColor("#2368bd"), 3))
+        for xv, yv in zip(x, plotted_y):
+            px, py = point(xv, yv)
+            painter.drawPoint(int(px), int(py))
 
 
 class AgentWindow(QMainWindow):
@@ -80,6 +324,7 @@ class AgentWindow(QMainWindow):
         self._worker: PreflightWorker | None = None
         self._planning_worker: PlanningWorker | None = None
         self._vision_worker: VisionWorker | None = None
+        self._fit_worker: AgentFitWorker | None = None
         self._active_run_id: str | None = None
         self._agent_run_id: str | None = None
         self._stage = "idle"
@@ -102,13 +347,25 @@ class AgentWindow(QMainWindow):
         self._agent_settings: AgentModelSettings = self._agent_settings_repository.load()
         self._run_snapshot: AgentRunSnapshot | None = None
         self._run_credential_resolver: AgentCredentialResolver | None = None
+        self._fit_plan: AgentFitPlan | None = None
+        self._fit_outcome: AgentFitOutcome | None = None
+        self._pending_fit_plan: AgentFitPlan | None = None
+        self._selected_roi_index = 0
+        self._selected_edge_index = 0
+        self._fit_cells: dict[tuple[int, int], AgentFitCellResult] = {}
+        self._fit_shape_initials: dict[tuple[int, int, int], tuple[float, float, float]] = {}
+        self._fit_parameter_bounds = FittingParameterBounds()
 
-        self.setWindowTitle("NEAT AI Agent — Visual Review (M5A-1)")
+        self.setWindowTitle("NEAT AI Agent — Autonomous Seven-ROI Fitting (M5A-2)")
         self.setMinimumSize(820, 520)
         self.resize(1280, 820)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
 
-        self.splitter = QSplitter(Qt.Horizontal, self)
+        self.root_panel = QWidget(self)
+        self.root_layout = QVBoxLayout(self.root_panel)
+        self.root_layout.setContentsMargins(8, 6, 8, 8)
+        self.root_layout.setSpacing(5)
+        self.splitter = QSplitter(Qt.Horizontal, self.root_panel)
         self.splitter.setObjectName("preflightOverviewEvidenceSplitter")
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(10)
@@ -119,7 +376,7 @@ class AgentWindow(QMainWindow):
             "QSplitter::handle:horizontal { background: #c5cbd3; border: 1px solid #aab2bc; }"
             "QSplitter::handle:horizontal:hover { background: #7b9fc8; }"
         )
-        self.setCentralWidget(self.splitter)
+        self.setCentralWidget(self.root_panel)
 
         self.overview_scroll = QScrollArea(self.splitter)
         self.overview_scroll.setWidgetResizable(True)
@@ -137,10 +394,10 @@ class AgentWindow(QMainWindow):
         overview_heading = QLabel("Overview", self.overview_panel)
         overview_heading.setStyleSheet("font-size: 15px; font-weight: bold;")
         overview_layout.addWidget(overview_heading)
-        title = QLabel("Prepare a read-only analysis", self.overview_panel)
+        title = QLabel("Explore fitting across seven sample locations", self.overview_panel)
         overview_layout.addWidget(title)
         self.scope_label = QLabel(
-            "NEAT checks the dataset, prepares a read-only plan when the required evidence is available, and reviews bounded visual evidence with the configured model. In OpenAI mode, pressing Start authorizes a metadata-only request when eligible and up to 7 bounded PNGs in 3 visual requests (up to 3 representative image previews, 1 spectrum plot, up to 3 phase overlays). Saving settings sends nothing. Model failures stop with a reason; no offline plan is substituted. No fitting or mapping is run.",
+            "One run checks the dataset, reviews up to three representative frames and the measured spectrum, then fits one to five trusted edges at seven spatial locations. Fitting runs locally; the model receives only the bounded previews disclosed for this run. Results are exploratory and do not confirm a phase, strain, or stress.",
             self.overview_panel,
         )
         self.scope_label.setWordWrap(True)
@@ -154,7 +411,7 @@ class AgentWindow(QMainWindow):
         self.model_readiness_label.setAccessibleName("Agent model readiness")
         overview_layout.addWidget(self.model_readiness_label)
         self.status_label = QLabel("No analysis has been started.", self.overview_panel)
-        self.status_label.setAccessibleName("Preflight status")
+        self.status_label.setAccessibleName("Autonomous analysis status")
         self.status_label.setWordWrap(True)
         controls = QHBoxLayout()
         self.start_autonomous_button = QPushButton(
@@ -165,25 +422,24 @@ class AgentWindow(QMainWindow):
         self.start_autonomous_button.setMinimumHeight(36)
         self.start_autonomous_button.setStyleSheet("font-weight: 600; padding: 6px 12px;")
         self.start_autonomous_button.setToolTip(
-            "Check the dataset and prepare a read-only plan in one action."
+            "Check the dataset, review its visual evidence, and fit selected edges locally at seven sample locations."
         )
         self.start_autonomous_button.clicked.connect(self.start_autonomous_analysis)
         controls.addWidget(self.start_autonomous_button, 1)
         self.stop_button = QPushButton("Stop", self.overview_panel)
-        self.stop_button.setAccessibleName("Cancel current preflight")
+        self.stop_button.setAccessibleName("Stop autonomous analysis")
         self.stop_button.setEnabled(False)
         self.stop_button.setVisible(False)
         self.stop_button.clicked.connect(self.stop_preflight)
         controls.addWidget(self.stop_button)
-        overview_layout.addLayout(controls)
 
-        overview_layout.addWidget(self.status_label)
         self.progress_bar = QProgressBar(self.overview_panel)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_bar.setAccessibleName("Preflight progress")
+        self.progress_bar.setAccessibleName("Autonomous analysis progress")
         self.progress_bar.setVisible(False)
-        overview_layout.addWidget(self.progress_bar)
+        self.progress_bar.setFormat("%p%")
+        controls.addWidget(self.progress_bar, 1)
 
         secondary_controls = QHBoxLayout()
         secondary_controls.addWidget(self.settings_button)
@@ -201,20 +457,64 @@ class AgentWindow(QMainWindow):
         self.dataset_summary_label.setAccessibleName("Dataset check summary")
         overview_layout.addWidget(self.dataset_summary_label)
 
-        plan_heading = QLabel("Plan and visual review", self.overview_panel)
-        plan_heading.setStyleSheet("font-weight: bold;")
-        overview_layout.addWidget(plan_heading)
+        matrix_heading = QLabel("Seven-location fit results", self.overview_panel)
+        matrix_heading.setStyleSheet("font-weight: bold;")
+        overview_layout.addWidget(matrix_heading)
+        self.fit_matrix_summary = QLabel(
+            "The fit matrix will appear after visual evidence passes validation.",
+            self.overview_panel,
+        )
+        self.fit_matrix_summary.setWordWrap(True)
+        self.fit_matrix_summary.setAccessibleName("Seven-location fit progress")
+        overview_layout.addWidget(self.fit_matrix_summary)
+        self.fit_matrix = QTableWidget(7, 1, self.overview_panel)
+        self.fit_matrix.setObjectName("agentSevenRoiFitMatrix")
+        self.fit_matrix.setVerticalHeaderLabels(list(SPATIAL_ROI_LABELS))
+        self.fit_matrix.setHorizontalHeaderLabels(["Waiting for validated edges"])
+        self.fit_matrix.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.fit_matrix.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.fit_matrix.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.fit_matrix.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self.fit_matrix.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.fit_matrix.setTabKeyNavigation(True)
+        self.fit_matrix.setAccessibleName("ROI by edge fitting status matrix")
+        self.fit_matrix.setToolTip(
+            "Rows are Reference and sample locations A–F. Columns are the validated trusted edges. "
+            "Select a cell to inspect its actual fit evidence."
+        )
+        self.fit_matrix.cellClicked.connect(self._select_fit_cell)
+        self.fit_matrix.currentCellChanged.connect(self._matrix_current_cell_changed)
+        self.fit_matrix.setMinimumHeight(148)
+        self.fit_matrix.setMaximumHeight(222)
+        self.fit_matrix.verticalHeader().setDefaultSectionSize(25)
+        overview_layout.addWidget(self.fit_matrix)
+        self.fit_detail_label = QLabel(
+            "Select a result cell after fitting begins.", self.overview_panel
+        )
+        self.fit_detail_label.setWordWrap(True)
+        self.fit_detail_label.setMinimumHeight(46)
+        self.fit_detail_label.setAccessibleName("Selected ROI and edge fit summary")
+        overview_layout.addWidget(self.fit_detail_label)
+
+        self.details_group = QGroupBox("Analysis details", self.overview_panel)
+        self.details_group.setCheckable(True)
+        self.details_group.setChecked(False)
+        details_layout = QVBoxLayout(self.details_group)
         self.plan_text = QPlainTextEdit(self.overview_panel)
         self.plan_text.setReadOnly(True)
         self.plan_text.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.plan_text.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.plan_text.setMinimumHeight(140)
-        self.plan_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.plan_text.setAccessibleName("Read-only plan proposal")
+        self.plan_text.setMinimumHeight(100)
+        self.plan_text.setMaximumHeight(220)
+        self.plan_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.plan_text.setAccessibleName("Analysis run details and planning trace")
         self.plan_text.setPlainText(
             "Start Autonomous Analysis to check the dataset and prepare a plan."
         )
-        overview_layout.addWidget(self.plan_text)
+        details_layout.addWidget(self.plan_text)
+        self.details_group.toggled.connect(self.plan_text.setVisible)
+        self.plan_text.setVisible(False)
+        overview_layout.addWidget(self.details_group)
         roi_review = QGridLayout()
         roi_review.setColumnStretch(0, 1)
         roi_review.setColumnStretch(1, 1)
@@ -251,7 +551,35 @@ class AgentWindow(QMainWindow):
         )
         evidence_explanation.setWordWrap(True)
         evidence_layout.addWidget(evidence_explanation)
-        self.evidence_scroll = QScrollArea(self.evidence_panel)
+        self.evidence_splitter = QSplitter(Qt.Vertical, self.evidence_panel)
+        self.evidence_splitter.setChildrenCollapsible(False)
+        self.evidence_splitter.setHandleWidth(7)
+        self.evidence_splitter.setAccessibleName(
+            "Adjustable image, fit evidence and run evidence panels"
+        )
+        image_preview_panel = QWidget(self.evidence_splitter)
+        image_preview_layout = QVBoxLayout(image_preview_panel)
+        image_preview_layout.setContentsMargins(0, 0, 0, 0)
+        image_preview_layout.addWidget(
+            QLabel("Actual frame with original-pixel ROI locations", image_preview_panel)
+        )
+        self.spatial_roi_preview = SpatialRoiPreviewWidget(image_preview_panel)
+        self.spatial_roi_preview.setMinimumHeight(135)
+        self.spatial_roi_preview.setMaximumHeight(380)
+        self.spatial_roi_preview.roiSelected.connect(self._select_roi_index)
+        image_preview_layout.addWidget(self.spatial_roi_preview, 1)
+        fit_evidence_panel = QWidget(self.evidence_splitter)
+        fit_evidence_layout = QGridLayout(fit_evidence_panel)
+        fit_evidence_layout.setContentsMargins(0, 0, 0, 0)
+        self.fit_curve_widgets = (
+            FitCurveWidget("Region 1 · higher wavelengths", parent=fit_evidence_panel),
+            FitCurveWidget("Region 2 · lower wavelengths", parent=fit_evidence_panel),
+            FitCurveWidget("Region 3 · edge fit", parent=fit_evidence_panel),
+            FitCurveWidget("Region 3 residuals", residuals=True, parent=fit_evidence_panel),
+        )
+        for index, curve_widget in enumerate(self.fit_curve_widgets):
+            fit_evidence_layout.addWidget(curve_widget, index // 2, index % 2)
+        self.evidence_scroll = QScrollArea(self.evidence_splitter)
         self.evidence_scroll.setWidgetResizable(True)
         self.evidence_scroll.setMinimumWidth(0)
         self.evidence_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -261,7 +589,11 @@ class AgentWindow(QMainWindow):
         self.evidence_layout.setAlignment(Qt.AlignTop)
         self._evidence_pixmaps: list[tuple[QLabel, QPixmap]] = []
         self.evidence_scroll.setWidget(self.evidence_content)
-        evidence_layout.addWidget(self.evidence_scroll)
+        self.evidence_splitter.addWidget(image_preview_panel)
+        self.evidence_splitter.addWidget(fit_evidence_panel)
+        self.evidence_splitter.addWidget(self.evidence_scroll)
+        self.evidence_splitter.setSizes([300, 250, 180])
+        evidence_layout.addWidget(self.evidence_splitter, 1)
         self.splitter.addWidget(self.overview_scroll)
         self.splitter.addWidget(self.evidence_panel)
         self.splitter.setStretchFactor(0, 1)
@@ -272,6 +604,9 @@ class AgentWindow(QMainWindow):
         self.splitter.handle(1).setToolTip(
             "Drag to give more space to Overview or Visual Evidence."
         )
+        self.root_layout.addLayout(controls)
+        self.root_layout.addWidget(self.status_label)
+        self.root_layout.addWidget(self.splitter, 1)
         self._show_evidence_message(
             "No measured evidence yet. Start Autonomous Analysis to review the dataset."
         )
@@ -359,6 +694,13 @@ class AgentWindow(QMainWindow):
 
     def _render_vision_outcome(self, outcome: VisionOutcome) -> None:
         roi = outcome.roi
+        if self._result is not None and self._result.frames:
+            image = self._result.frames[0].image
+            self.spatial_roi_preview.set_preview(
+                image.png_bytes,
+                image.coordinate_mapping,
+                outcome.spatial_roi_candidates,
+            )
         if roi is None:
             self.plan_text.setPlainText(
                 self._planning_display_text
@@ -378,7 +720,7 @@ class AgentWindow(QMainWindow):
         for edit, value in zip(self.roi_edits, (roi.x_min, roi.x_max, roi.y_min, roi.y_max)):
             edit.setValue(value)
         review_heading = (
-            "OpenAI visual proposal — user review required; no settings applied"
+            "OpenAI visual proposal — phase is provisional; NEAT validates inputs before local fitting"
             if outcome.phase_id
             else "OpenAI visual review — manual evidence review required; no settings applied"
         )
@@ -433,15 +775,483 @@ class AgentWindow(QMainWindow):
         lines.extend((
             "Visual agreement is not crystallographic identification or proof of fit quality.",
             "Physical d/strain interpretation still needs separate validation, including the legacy d_fit/factor-of-two caveat.",
-            "No fit, mapping, phase-table edit or fitting-tab change occurred.",
+            "NEAT will fit only after all seven spatial ROIs, selected edges, and fitting windows pass deterministic checks. The existing fitting tab and its configuration are not changed.",
         ))
         self.plan_text.setPlainText("\n".join(lines))
         self._clear_evidence()
+        if self._result is not None and self._result.frames:
+            image = self._result.frames[0].image
+            self.spatial_roi_preview.set_preview(
+                image.png_bytes,
+                image.coordinate_mapping,
+                outcome.spatial_roi_candidates,
+            )
         self._add_vision_png("Actual frame with proposed ROI (yellow); image row zero at top.", outcome.roi_preview_png)
         self._add_vision_png("Actual measured spectrum from proposed ROI; full source wavelength axis.", outcome.spectrum_png)
         for phase, png in outcome.phase_overlays:
             self._add_vision_png(f"Measured spectrum and NEAT theoretical dashed markers: {phase} (provisional).", png)
         self.evidence_layout.addStretch()
+
+    def _capture_fit_configuration(self) -> None:
+        """Snapshot shape initials and shared bounds on the Qt owner thread."""
+        self._fit_shape_initials = {}
+        table = getattr(self._main_window, "bragg_table", None)
+        if table is not None:
+            for row in range(table.rowCount()):
+                try:
+                    hkl = ast.literal_eval(table.item(row, 0).text())
+                    if not isinstance(hkl, (tuple, list)) or len(hkl) != 3:
+                        continue
+                    key = tuple(int(value) for value in hkl)
+                    values = tuple(
+                        float(table.item(row, column).text())
+                        if table.item(row, column) is not None
+                        else default
+                        for column, default in ((8, 0.001), (9, 0.01), (10, 0.5))
+                    )
+                    if all(np.isfinite(value) for value in values):
+                        self._fit_shape_initials[key] = values
+                except (AttributeError, SyntaxError, TypeError, ValueError, OverflowError):
+                    continue
+        getter = getattr(self._main_window, "get_fitting_parameter_bounds", None)
+        raw_bounds = getter() if callable(getter) else None
+        self._fit_parameter_bounds = FittingParameterBounds.from_legacy_dict(raw_bounds)
+
+    def _reset_fit_results(self) -> None:
+        self._fit_plan = None
+        self._fit_outcome = None
+        self._pending_fit_plan = None
+        self._fit_cells.clear()
+        self._selected_roi_index = 0
+        self._selected_edge_index = 0
+        self.fit_matrix.setColumnCount(1)
+        self.fit_matrix.setHorizontalHeaderLabels(["Waiting for validated edges"])
+        for row in range(self.fit_matrix.rowCount()):
+            item = QTableWidgetItem("—")
+            item.setToolTip("No fitting attempt has been made.")
+            self.fit_matrix.setItem(row, 0, item)
+        self.fit_matrix_summary.setText(
+            "The fit matrix will appear after visual evidence passes validation."
+        )
+        for curve_widget in self.fit_curve_widgets:
+            curve_widget.set_curve(None)
+        self.spatial_roi_preview.set_selected_roi(None)
+
+    def _configure_fit_matrix(self, plan: AgentFitPlan) -> None:
+        self._fit_plan = plan
+        self._fit_cells.clear()
+        self.fit_matrix.setColumnCount(len(plan.edges))
+        self.fit_matrix.setHorizontalHeaderLabels(
+            [f"{edge.hkl} · {edge.edge_wavelength:.3f} Å" for edge in plan.edges]
+        )
+        for roi_index, label in enumerate(SPATIAL_ROI_LABELS):
+            self.fit_matrix.setVerticalHeaderItem(roi_index, QTableWidgetItem(label))
+            for edge_index, edge in enumerate(plan.edges):
+                item = QTableWidgetItem("Queued")
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setToolTip(
+                    f"{label}, edge {edge.hkl}. Select to inspect this fit result."
+                )
+                self.fit_matrix.setItem(roi_index, edge_index, item)
+        self.fit_matrix_summary.setText(
+            f"Provisional phase: {plan.phase_id} · {len(plan.spatial_rois)} locations · "
+            f"{len(plan.edges)} edges · {len(plan.spatial_rois) * len(plan.edges)} local fits"
+        )
+        self.fit_matrix.setCurrentCell(0, 0)
+        self._update_selected_fit_evidence()
+
+    @staticmethod
+    def _cell_display(cell: AgentFitCellResult) -> tuple[str, str, QColor]:
+        mapping = {
+            AgentFitCellState.QUEUED: ("Queued", "#eef1f4"),
+            AgentFitCellState.RUNNING: ("Fitting…", "#fff0bf"),
+            AgentFitCellState.SUCCEEDED: ("Fit", "#d7f1df"),
+            AgentFitCellState.NEEDS_REVIEW: ("Review", "#ffe5ae"),
+            AgentFitCellState.FAILED: ("Failed", "#ffd9d9"),
+            AgentFitCellState.SKIPPED: ("Skipped", "#e4e7eb"),
+            AgentFitCellState.CANCELLED: ("Stopped", "#e4e7eb"),
+        }
+        label, color = mapping[cell.state]
+        details = cell.message
+        result = cell.attempt.result if cell.attempt is not None else None
+        if result is not None:
+            relative = (
+                abs(result.d_unc / result.d_fit) * 100.0
+                if np.isfinite(result.d_fit) and result.d_fit != 0 and np.isfinite(result.d_unc)
+                else float("nan")
+            )
+            label = f"{label}\n{result.d_fit:.4g}"
+            details += (
+                f"\nd_fit = {result.d_fit:.7g} ± {result.d_unc:.3g} Å"
+                f"\nRelative d uncertainty = {relative:.4g}%"
+                f"\ns = {result.s_fit:.6g} ± {result.s_unc:.3g}"
+                f"\nt = {result.t_fit:.6g} ± {result.t_unc:.3g}"
+                f"\neta = {result.eta_fit:.6g} ± {result.eta_unc:.3g}"
+                f"\nRMS = {result.rms:.5g}"
+            )
+        if cell.review_flags:
+            details += "\nReview flags: " + "; ".join(cell.review_flags)
+        return label, details, QColor(color)
+
+    def _show_fit_cell(self, cell: AgentFitCellResult) -> None:
+        attempt = cell.attempt
+        curves = (
+            None if attempt is None else attempt.region1,
+            None if attempt is None else attempt.region2,
+            None if attempt is None else attempt.region3,
+            None if attempt is None else attempt.region3,
+        )
+        for widget, curve in zip(self.fit_curve_widgets, curves):
+            widget.set_curve(curve)
+        result = attempt.result if attempt is not None else None
+        heading = f"{cell.roi_label} · edge {cell.hkl}"
+        if result is None:
+            self.fit_detail_label.setText(f"{heading} · {cell.state.value.replace('_', ' ')}: {cell.message}")
+            return
+        relative_uncertainty = (
+            abs(result.d_unc / result.d_fit) * 100.0
+            if np.isfinite(result.d_fit) and result.d_fit != 0 and np.isfinite(result.d_unc)
+            else float("nan")
+        )
+        summary = (
+            f"{heading} · d_fit {result.d_fit:.6g} ± {result.d_unc:.2g} Å "
+            f"({relative_uncertainty:.3g}% relative) · RMS {result.rms:.4g}"
+        )
+        summary += (
+            f"\ns {result.s_fit:.5g} ± {result.s_unc:.2g} · "
+            f"t {result.t_fit:.5g} ± {result.t_unc:.2g} · "
+            f"eta {result.eta_fit:.5g} ± {result.eta_unc:.2g}"
+        )
+        if self._fit_plan is not None:
+            edge = self._fit_plan.edges[self._selected_edge_index]
+            summary += (
+                f"\nRegions (Å): R1 {edge.region1.min_wavelength:.4g}–{edge.region1.max_wavelength:.4g}; "
+                f"R2 {edge.region2.min_wavelength:.4g}–{edge.region2.max_wavelength:.4g}; "
+                f"R3 {edge.region3.min_wavelength:.4g}–{edge.region3.max_wavelength:.4g}"
+            )
+        if cell.review_flags:
+            summary += " · Review: " + "; ".join(cell.review_flags)
+        summary += "\nNEAT legacy d_fit convention applies; this is a local exploratory fit, not phase, strain, or stress validation."
+        self.fit_detail_label.setText(summary)
+
+    def _update_selected_fit_evidence(self) -> None:
+        if self._fit_plan is None:
+            self.fit_detail_label.setText("Select a result cell after fitting begins.")
+            return
+        roi_index = min(self._selected_roi_index, len(self._fit_plan.spatial_rois) - 1)
+        edge_index = min(self._selected_edge_index, len(self._fit_plan.edges) - 1)
+        self.spatial_roi_preview.set_selected_roi(roi_index)
+        cell = self._fit_cells.get((roi_index, edge_index))
+        if cell is not None:
+            self._show_fit_cell(cell)
+        else:
+            for widget in self.fit_curve_widgets:
+                widget.set_curve(None)
+            self.fit_detail_label.setText(
+                f"{SPATIAL_ROI_LABELS[roi_index]} · edge {self._fit_plan.edges[edge_index].hkl} · waiting for fit evidence"
+            )
+
+    def _select_fit_cell(self, row: int, column: int) -> None:
+        if self._fit_plan is None:
+            return
+        self._selected_roi_index = max(0, min(row, len(self._fit_plan.spatial_rois) - 1))
+        self._selected_edge_index = max(0, min(column, len(self._fit_plan.edges) - 1))
+        self._update_selected_fit_evidence()
+
+    def _matrix_current_cell_changed(self, row: int, column: int, *_previous) -> None:
+        self._select_fit_cell(row, column)
+
+    def _select_roi_index(self, index: int) -> None:
+        if self._fit_plan is None or not 0 <= index < len(self._fit_plan.spatial_rois):
+            return
+        self._selected_roi_index = index
+        self.fit_matrix.setCurrentCell(index, self._selected_edge_index)
+        self._update_selected_fit_evidence()
+
+    def _block_agent_fitting(self, message: str, outcome: VisionOutcome) -> None:
+        self._pending_fit_plan = None
+        self._fit_plan = None
+        edges = tuple(outcome.hkls[:5])
+        self.fit_matrix.setColumnCount(max(1, len(edges)))
+        self.fit_matrix.setHorizontalHeaderLabels(
+            [f"{hkl} · not started" for hkl in edges]
+            if edges
+            else ["Edges not validated"]
+        )
+        for row in range(7):
+            for column in range(max(1, len(edges))):
+                item = QTableWidgetItem("Needs input")
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setToolTip(message)
+                item.setBackground(QColor("#ffe5ae"))
+                self.fit_matrix.setItem(row, column, item)
+        self.fit_matrix_summary.setText("Fitting paused · no local fit was started")
+        self.fit_detail_label.setText(message)
+        self._stage = "fitting_needs_input"
+        self._set_status(message)
+        detail = self.plan_text.toPlainText()
+        self.plan_text.setPlainText(detail + "\n\nLocal fitting paused: " + message)
+        self.progress_bar.setValue(100)
+        self._update_controls()
+
+    def _prepare_agent_fit(self, outcome: VisionOutcome) -> None:
+        if outcome.status is not VisionStatus.NEEDS_REVIEW or not outcome.phase_id or not outcome.hkls:
+            self._block_agent_fitting(
+                "Visual review did not produce a validated phase and one to five trusted edges. Review the displayed evidence; no fitting was started.",
+                outcome,
+            )
+            return
+        if len(outcome.hkls) > 5:
+            self._block_agent_fitting(
+                "Visual review proposed more than five edges. NEAT did not start fitting.",
+                outcome,
+            )
+            return
+        adapter = getattr(self._main_window, "scientific_observation_api", None)
+        if adapter is None or adapter.revision_clock.current() != self._dataset_token:
+            self._mark_stale()
+            return
+        try:
+            handle = adapter.capture_dataset()
+            if handle.image_shape is None or (handle.dataset_id, handle.revision) != self._dataset_token:
+                self._mark_stale()
+                return
+            plan = build_agent_fit_plan(
+                run_id=self._agent_run_id or "",
+                dataset_id=handle.dataset_id,
+                revision=handle.revision,
+                image_shape=handle.image_shape,
+                visual_outcome=outcome,
+                shape_parameter_initials=self._fit_shape_initials,
+                fitting_parameter_bounds=self._fit_parameter_bounds,
+            )
+            handle.assert_current()
+        except AgentFitBlocked as exc:
+            self._block_agent_fitting(str(exc), outcome)
+            return
+        except (DatasetUnavailableError, ObservationErrorBase, ValueError) as exc:
+            self._block_agent_fitting(
+                f"NEAT could not prepare a consistent local fitting run ({type(exc).__name__}). No fits were started.",
+                outcome,
+            )
+            return
+        self._configure_fit_matrix(plan)
+        self._pending_fit_plan = plan
+        self._stage = "fit_waiting_for_visual_worker"
+        self.progress_bar.setValue(0)
+        self._set_status(
+            f"Visual proposal passed the initial checks. Preparing {len(plan.spatial_rois) * len(plan.edges)} local fits."
+        )
+        self.plan_text.setPlainText(
+            self.plan_text.toPlainText()
+            + "\n\nNEAT validated seven distinct spatial ROIs, the provisional built-in phase, and the selected trusted edges. Local fitting is queued."
+        )
+
+    def _start_pending_fitting(self) -> None:
+        plan = self._pending_fit_plan
+        if (
+            plan is None
+            or self._worker is not None
+            or self._planning_worker is not None
+            or self._vision_worker is not None
+            or self._fit_worker is not None
+            or self._cancellation_requested
+            or self._stale
+            or self._parent_closing
+            or getattr(self._main_window, "_shutdown_close_pending", False)
+            or getattr(self._main_window, "_shutdown_committed", False)
+        ):
+            return
+        self._pending_fit_plan = None
+        adapter = getattr(self._main_window, "scientific_observation_api", None)
+        if adapter is None or adapter.revision_clock.current() != (
+            plan.dataset_id,
+            plan.revision,
+        ):
+            self._mark_stale()
+            return
+        try:
+            handle = adapter.capture_dataset()
+        except (DatasetUnavailableError, ObservationErrorBase, ValueError):
+            self._block_agent_fitting(
+                "The current dataset snapshot could not be captured for local fitting. Rerun the analysis.",
+                self._vision_outcome or VisionOutcome(
+                    self._agent_run_id or "", plan.dataset_id, plan.revision,
+                    VisionStatus.BLOCKED, "Dataset capture failed."
+                ),
+            )
+            return
+        if (handle.dataset_id, handle.revision) != (plan.dataset_id, plan.revision):
+            self._mark_stale()
+            return
+        worker = AgentFitWorker(handle, plan, parent=self._main_window)
+        self._fit_worker = worker
+        self._main_window.agent_fitting_worker = worker
+        self._main_window._track_shutdown_worker(worker, "agent_fitting")
+        self._main_window._connect_shutdown_worker_signal(
+            worker,
+            worker.progress,
+            lambda event, rid=plan.run_id, current=worker: self._on_fit_progress(rid, current, event),
+            current_attribute="agent_fitting_worker",
+        )
+        self._main_window._connect_shutdown_worker_signal(
+            worker,
+            worker.completed,
+            lambda result, rid=plan.run_id, current=worker: self._on_fit_completed(rid, current, result),
+            current_attribute="agent_fitting_worker",
+        )
+        self._main_window._connect_shutdown_worker_signal(
+            worker,
+            worker.finished,
+            lambda rid=plan.run_id, current=worker: self._on_fit_finished(rid, current),
+            current_attribute="agent_fitting_worker",
+        )
+        self._stage = "fitting_running"
+        self.progress_bar.setValue(1)
+        self._set_status(
+            f"Fitting {plan.phase_id} edges locally · 0/{len(plan.spatial_rois) * len(plan.edges)} attempted."
+        )
+        self._update_controls()
+        worker.start()
+
+    def _on_fit_progress(self, run_id: str, worker: AgentFitWorker, event: AgentFitProgress) -> None:
+        if (
+            run_id != self._agent_run_id
+            or worker is not self._fit_worker
+            or self._parent_closing
+            or self._cancellation_requested
+            or self._stale
+        ):
+            return
+        self._check_revision()
+        if self._stale:
+            return
+        if event.cell is not None and self._fit_plan is not None:
+            cell = event.cell
+            edge_index = next(
+                (index for index, edge in enumerate(self._fit_plan.edges) if edge.hkl == cell.hkl),
+                None,
+            )
+            if edge_index is not None:
+                self._fit_cells[(cell.roi_index, edge_index)] = cell
+                self._paint_fit_cell(cell.roi_index, edge_index, cell)
+                if cell.state is not AgentFitCellState.RUNNING and (
+                    cell.roi_index == self._selected_roi_index
+                    and edge_index == self._selected_edge_index
+                ):
+                    self._update_selected_fit_evidence()
+        if event.stage == "fit_edges" and event.total_fits:
+            self.progress_bar.setValue(min(99, int(100 * event.attempted / event.total_fits)))
+        else:
+            self.progress_bar.setValue(5)
+        self._set_status(event.message)
+
+    def _paint_fit_cell(self, row: int, column: int, cell: AgentFitCellResult) -> None:
+        label, details, color = self._cell_display(cell)
+        item = self.fit_matrix.item(row, column)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setTextAlignment(Qt.AlignCenter)
+            self.fit_matrix.setItem(row, column, item)
+        item.setText(label)
+        item.setToolTip(details)
+        item.setBackground(color)
+
+    def _on_fit_completed(self, run_id: str, worker: AgentFitWorker, outcome: AgentFitOutcome) -> None:
+        if (
+            run_id != self._agent_run_id
+            or worker is not self._fit_worker
+            or outcome.run_id != run_id
+            or self._parent_closing
+            or getattr(self._main_window, "_shutdown_close_pending", False)
+        ):
+            return
+        if outcome.status is AgentFitRunStatus.STALE:
+            self._mark_stale()
+            return
+        self._check_revision()
+        if self._stale or self._dataset_token != (outcome.dataset_id, outcome.revision):
+            self._mark_stale()
+            return
+        if self._cancellation_requested:
+            outcome = replace(
+                outcome,
+                status=AgentFitRunStatus.STOPPED,
+                message="Stop was requested before the completion callback was delivered. Completed cell evidence is retained; the run is marked stopped.",
+            )
+        self._fit_outcome = outcome
+        self._fit_cells.clear()
+        for cell in outcome.cells:
+            edge_index = next(
+                (index for index, edge in enumerate(outcome.edges) if edge.hkl == cell.hkl),
+                None,
+            )
+            if edge_index is not None:
+                self._fit_cells[(cell.roi_index, edge_index)] = cell
+                self._paint_fit_cell(cell.roi_index, edge_index, cell)
+        self._stage = outcome.status.value
+        self.fit_matrix_summary.setText(
+            f"{outcome.attempted}/{outcome.total_fits} attempted · {outcome.succeeded} fit results · "
+            f"{outcome.failed} failed · {outcome.needs_review} need review · {outcome.cancelled} stopped"
+        )
+        if outcome.status is AgentFitRunStatus.COMPLETE:
+            status = "Seven-location fitting completed. Review the matrix and selected evidence."
+        elif outcome.status is AgentFitRunStatus.COMPLETE_WITH_ISSUES:
+            status = "Fitting completed with results that need review or individual failures."
+        elif outcome.status is AgentFitRunStatus.STOPPED:
+            status = "Fitting stopped safely. Completed cell results remain available for review."
+        elif outcome.status is AgentFitRunStatus.BLOCKED:
+            status = "Fitting was blocked by a deterministic data or resource check."
+        else:
+            status = "Fitting ended safely. Review the run details."
+        self._set_status(status)
+        self.progress_bar.setValue(100 if outcome.status is not AgentFitRunStatus.STOPPED else min(99, self.progress_bar.value()))
+        first_review = next(
+            (
+                cell for cell in outcome.cells
+                if cell.state in {AgentFitCellState.FAILED, AgentFitCellState.NEEDS_REVIEW}
+            ),
+            None,
+        )
+        if first_review is not None:
+            self._selected_roi_index = first_review.roi_index
+            self._selected_edge_index = next(
+                index for index, edge in enumerate(outcome.edges) if edge.hkl == first_review.hkl
+            )
+        self.fit_matrix.setCurrentCell(self._selected_roi_index, self._selected_edge_index)
+        self._update_selected_fit_evidence()
+        self.plan_text.setPlainText(
+            self.plan_text.toPlainText()
+            + f"\n\nLocal fitting: {outcome.attempted}/{outcome.total_fits} attempted, "
+            f"{outcome.succeeded} results, {outcome.failed} failed, {outcome.needs_review} need review. "
+            + outcome.message
+            + "\nNo mapping, phase confirmation, strain, or stress calculation was performed."
+        )
+        self._update_controls()
+
+    def _on_fit_finished(self, run_id: str, worker: AgentFitWorker) -> None:
+        if self._fit_worker is worker:
+            self._fit_worker = None
+        if getattr(self._main_window, "agent_fitting_worker", None) is worker:
+            self._main_window.agent_fitting_worker = None
+        if run_id == self._agent_run_id and self._cancellation_requested and not self._stale:
+            self._stage = "cancelled"
+            self._set_status("Autonomous analysis stopped after the current local fit completed safely.")
+        self._update_controls()
+
+    def fit_worker_retired(self, worker: AgentFitWorker, callbacks_suppressed: bool) -> None:
+        if self._fit_worker is worker:
+            self._fit_worker = None
+        if not self._parent_closing:
+            if self._cancellation_requested and not self._stale:
+                self._stage = "cancelled"
+                self._set_status("Autonomous analysis stopped. Completed fits, if any, remain available.")
+            elif callbacks_suppressed and not self._stale:
+                self._fit_outcome = None
+                self._fit_cells.clear()
+                self._reset_fit_results()
+                self._set_status("Local fitting stopped while NEAT was closing.")
+            self._update_controls()
 
     def preview_adjusted_roi(self) -> None:
         if self._result is None or not self._result.frames or self._vision_outcome is None or self._has_active_worker():
@@ -530,6 +1340,14 @@ class AgentWindow(QMainWindow):
             self._planning_worker.stop()
         if self._vision_worker is not None:
             self._vision_worker.stop()
+        if self._fit_worker is not None:
+            self._fit_worker.stop()
+        self._fit_outcome = None
+        self._fit_plan = None
+        self._pending_fit_plan = None
+        self._fit_cells.clear()
+        self._reset_fit_results()
+        self.spatial_roi_preview.set_preview(None, None, ())
         self._stage = "stale"
         stale_message = (
             "Dataset changed — rerun autonomous analysis."
@@ -544,7 +1362,10 @@ class AgentWindow(QMainWindow):
             if self._agent_run_id is not None
             else "Dataset changed — rerun preflight to see current evidence."
         )
-        if self._worker is None and self._planning_worker is None and self._vision_worker is None:
+        if (
+            self._worker is None and self._planning_worker is None
+            and self._vision_worker is None and self._fit_worker is None
+        ):
             self._revision_timer.stop()
         self._update_controls()
 
@@ -554,16 +1375,18 @@ class AgentWindow(QMainWindow):
             inventory is not None
             and any(
                 inventory.has_role(role)
-                for role in ("agent_preflight", "agent_planning", "agent_vision")
+                for role in ("agent_preflight", "agent_planning", "agent_vision", "agent_fitting")
             )
         )
         return bool(
             self._worker is not None
             or self._planning_worker is not None
             or self._vision_worker is not None
+            or self._fit_worker is not None
             or self._awaiting_preflight_completion
             or self._pending_planning_context is not None
             or self._pending_vision_result is not None
+            or self._pending_fit_plan is not None
             or tracked_worker
         )
 
@@ -574,6 +1397,7 @@ class AgentWindow(QMainWindow):
             self._awaiting_preflight_completion
             or self._pending_planning_context is not None
             or self._pending_vision_result is not None
+            or self._pending_fit_plan is not None
             or (
                 self._worker is not None
                 and not self._preflight_completion_received
@@ -583,6 +1407,7 @@ class AgentWindow(QMainWindow):
                 and self._planning_outcome is None
             )
             or (self._vision_worker is not None and self._vision_outcome is None)
+            or (self._fit_worker is not None and self._fit_outcome is None)
         )
 
     def _update_controls(self) -> None:
@@ -774,6 +1599,8 @@ class AgentWindow(QMainWindow):
         self._planning_outcome = None
         self._planning_display_text = ""
         self._vision_outcome = None
+        self._reset_fit_results()
+        self._capture_fit_configuration()
         self._set_vision_review_visible(False)
         self._vision_run_enabled = vision_enabled
         self._stage = "preflight_running"
@@ -806,8 +1633,10 @@ class AgentWindow(QMainWindow):
         self._awaiting_preflight_completion = True
         self._pending_planning_context = None
         self._pending_vision_result = None
+        self._pending_fit_plan = None
         self._planning_outcome = None
         self._vision_outcome = None
+        self._reset_fit_results()
         if _agent_run_id is None:
             self._agent_run_id = None
             self._run_snapshot = None
@@ -891,7 +1720,13 @@ class AgentWindow(QMainWindow):
         self._cancellation_requested = True
         self._pending_planning_context = None
         self._pending_vision_result = None
-        for worker in (self._worker, self._planning_worker, self._vision_worker):
+        self._pending_fit_plan = None
+        for worker in (
+            self._worker,
+            self._planning_worker,
+            self._vision_worker,
+            self._fit_worker,
+        ):
             if worker is not None:
                 try:
                     worker.stop()
@@ -1097,6 +1932,7 @@ class AgentWindow(QMainWindow):
             result,
             self._run_snapshot.settings,
             roi_override=roi_override,
+            require_spatial_rois=True,
             credential_resolver=self._run_credential_resolver,
             cloud_egress_authorized=self._vision_run_enabled,
             parent=self._main_window,
@@ -1121,7 +1957,7 @@ class AgentWindow(QMainWindow):
         )
         self._stage = "vision_running"
         visual_status = (
-            "The configured OpenAI model is inspecting bounded previews. This may propose settings for your review; nothing will be applied."
+            "The configured OpenAI model is reviewing the bounded previews and proposing sample locations and trusted edges. NEAT will validate them before any local fit starts."
         )
         self.plan_text.setPlainText(
             self._planning_display_text + "\n\n" + visual_status
@@ -1209,11 +2045,19 @@ class AgentWindow(QMainWindow):
             self._set_status(outcome.message)
         else:
             self._render_vision_outcome(outcome)
-            if outcome.phase_id:
-                self._set_status("Provisional visual suggestions are ready for your review. No fitting or configuration change occurred.")
+            if outcome.phase_id and len(outcome.spatial_roi_candidates) == 7:
+                self._prepare_agent_fit(outcome)
+            elif outcome.phase_id:
+                self._stage = "fitting_needs_input"
+                self._set_status(
+                    "Visual phase and edge suggestions are available, but seven spatial locations were not validated. No fitting was started."
+                )
             else:
-                self._set_status("Visual evidence is ready for manual review; no phase or edge suggestion was accepted.")
-            self.progress_bar.setValue(100)
+                self._block_agent_fitting(
+                    "Visual review did not produce a validated provisional phase and edge list. Review the evidence; no fitting was started.",
+                    outcome,
+                )
+                self.progress_bar.setValue(100)
         self._update_controls()
 
     def _on_vision_finished(self, run_id: str, worker: VisionWorker) -> None:
@@ -1237,6 +2081,8 @@ class AgentWindow(QMainWindow):
             elif callbacks_suppressed and not self._stale:
                 self._vision_outcome = None
                 self._set_status("OpenAI visual review stopped while NEAT was closing.")
+            elif self._pending_fit_plan is not None:
+                self._start_pending_fitting()
             self._update_controls()
 
     def _start_planning(self, context: PlanningContext) -> None:
@@ -1429,14 +2275,14 @@ class AgentWindow(QMainWindow):
             lines.extend(
                 (
                     "",
-                    "Plan prepared — scientific execution is not yet implemented.",
-                    "No fitting, mapping, phase identification, or source-data changes occurred.",
+                    "Dataset preflight plan prepared. Visual checks and local exploratory fitting are the next stages.",
+                    "No fitting has started yet; phase, strain and stress are not confirmed by this plan.",
                 )
             )
             self._set_status(
-                "Plan ready to review. No fitting or mapping has run."
+                "Dataset preflight passed — visual review and local fitting will advance automatically."
             )
-            self.progress_bar.setValue(100)
+            self.progress_bar.setValue(72)
         elif outcome.status is PlanningStatus.NEEDS_INPUT:
             self._set_status("Plan needs user input before it can be considered ready.")
         elif outcome.status is PlanningStatus.BLOCKED_INVALID_DATA:
@@ -1636,8 +2482,25 @@ class AgentWindow(QMainWindow):
         self.dataset_summary_label.setText(summary)
         self._clear_evidence()
         if dataset.mode is DatasetMode.PROFILE:
+            self.spatial_roi_preview.set_preview(None, None, ())
             self._add_evidence_text("Spectrum-only input: image controls do not apply.")
         elif result.frames:
+            image = result.frames[0].image
+            candidates = ()
+            if result.roi is not None:
+                candidates = (
+                    SpatialRoiCandidate(
+                        "Reference",
+                        result.roi,
+                        "NEAT's selected ROI.",
+                        "user-selected",
+                        (),
+                        (result.roi.x_min, result.roi.x_max, result.roi.y_min, result.roi.y_max),
+                    ),
+                )
+            self.spatial_roi_preview.set_preview(
+                image.png_bytes, image.coordinate_mapping, candidates
+            )
             self._add_evidence_text("Measured image previews; image row zero is at the top.")
             for frame in result.frames:
                 caption = f"Frame {frame.frame_index}"
@@ -1690,11 +2553,18 @@ class AgentWindow(QMainWindow):
         self._planning_outcome = None
         self._vision_outcome = None
         self._vision_worker = None
+        self._fit_worker = None
+        self._fit_plan = None
+        self._fit_outcome = None
+        self._fit_cells.clear()
+        self._pending_fit_plan = None
         self._run_snapshot = None
         self._run_credential_resolver = None
         self._dataset_token = None
         self._discard_adjusted_roi()
         self.plan_text.clear()
+        self._reset_fit_results()
+        self.spatial_roi_preview.set_preview(None, None, ())
         self._show_evidence_message("NEAT is closing.")
         self.hide()
 
@@ -1712,11 +2582,17 @@ class AgentWindow(QMainWindow):
         self._result = None
         self._planning_outcome = None
         self._vision_outcome = None
+        self._fit_plan = None
+        self._fit_outcome = None
+        self._fit_cells.clear()
+        self._pending_fit_plan = None
         self._dataset_token = None
         self._discard_adjusted_roi()
         self._run_snapshot = None
         self._run_credential_resolver = None
         self.plan_text.clear()
+        self._reset_fit_results()
+        self.spatial_roi_preview.set_preview(None, None, ())
         self._revision_timer.stop()
         self._show_evidence_message("No current evidence is displayed.")
         self.hide()
