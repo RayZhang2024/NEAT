@@ -107,7 +107,7 @@ class ReleasePackagingTests(unittest.TestCase):
             encoding="utf-8"
         )
         normalized = workflow.lower()
-        self.assertIn(".[assistant,assistant-server]", workflow)
+        self.assertIn(".[assistant,assistant-server,agent-llm]", workflow)
         self.assertIn("--release-smoke-test", workflow)
         self.assertIn("NEAT_RELEASE_SMOKE_RESULT", workflow)
         self.assertIn("tools.prepare_public_shared_access", workflow)
@@ -127,7 +127,13 @@ class ReleasePackagingTests(unittest.TestCase):
             encoding="utf-8"
         )
         normalized = workflow.lower()
-        self.assertIn(".[assistant,assistant-server,test]", workflow)
+        self.assertIn(".[assistant,assistant-server,agent-llm,test]", workflow)
+        distribution_workflow = (
+            PROJECT_ROOT / ".github/workflows/distribution.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            ".[assistant,assistant-server,agent-llm,test]", distribution_workflow
+        )
         windows_matrix = re.search(
             r"windows-unit-tests:(.*?)(?=\n  ubuntu-quality:)", normalized, re.DOTALL
         )
