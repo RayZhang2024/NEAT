@@ -37,7 +37,9 @@ class VisionWorker(QThread):
         settings: AgentModelSettings,
         *,
         roi_override: RoiBounds | None = None,
+        require_spatial_rois: bool = False,
         credential_resolver: AgentCredentialResolver | None = None,
+        langsmith_credential_resolver: AgentCredentialResolver | None = None,
         cloud_egress_authorized: bool = False,
         inspector: VisionInspector | None = None,
         parent=None,
@@ -49,8 +51,10 @@ class VisionWorker(QThread):
         self._handle: ScientificDatasetHandle | None = handle
         self._preflight: PreflightResult | None = preflight
         self._roi_override = roi_override
+        self._require_spatial_rois = bool(require_spatial_rois)
         self._settings = settings
         self._credential_resolver = credential_resolver
+        self._langsmith_credential_resolver = langsmith_credential_resolver
         self._cloud_egress_authorized = cloud_egress_authorized
         self._inspector: VisionInspector | None = inspector
         self._cancel = Event()
@@ -90,14 +94,30 @@ class VisionWorker(QThread):
             if self._cancel.is_set():
                 inspector.cancel()
                 raise VisionCancelled("Visual review stopped.")
+            langsmith_api_key = None
+            if (
+                self._settings.langsmith_tracing_enabled
+                and self._langsmith_credential_resolver is not None
+            ):
+                try:
+                    langsmith_api_key = self._langsmith_credential_resolver.get()
+                except AgentModelError:
+                    langsmith_api_key = None
             outcome = run_visual_rehearsal(
                 self.run_id,
                 handle,
                 preflight,
                 inspector,
                 roi_override=self._roi_override,
+                require_spatial_rois=self._require_spatial_rois,
                 cancelled=self._cancel.is_set,
                 progress=self.progress.emit,
+                langsmith_enabled=self._settings.langsmith_tracing_enabled,
+                langsmith_api_key=langsmith_api_key,
+                langsmith_agent_id=self._settings.langsmith_agent_id,
+                langsmith_environment=self._settings.langsmith_environment,
+                langsmith_region=self._settings.langsmith_region,
+                langsmith_workspace_id=self._settings.langsmith_workspace_id,
             )
             if self._cancel.is_set():
                 raise VisionCancelled("Visual review stopped.")

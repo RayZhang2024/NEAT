@@ -62,6 +62,7 @@ from ...domain import (
     FittingParameterBounds,
     FullPatternFitConfig,
     IndividualEdgeFitConfig,
+    default_bragg_edge_windows,
 )
 from ...services.fitting_engine import FittingEngine
 from ...workers.batch import (
@@ -230,23 +231,7 @@ class FittingMixin:
     @staticmethod
     def _default_bragg_edge_windows(x_hkl, lower_midpoint=None, upper_midpoint=None):
         """Return default edge windows, clamped by adjacent-edge midpoints."""
-        lower_window_min = max(x_hkl * 0.90, x_hkl - 0.3)
-        lower_window_max = x_hkl * 0.98
-        upper_window_min = x_hkl * 1.04
-        upper_window_max = min(x_hkl * 1.12, x_hkl + 0.4)
-
-        if lower_midpoint is not None and np.isfinite(lower_midpoint):
-            lower_window_min = max(lower_window_min, float(lower_midpoint))
-        if upper_midpoint is not None and np.isfinite(upper_midpoint):
-            upper_window_max = min(upper_window_max, float(upper_midpoint))
-
-        return {
-            "lower_min": lower_window_min,
-            "lower_max": lower_window_max,
-            "upper_min": upper_window_min,
-            "upper_max": upper_window_max,
-            "valid": lower_window_min < lower_window_max and upper_window_min < upper_window_max,
-        }
+        return default_bragg_edge_windows(x_hkl, lower_midpoint, upper_midpoint)
 
     def _bragg_cell_text(self, row, col):
         table = getattr(self, "bragg_table", None)

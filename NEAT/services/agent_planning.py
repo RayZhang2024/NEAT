@@ -1,4 +1,4 @@
-"""Offline LangGraph planner for validated, read-only preflight evidence.
+"""LangGraph workflow for validating read-only preflight plans.
 
 LangGraph is imported only when a planning run starts so the normal NEAT
 installation remains independent of the optional ``agent`` extra.
@@ -31,6 +31,7 @@ from ..domain.agent_planning import (
 )
 from ..domain.agent_preflight import PreflightReadiness
 from ..domain.observation import DatasetMode, WavelengthAxisStatus
+from .agent_tracing import agent_langsmith_context
 
 
 class PlanningDependencyUnavailable(RuntimeError):
@@ -489,12 +490,11 @@ def _apply_scientific_safety_gates(
 def _load_langgraph():
     try:
         from langgraph.graph import END, START, StateGraph
-        from langsmith.run_helpers import tracing_context
     except (ImportError, OSError) as exc:
         raise PlanningDependencyUnavailable(
-            "Offline LangGraph planning requires NEAT's optional [agent] extra."
+            "Agent planning requires NEAT's optional [agent] extra."
         ) from exc
-    return END, START, StateGraph, tracing_context
+    return END, START, StateGraph
 
 
 def run_planning(
@@ -507,10 +507,16 @@ def run_planning(
     planner_source: PlannerSource = PlannerSource.LOCAL_DETERMINISTIC,
     provider: str = "",
     model_id: str = "",
+    langsmith_enabled: bool = False,
+    langsmith_api_key: str | None = None,
+    langsmith_agent_id: str = "neat-agentic-roi",
+    langsmith_environment: str = "local",
+    langsmith_region: str = "eu",
+    langsmith_workspace_id: str = "",
 ) -> PlanningOutcome:
-    """Run the fixed, offline StateGraph and validate its read-only proposal."""
+    """Run the fixed LangGraph workflow and validate its read-only proposal."""
     _check_live(context, cancelled, current_dataset_token)
-    END, START, StateGraph, tracing_context = _load_langgraph()
+    END, START, StateGraph = _load_langgraph()
     initial = context_to_state(context)
     _check_live(context, cancelled, current_dataset_token)
 
@@ -650,15 +656,20 @@ def run_planning(
     builder.add_edge("terminal", END)
     app = builder.compile(checkpointer=checkpointer)
     config = {
-        "callbacks": [],
         "configurable": {"thread_id": context.run_id},
         "recursion_limit": MAX_GRAPH_NODES + 1,
         "metadata": {"workflow": "neat_read_only_plan", "run_id": context.run_id},
     }
     try:
-        # A user may have enabled LangSmith tracing globally for other tools.
-        # This local scientific workflow explicitly suppresses that context.
-        with tracing_context(enabled=False):
+        with agent_langsmith_context(
+            enabled=langsmith_enabled,
+            api_key=langsmith_api_key,
+            agent_id=langsmith_agent_id,
+            environment=langsmith_environment,
+            region=langsmith_region,
+            workspace_id=langsmith_workspace_id,
+            workflow="neat_read_only_plan",
+        ):
             raw = app.invoke(initial, config=config)
     except (PlanningCancelled, PlanningStale):
         raise

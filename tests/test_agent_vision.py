@@ -13,23 +13,33 @@ from unittest.mock import patch
 
 import httpx
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Keep optional ONNX initialization ahead of Qt, as in NEAT.app.
+# isort: off
+import NEAT  # noqa: F401
+# isort: on
+
 from PyQt5.QtWidgets import QApplication
 
 from NEAT.domain.agent_model import AgentModelMode, AgentModelSettings
 from NEAT.domain.agent_preflight import FrameEvidence, PreflightResult, assess_dataset
-from NEAT.domain.agent_vision import VisionStatus
+from NEAT.domain.agent_vision import SpatialRoiCandidate, VisionStatus
 from NEAT.domain.observation import (
     DatasetMode,
     DatasetRevisionClock,
     ImageViewSpec,
+    PixelCoordinateMapping,
     RoiBounds,
     WavelengthAxisStatus,
 )
 from NEAT.services.agent_vision import (
     MAX_VISION_COMPLETION_TOKENS,
+    MAX_VISION_EDGE_REASON_CHARS,
+    MAX_VISION_EXPLANATION_CHARS,
+    MAX_VISION_RESPONSE_BYTES,
+    MAX_VISION_TEXT_CHARS,
     OpenAIVisionInspector,
     VisionCancelled,
     VisionError,
@@ -37,9 +47,12 @@ from NEAT.services.agent_vision import (
     VisionUnavailable,
     _message_text_content,
     _roi_from_response,
+    _spatial_roi_candidate,
+    _text,
     _visual_response_schema,
     render_phase_overlay,
     render_roi_overlay,
+    render_spatial_roi_overlay,
     run_visual_rehearsal,
     trusted_phase_edges,
 )
@@ -129,6 +142,9 @@ class FakeVision:
         self.roi_reason = roi_reason
         self.cancelled = False
 
+    def cancel(self):
+        self.cancelled = True
+
     def inspect(self, stage, images, prompt):
         self.calls.append((stage, images, prompt))
         for png in images:
@@ -183,11 +199,313 @@ class FakeVision:
             "unresolved": ["Compare fitting uncertainty later"],
         }
 
+
+class FakeSevenRoiVision(FakeVision):
+    """Fake the same bounded request while returning six added locations."""
+
+    def __init__(self, *, medium_location: str | None = None,
+                 retry_stays_uncertain: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.medium_location = medium_location
+        self.retry_stays_uncertain = retry_stays_uncertain
+
+    def inspect(self, stage, images, prompt):
+        if stage not in {"sample_roi", "sample_locations"}:
+            return super().inspect(stage, images, prompt)
+        super().inspect(stage, images, prompt)
+        rois = (
+            (18, 23, 20, 25),
+            (25, 30, 20, 25),
+            (32, 37, 20, 25),
+            (39, 44, 20, 25),
+            (18, 23, 30, 35),
+            (25, 30, 30, 35),
+            (32, 37, 30, 35),
+        )
+        reference = {
+            "roi": dict(zip(("x_min", "x_max", "y_min", "y_max"), rois[0])),
+            "reason": "Visible sample interior.",
+            "confidence": "high",
+            "ambiguity_flags": [],
+        }
+        additional = []
+        for index, coordinates in enumerate(rois[1:]):
+            if (stage == "sample_locations" and self.medium_location == chr(65 + index)
+                    and sum(call[0] == "sample_locations" for call in self.calls) > 1
+                    and not self.retry_stays_uncertain):
+                coordinates = (40, 45, 30, 35)
+            additional.append({
+                "roi": dict(zip(("x_min", "x_max", "y_min", "y_max"), coordinates)),
+                "reason": "Distinct visible sample interior.",
+                "confidence": "medium" if (
+                    self.medium_location == chr(65 + index)
+                    and (self.retry_stays_uncertain or
+                         sum(call[0] == "sample_locations" for call in self.calls) == 1)
+                ) else "high",
+                "ambiguity_flags": [],
+            })
+        return {**reference, **({"additional_rois": additional} if stage == "sample_locations" else {})}
+
     def cancel(self):
         self.cancelled = True
 
 
+class PhaseResponseVision(FakeSevenRoiVision):
+    def __init__(self, **changes):
+        super().__init__()
+        self.changes = changes
+
+    def inspect(self, stage, images, prompt):
+        response = super().inspect(stage, images, prompt)
+        if stage == "phase_overlay":
+            response.update(self.changes)
+        return response
+
+
 class VisionServiceTests(unittest.TestCase):
+    def test_small_spatial_rois_render_at_preview_scales_and_boundaries(self):
+        for original_size, preview_size, bounds, expected in (
+            (2048, 256, (1000, 1003, 1000, 1003), (125, 125, 125, 125)),
+            (2048, 256, (0, 3, 0, 3), (0, 0, 0, 0)),
+            (2048, 256, (2045, 2048, 2045, 2048), (255, 255, 255, 255)),
+            (512, 256, (101, 104, 101, 104), (50, 50, 51, 51)),
+            (64, 64, (10, 13, 10, 13), (10, 10, 12, 12)),
+        ):
+            with self.subTest(original_size=original_size, bounds=bounds):
+                candidate = _spatial_roi_candidate(
+                    {
+                        "roi": dict(zip(("x_min", "x_max", "y_min", "y_max"), bounds)),
+                        "reason": "Visible sample interior.",
+                        "confidence": "high", "ambiguity_flags": [],
+                    },
+                    label="Reference", image_shape=(original_size, original_size),
+                    previously_proposed=(),
+                )
+                self.assertTrue(candidate.accepted)
+                mapping = PixelCoordinateMapping(
+                    original_size, original_size, preview_size, preview_size
+                )
+                png = BytesIO()
+                Image.new("RGB", (preview_size, preview_size)).save(png, "PNG")
+                rectangle = ImageDraw.ImageDraw.rectangle
+                with patch.object(
+                    ImageDraw.ImageDraw, "rectangle", autospec=True, side_effect=rectangle
+                ) as draw_rectangle:
+                    result = render_spatial_roi_overlay(png.getvalue(), mapping, (candidate,))
+                self.assertEqual(draw_rectangle.call_args_list[0].args[1], expected)
+                with Image.open(BytesIO(result)) as rendered:
+                    self.assertEqual(rendered.size, (preview_size, preview_size))
+
+    def test_invalid_spatial_rectangles_are_skipped_or_clipped_for_display_only(self):
+        mapping = PixelCoordinateMapping(2048, 2048, 256, 256)
+        png = BytesIO()
+        Image.new("RGB", (256, 256)).save(png, "PNG")
+        for bounds, expected in (
+            ((1003, 1000, 10, 20), None),
+            ((10, 20, 20, 20), None),
+            ((-10, -1, 0, 3), None),
+            ((2048, 2051, 0, 3), None),
+            ((-1, 3, -1, 3), (0, 0, 0, 0)),
+            ((2045, 2051, 2045, 2051), (255, 255, 255, 255)),
+        ):
+            with self.subTest(bounds=bounds):
+                candidate = SpatialRoiCandidate(
+                    "A", None, proposed_coordinates=bounds, validation_error="Invalid ROI."
+                )
+                rectangle = ImageDraw.ImageDraw.rectangle
+                with patch.object(
+                    ImageDraw.ImageDraw, "rectangle", autospec=True, side_effect=rectangle
+                ) as draw_rectangle:
+                    render_spatial_roi_overlay(png.getvalue(), mapping, (candidate,))
+                if expected is None:
+                    draw_rectangle.assert_not_called()
+                else:
+                    self.assertEqual(draw_rectangle.call_args_list[0].args[1], expected)
+                self.assertFalse(candidate.accepted)
+
+    def test_spatial_roi_explanations_use_the_advertised_normalized_limit(self):
+        for reason, accepted in (
+            ("Visible sample\ninterior.", True),
+            ("Visible sample interior. " * 30, True),
+            ("x" * (MAX_VISION_EXPLANATION_CHARS + 1), False),
+            ("private-output\x00", False),
+        ):
+            with self.subTest(accepted=accepted, length=len(reason)):
+                candidate = _spatial_roi_candidate(
+                    {
+                        "roi": {"x_min": 10, "x_max": 20, "y_min": 10, "y_max": 20},
+                        "reason": reason,
+                        "confidence": "high",
+                        "ambiguity_flags": [],
+                    },
+                    label="Reference",
+                    image_shape=(100, 100),
+                    previously_proposed=(),
+                )
+                self.assertEqual(candidate.accepted, accepted)
+                if accepted:
+                    self.assertEqual(candidate.reason, " ".join(reason.split()))
+                else:
+                    self.assertTrue(candidate.validation_error)
+                    self.assertNotIn("private-output", candidate.validation_error)
+
+    def test_long_multiline_explanations_preserve_the_seven_roi_phase_proposal(self):
+        handle, preflight = _fixture()
+        reason = "Support and contradiction. " * 30
+        edge_reason = "Visible step near the trusted marker. " * 10
+        model = PhaseResponseVision(
+            reason="\r\n  " + reason + "\t\nEnd of comparison.  ",
+            edge_reasons=["\n " + edge_reason + "\t"],
+        )
+        outcome = run_visual_rehearsal(
+            "run", handle, preflight, model, require_spatial_rois=True
+        )
+
+        self.assertEqual(outcome.phase_id, "Fe_bcc")
+        self.assertEqual(outcome.hkls, ((2, 1, 1),))
+        self.assertEqual(outcome.phase_reason, reason.strip() + " End of comparison.")
+        self.assertEqual(outcome.edge_reasons, (edge_reason.strip(),))
+        self.assertEqual(outcome.response_validation_error, "")
+        self.assertEqual(len(outcome.spatial_roi_candidates), 7)
+        self.assertTrue(all(item.accepted for item in outcome.spatial_roi_candidates))
+        self.assertEqual(len(model.calls), 4)
+
+    def test_invalid_phase_explanations_report_sanitized_failure_and_keep_evidence(self):
+        for value, error in (
+            (None, "must be text"),
+            (" \n\t ", "empty after whitespace normalization"),
+            ("private-output\x00", "unsupported control characters"),
+            ("x" * (MAX_VISION_EXPLANATION_CHARS + 1), "2048-character limit"),
+        ):
+            with self.subTest(error=error):
+                handle, preflight = _fixture()
+                model = PhaseResponseVision(reason=value)
+                outcome = run_visual_rehearsal("run", handle, preflight, model)
+                self.assertEqual(outcome.phase_id, "")
+                self.assertEqual(outcome.hkls, ())
+                self.assertEqual(outcome.proposed_phase_id, "Fe_bcc")
+                self.assertIn(error, outcome.response_validation_error)
+                self.assertIn(error, outcome.message)
+                self.assertNotIn("private-output", outcome.message)
+                self.assertNotIn("uncertain", outcome.message)
+                self.assertIsNotNone(outcome.roi_preview_png)
+                self.assertIsNotNone(outcome.spectrum_png)
+                self.assertEqual(len(outcome.phase_overlays), 2)
+                self.assertEqual(len(model.calls), 3)
+
+    def test_long_explanation_does_not_override_uncertainty_or_invalid_hkls(self):
+        for changes in (
+            {"status": "uncertain", "phase_id": None, "hkls": [], "edge_reasons": []},
+            {"hkls": [[9, 9, 9]]},
+        ):
+            with self.subTest(changes=changes):
+                handle, preflight = _fixture()
+                reason = "Evidence remains ambiguous. " * 20
+                outcome = run_visual_rehearsal(
+                    "run", handle, preflight,
+                    PhaseResponseVision(reason=reason, **changes),
+                )
+                self.assertEqual(outcome.phase_id, "")
+                self.assertEqual(outcome.hkls, ())
+                self.assertEqual(outcome.response_validation_error, "")
+                if changes.get("status") == "uncertain":
+                    self.assertIn("marked the overlay comparison as uncertain", outcome.message)
+                    self.assertEqual(outcome.phase_reason, reason.strip())
+                    self.assertEqual(outcome.proposed_phase_id, "")
+                else:
+                    self.assertIn("unsupported or duplicated", outcome.message)
+
+    def test_invalid_edge_explanation_still_blocks_the_proposal(self):
+        handle, preflight = _fixture()
+        outcome = run_visual_rehearsal(
+            "run", handle, preflight,
+            PhaseResponseVision(edge_reasons=["x" * (MAX_VISION_EDGE_REASON_CHARS + 1)]),
+        )
+        self.assertEqual(outcome.phase_id, "")
+        self.assertEqual(outcome.hkls, ())
+        self.assertEqual(outcome.proposed_phase_id, "Fe_bcc")
+        self.assertIn("512-character limit", outcome.response_validation_error)
+
+    def test_text_bounds_are_checked_after_normalization_without_truncation(self):
+        for limit in (
+            MAX_VISION_TEXT_CHARS, MAX_VISION_EDGE_REASON_CHARS,
+            MAX_VISION_EXPLANATION_CHARS,
+        ):
+            with self.subTest(limit=limit):
+                text = "x" * limit
+                self.assertEqual(_text("\n " + text + "\t", "Reason", character_limit=limit), text)
+                with self.assertRaisesRegex(VisionError, "character limit"):
+                    _text(text + "x", "Reason", character_limit=limit)
+        with self.assertRaisesRegex(VisionError, "safety limit"):
+            _text(" " * (MAX_VISION_RESPONSE_BYTES + 1), "Reason")
+
+    def test_spatial_seven_roi_proposal_reuses_existing_images_and_request_budget(self):
+        handle, preflight = _fixture()
+        model = FakeSevenRoiVision()
+        outcome = run_visual_rehearsal(
+            "seven-roi-run",
+            handle,
+            preflight,
+            model,
+            require_spatial_rois=True,
+        )
+
+        self.assertEqual(len(outcome.spatial_roi_candidates), 7)
+        self.assertTrue(all(candidate.accepted for candidate in outcome.spatial_roi_candidates))
+        self.assertEqual(tuple(item.label for item in outcome.spatial_roi_candidates), (
+            "Reference", "A", "B", "C", "D", "E", "F"
+        ))
+        self.assertEqual(outcome.request_stages, ("sample_roi", "phase_shortlist", "phase_overlay", "sample_locations"))
+        self.assertEqual([call[0] for call in model.calls], list(outcome.request_stages))
+        self.assertEqual([len(call[1]) for call in model.calls], [3, 1, 2, 3])
+        self.assertIn("exactly six `additional_rois`", model.calls[3][2])
+        self.assertIsNotNone(outcome.spatial_rois_png)
+
+    def test_user_reference_still_uses_same_three_previews_for_six_locations(self):
+        handle, preflight = _fixture()
+        model = FakeSevenRoiVision()
+        reference = RoiBounds(18, 23, 20, 25)
+        outcome = run_visual_rehearsal(
+            "seven-roi-run",
+            handle,
+            preflight,
+            model,
+            roi_override=reference,
+            require_spatial_rois=True,
+        )
+
+        self.assertEqual(outcome.roi, reference)
+        self.assertEqual(len(outcome.spatial_roi_candidates), 7)
+        self.assertEqual(len(model.calls), 3)
+        self.assertEqual(len(model.calls[-1][1]), 3)
+        self.assertIn("Already accepted locations", model.calls[-1][2])
+        self.assertEqual(len(outcome.inspected_frames), 3)
+
+    def test_ambiguous_spatial_roi_is_replaced_before_fitting(self):
+        handle, preflight = _fixture()
+        outcome = run_visual_rehearsal(
+            "seven-roi-run",
+            handle,
+            preflight,
+            FakeSevenRoiVision(medium_location="C"),
+            require_spatial_rois=True,
+        )
+
+        self.assertEqual(len(outcome.spatial_roi_candidates), 7)
+        self.assertTrue(all(candidate.accepted for candidate in outcome.spatial_roi_candidates))
+        self.assertEqual(outcome.request_stages[-2:], ("sample_locations", "sample_locations"))
+
+    def test_ambiguous_spatial_roi_remains_unaccepted_after_bounded_retries(self):
+        handle, preflight = _fixture()
+        outcome = run_visual_rehearsal(
+            "seven-roi-run", handle, preflight,
+            FakeSevenRoiVision(medium_location="C", retry_stays_uncertain=True),
+            require_spatial_rois=True,
+        )
+        self.assertFalse(outcome.spatial_roi_candidates[3].accepted)
+        self.assertEqual(outcome.request_stages.count("sample_locations"), 3)
+        self.assertIn("No safe replacement after two retries", outcome.spatial_roi_candidates[3].validation_error)
+
     def test_actual_pngs_roi_bootstrap_overlay_and_no_scientific_writes(self):
         handle, preflight = _fixture()
         model = FakeVision()
@@ -316,6 +634,8 @@ class VisionServiceTests(unittest.TestCase):
                 self.assertEqual(result.phase_id, "")
                 self.assertEqual(result.hkls, ())
                 self.assertIn("phase", result.message.lower())
+                if "bad_phase" in kwargs:
+                    self.assertEqual(result.proposed_phase_id, "")
                 self.assertIsNotNone(result.roi_preview_png)
                 self.assertIsNotNone(result.spectrum_png)
 
@@ -512,6 +832,12 @@ class VisionServiceTests(unittest.TestCase):
             received[0].headers["authorization"], "Bearer temporary-test-key"
         )
         body = json.loads(received[0].content)
+        instructions = body["messages"][0]["content"]
+        for limit in (
+            MAX_VISION_EXPLANATION_CHARS, MAX_VISION_EDGE_REASON_CHARS,
+            MAX_VISION_TEXT_CHARS,
+        ):
+            self.assertIn(f"{limit} characters", instructions)
         self.assertEqual(
             body["max_completion_tokens"], MAX_VISION_COMPLETION_TOKENS
         )
@@ -563,6 +889,25 @@ class VisionServiceTests(unittest.TestCase):
             self.assertEqual(set(schema["required"]), required)
             self.assertIs(schema["additionalProperties"], False)
             self.assertEqual(set(schema["properties"]), required)
+        locations = _visual_response_schema("sample_locations", include_spatial_rois=True)
+        self.assertEqual(set(locations["required"]), {
+            "roi", "reason", "confidence", "ambiguity_flags", "additional_rois"
+        })
+        self.assertIs(locations["additionalProperties"], False)
+
+    def test_response_schema_describes_the_local_explanation_limits(self):
+        for stage in ("sample_roi", "phase_overlay"):
+            properties = _visual_response_schema(stage)["properties"]
+            self.assertIn(str(MAX_VISION_EXPLANATION_CHARS), properties["reason"]["description"])
+        properties = _visual_response_schema("phase_overlay")["properties"]
+        self.assertIn(
+            str(MAX_VISION_EDGE_REASON_CHARS),
+            properties["edge_reasons"]["items"]["description"],
+        )
+        self.assertIn(
+            str(MAX_VISION_TEXT_CHARS),
+            properties["unresolved"]["items"]["description"],
+        )
 
     def test_openai_visual_response_accepts_text_only_content_blocks(self):
         self.assertEqual(

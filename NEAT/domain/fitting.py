@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from math import isfinite
 from numbers import Integral
 from types import MappingProxyType
-from typing import Any, Mapping, cast
+from typing import Any, cast
 
 import numpy as np
 
@@ -16,6 +17,36 @@ from ..core.fitting import (
 )
 
 HKL = tuple[int, int, int]
+
+
+def default_bragg_edge_windows(
+    x_hkl: float,
+    lower_midpoint: float | None = None,
+    upper_midpoint: float | None = None,
+) -> dict[str, float | bool]:
+    """Return NEAT's existing default pre/post-edge windows.
+
+    Keep this pure helper as the shared implementation used by the fitting UI
+    and autonomous fitting so both paths retain the same midpoint rules.
+    """
+    edge = float(x_hkl)
+    lower_window_min = max(edge * 0.90, edge - 0.3)
+    lower_window_max = edge * 0.98
+    upper_window_min = edge * 1.04
+    upper_window_max = min(edge * 1.12, edge + 0.4)
+
+    if lower_midpoint is not None and isfinite(float(lower_midpoint)):
+        lower_window_min = max(lower_window_min, float(lower_midpoint))
+    if upper_midpoint is not None and isfinite(float(upper_midpoint)):
+        upper_window_max = min(upper_window_max, float(upper_midpoint))
+
+    return {
+        "lower_min": lower_window_min,
+        "lower_max": lower_window_max,
+        "upper_min": upper_window_min,
+        "upper_max": upper_window_max,
+        "valid": lower_window_min < lower_window_max and upper_window_min < upper_window_max,
+    }
 
 
 @dataclass(frozen=True)

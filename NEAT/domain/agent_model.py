@@ -15,6 +15,8 @@ from .agent_planning import (
 )
 
 SCHEMA_VERSION = "neat-agent-planning-v1"
+LANGSMITH_REGIONS = ("eu", "us", "apac", "aws-us")
+LANGSMITH_ENVIRONMENTS = ("local", "development", "staging", "production")
 MAX_CANONICAL_REQUEST_BYTES = 4096
 # Conservative ceiling: the complete ASCII request body, including all prompt
 # and schema text, is also capped at 4096 bytes. Actual provider tokenization
@@ -40,6 +42,11 @@ class AgentModelSettings:
     model_id: str = ""
     endpoint: str = ""
     allow_environment_credential: bool = False
+    langsmith_tracing_enabled: bool = False
+    langsmith_agent_id: str = "neat-agentic-roi"
+    langsmith_environment: str = "local"
+    langsmith_region: str = "eu"
+    langsmith_workspace_id: str = ""
 
 
 @dataclass(frozen=True)

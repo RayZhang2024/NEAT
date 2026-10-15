@@ -21,6 +21,7 @@ from ..services.agent_model import (
     AgentCredentialResolver,
     AgentModelError,
     AgentModelOutputRejected,
+    AgentModelUnavailable,
     LLMPlanProposer,
     MissingAgentCredential,
     StructuredModel,
@@ -46,6 +47,7 @@ class PlanningWorker(QThread):
         run_snapshot: AgentRunSnapshot | None = None,
         *,
         credential_resolver: AgentCredentialResolver | None = None,
+        langsmith_credential_resolver: AgentCredentialResolver | None = None,
         model_factory=None,
         model: StructuredModel | None = None,
         parent=None,
@@ -58,6 +60,7 @@ class PlanningWorker(QThread):
         self._revision_clock: DatasetRevisionClock | None = revision_clock
         self._run_snapshot = run_snapshot
         self._credential_resolver = credential_resolver
+        self._langsmith_credential_resolver = langsmith_credential_resolver
         self._model_factory = model_factory
         self._injected_model = model
         self._cancel = Event()
@@ -125,12 +128,18 @@ class PlanningWorker(QThread):
         model_id = ""
         planner_source = PlannerSource.LOCAL_DETERMINISTIC
         proposer = None
+        langsmith_api_key = None
         if snapshot is not None:
             model_id = snapshot.settings.model_id
             if snapshot.settings.mode is AgentModelMode.OPENAI_CLOUD:
                 provider = "OpenAI"
             elif snapshot.settings.mode is AgentModelMode.LOCAL:
                 provider = "Local model"
+            if snapshot.settings.langsmith_tracing_enabled and self._langsmith_credential_resolver:
+                try:
+                    langsmith_api_key = self._langsmith_credential_resolver.get()
+                except AgentModelUnavailable:
+                    langsmith_api_key = None
 
         self.progress.emit(10, "Validating the preflight before planning")
         try:
@@ -210,6 +219,12 @@ class PlanningWorker(QThread):
                         planner_source=planner_source,
                         provider=provider,
                         model_id=model_id,
+                        langsmith_enabled=snapshot.settings.langsmith_tracing_enabled,
+                        langsmith_api_key=langsmith_api_key,
+                        langsmith_agent_id=snapshot.settings.langsmith_agent_id,
+                        langsmith_environment=snapshot.settings.langsmith_environment,
+                        langsmith_region=snapshot.settings.langsmith_region,
+                        langsmith_workspace_id=snapshot.settings.langsmith_workspace_id,
                     )
                     accepted = getattr(proposer, "proposer", None)
                     if accepted is not None:

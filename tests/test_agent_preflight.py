@@ -15,20 +15,25 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Preserve the application import order: ONNX Runtime is initialized before Qt.
+# isort: off
+import NEAT  # noqa: F401
+# isort: on
+
 import numpy as np
-from PyQt5.QtCore import QEventLoop, Qt, QTimer
+from PyQt5.QtCore import QEventLoop, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
     QSlider,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QTextEdit,
     QWidget,
 )
 
-import NEAT  # noqa: F401
 from NEAT.domain.agent_model import (
     AgentModelMode,
     AgentModelSettings,
@@ -36,7 +41,12 @@ from NEAT.domain.agent_model import (
 )
 from NEAT.domain.agent_planning import PlannerSource, PlanningOutcome, PlanningStatus
 from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
-from NEAT.domain.agent_vision import VisionOutcome, VisionStatus
+from NEAT.domain.agent_vision import SpatialRoiCandidate, VisionOutcome, VisionStatus
+from NEAT.domain.individual_edge import (
+    IndividualEdgeFitAttempt,
+    IndividualEdgeFitResult,
+    RegionFitCurve,
+)
 from NEAT.domain.observation import (
     DatasetMode,
     ObservationStatus,
@@ -89,6 +99,88 @@ class _Assistant:
         return True
 
 
+class _FakeSpatialVisionWorker(QThread):
+    """Eventless offline visual fixture used to verify the real Qt handoff."""
+
+    progress = pyqtSignal(int, str)
+    completed = pyqtSignal(object)
+
+    def __init__(self, run_id, handle, preflight, settings, *, parent=None, **_kwargs):
+        super().__init__(parent)
+        self.run_id = run_id
+        self._stopped = False
+        bounds = (
+            RoiBounds(8, 13, 8, 13),
+            RoiBounds(18, 23, 8, 13),
+            RoiBounds(28, 33, 8, 13),
+            RoiBounds(38, 43, 8, 13),
+            RoiBounds(8, 13, 20, 25),
+            RoiBounds(18, 23, 20, 25),
+            RoiBounds(28, 33, 20, 25),
+        )
+        candidates = tuple(
+            SpatialRoiCandidate(
+                label,
+                roi,
+                "Visible sample interior.",
+                "high",
+                (),
+                (roi.x_min, roi.x_max, roi.y_min, roi.y_max),
+            )
+            for label, roi in zip(("Reference", "A", "B", "C", "D", "E", "F"), bounds)
+        )
+        self.outcome = VisionOutcome(
+            run_id,
+            handle.dataset_id,
+            handle.revision,
+            VisionStatus.NEEDS_REVIEW,
+            "Offline test visual proposal.",
+            roi=bounds[0],
+            phase_id="Fe_bcc",
+            hkls=((2, 1, 1),),
+            edge_reasons=("Fixture edge rationale.",),
+            spatial_roi_candidates=candidates,
+        )
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        self.progress.emit(80, "Offline visual fixture complete")
+        self.completed.emit(self.outcome)
+
+
+def _successful_fit(config):
+    def curve(region):
+        x = np.linspace(region.min_wavelength, region.max_wavelength, 20)
+        y = np.linspace(0.1, 0.2, 20)
+        return RegionFitCurve(x, y, y.copy())
+
+    region1 = curve(config.regions[1])
+    region2 = curve(config.regions[0])
+    region3 = curve(config.regions[2])
+    result = IndividualEdgeFitResult(
+        config.source_row,
+        config.hkl,
+        region1,
+        region2,
+        region3,
+        2.34,
+        0.0002,
+        0.005,
+        0.0001,
+        0.05,
+        0.001,
+        0.5,
+        0.01,
+        0.1,
+        0.02,
+        0.003,
+        {"a0": 0.1},
+    )
+    return IndividualEdgeFitAttempt(region1, region2, region3, result)
+
+
 class AgentPreflightTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -108,7 +200,12 @@ class AgentPreflightTests(unittest.TestCase):
         self.window.show()
 
     def tearDown(self):
-        for worker in (self.window._worker, self.window._planning_worker, self.window._vision_worker):
+        for worker in (
+            self.window._worker,
+            self.window._planning_worker,
+            self.window._vision_worker,
+            self.window._fit_worker,
+        ):
             if worker is not None:
                 worker.stop()
                 worker.wait(5000)
@@ -124,6 +221,348 @@ class AgentPreflightTests(unittest.TestCase):
                 return
             QTest.qWait(5)
         self.fail("Qt state did not settle before timeout")
+
+    def _prepare_spatial_fit_host(self):
+        wavelengths = np.linspace(0.5, 5.0, 400)
+        images = []
+        for index in range(wavelengths.size):
+            image = np.zeros((64, 64), dtype=np.float32)
+            image[5:55, 5:55] = 10.0 + index / 100.0
+            images.append(image)
+        self.host.images = images
+        self.host.wavelengths = wavelengths
+        self.host.selected_area = None
+        self.window._agent_settings = AgentModelSettings(
+            mode=AgentModelMode.OPENAI_CLOUD,
+            model_id="injected-test-model",
+        )
+        self.window._update_model_readiness()
+        return images, wavelengths
+
+    def test_one_click_preflight_visual_validation_and_seven_roi_fit(self):
+        from NEAT.domain.agent_fitting import AgentFitRunStatus
+
+        images, wavelengths = self._prepare_spatial_fit_host()
+        fitting_table = QTableWidget(1, 11, self.host)
+        self.host.bragg_table = fitting_table
+        row_values = (
+            "(2, 1, 1)", "1.234", "2.100", "2.200", "2.400", "2.500",
+            "2.100", "2.500", "0.0017", "0.0140", "0.4700",
+        )
+        for column, value in enumerate(row_values):
+            fitting_table.setItem(0, column, QTableWidgetItem(value))
+        fitting_table_snapshot = tuple(
+            fitting_table.item(0, column).text()
+            for column in range(fitting_table.columnCount())
+        )
+        fit_engine = type(
+            "FitSpy",
+            (),
+            {
+                "fit_individual_edge": staticmethod(
+                    lambda _wave, _signal, config, **_kwargs: _successful_fit(config)
+                )
+            },
+        )()
+        with (
+            patch("NEAT.ui.agent_window.VisionWorker", _FakeSpatialVisionWorker),
+            patch("NEAT.services.agent_fitting.FittingEngine", return_value=fit_engine),
+        ):
+            self.window.start_autonomous_analysis()
+            self._wait_for(
+                lambda: self.window._fit_outcome is not None
+                and self.window._fit_worker is None
+                and not self.host._shutdown_worker_inventory.workers,
+                timeout=20,
+            )
+
+        self.assertEqual(self.window._fit_outcome.status, AgentFitRunStatus.COMPLETE)
+        self.assertEqual((self.window._fit_outcome.total_fits, self.window._fit_outcome.attempted), (7, 7))
+        self.assertEqual(self.window.fit_matrix.rowCount(), 7)
+        self.assertEqual(self.window.fit_matrix.columnCount(), 1)
+        self.assertEqual(len(self.window.spatial_roi_preview._candidates), 7)
+        self.assertTrue(self.window.summary_page.isVisible())
+        self.assertEqual(self.window.summary_page.heading.text(), "Analysis complete")
+        self.assertIn("Fe_bcc", self.window.summary_page.rows[1].conclusion_label.text())
+        self.assertIn("7 sample locations", self.window.summary_page.rows[2].conclusion_label.text())
+        self.assertEqual(self.window.summary_page.rows[3].conclusion_label.text(), "7 fits completed")
+        self.assertFalse(self.window.summary_page.review_button.isVisible())
+        self.assertFalse(self.window.fit_matrix.isVisible())
+        self.window.summary_page.results_button.click()
+        self.assertTrue(self.window.fit_matrix.isVisible())
+        self.assertIn("7/7 attempted", self.window.fit_matrix_summary.text())
+        self.assertIn("d_fit", self.window.fit_detail_label.text())
+        self.assertIs(
+            self.window.fit_curve_widgets[0]._curve,
+            self.window._fit_outcome.cells[0].attempt.region1,
+        )
+        self.window.fit_matrix.setCurrentCell(3, 0)
+        self.app.processEvents(QEventLoop.AllEvents, 10)
+        self.assertIn("C · edge", self.window.fit_detail_label.text())
+        self.assertTrue(self.window.start_autonomous_button.isEnabled())
+        self.assertFalse(self.window.stop_button.isVisible())
+        self.assertIs(self.host.images, images)
+        self.assertIs(self.host.wavelengths, wavelengths)
+        self.assertIsNone(self.host.selected_area)
+        self.assertEqual(
+            tuple(
+                fitting_table.item(0, column).text()
+                for column in range(fitting_table.columnCount())
+            ),
+            fitting_table_snapshot,
+        )
+        self.assertEqual(self.window.splitter.count(), 2)
+        self.assertEqual(self.window.evidence_splitter.orientation(), Qt.Vertical)
+        self.window.close()
+        self.window.show()
+        self.assertTrue(self.window.summary_page.isVisible())
+        self.assertEqual(self.window.summary_page.heading.text(), "Explore your dataset")
+        self.assertFalse(self.window.summary_page.results_button.isVisible())
+        self.assertIsNone(self.window._fit_outcome)
+
+    def _complete_spatial_fit_for_invalidation(self):
+        self._prepare_spatial_fit_host()
+        fit_engine = Mock()
+        fit_engine.fit_individual_edge.side_effect = (
+            lambda _wave, _signal, config, **_kwargs: _successful_fit(config)
+        )
+        with (
+            patch("NEAT.ui.agent_window.VisionWorker", _FakeSpatialVisionWorker),
+            patch("NEAT.services.agent_fitting.FittingEngine", return_value=fit_engine),
+        ):
+            self.window.start_autonomous_analysis()
+            self._wait_for(
+                lambda: self.window._fit_outcome is not None
+                and not self.host._shutdown_worker_inventory.workers,
+                timeout=20,
+            )
+        self.window.fit_matrix.setCurrentCell(3, 0)
+        self.app.processEvents(QEventLoop.AllEvents, 10)
+        self.assertIn("d_fit", self.window.fit_detail_label.text())
+        self.assertTrue(all(widget._curve is not None for widget in self.window.fit_curve_widgets))
+
+    def _assert_fit_evidence_withdrawn(self):
+        self.assertIsNone(self.window._fit_plan)
+        self.assertIsNone(self.window._fit_outcome)
+        self.assertIsNone(self.window._pending_fit_plan)
+        self.assertFalse(self.window._fit_cells)
+        self.assertEqual(self.window.fit_matrix.currentRow(), -1)
+        self.assertFalse(self.window.fit_matrix.selectedItems())
+        for row in range(self.window.fit_matrix.rowCount()):
+            self.assertEqual(self.window.fit_matrix.item(row, 0).text(), "—")
+        self.assertNotIn("d_fit", self.window.fit_detail_label.text())
+        self.assertTrue(all(widget._curve is None for widget in self.window.fit_curve_widgets))
+        self.assertFalse(self.window.spatial_roi_preview._candidates)
+        self.assertIsNone(self.window.spatial_roi_preview._selected_index)
+        self.assertTrue(self.window.spatial_roi_preview._pixmap.isNull())
+        # Neither a stale matrix cell nor an old ROI selection can resurrect results.
+        self.window._select_fit_cell(3, 0)
+        self.assertNotIn("d_fit", self.window.fit_detail_label.text())
+
+    def test_adjusting_completed_fit_roi_withdraws_all_old_fit_evidence(self):
+        self._complete_spatial_fit_for_invalidation()
+        for edit, value in zip(self.window.roi_edits, (10, 20, 10, 20)):
+            edit.setValue(value)
+        self.window.preview_adjusted_roi()
+        self._assert_fit_evidence_withdrawn()
+        self.assertIsNone(self.window._vision_outcome)
+        self.assertEqual(self.window._adjusted_roi, RoiBounds(10, 20, 10, 20))
+        self.assertIn("Adjusted ROI saved", self.window.status_label.text())
+        self.assertEqual(self.window.summary_page.heading.text(), "ROI adjustment saved")
+        self.assertEqual(self.window.summary_page.rows[3].conclusion_label.text(), "Earlier fits withdrawn")
+
+    def test_rejecting_completed_fit_proposal_withdraws_all_old_fit_evidence(self):
+        self._complete_spatial_fit_for_invalidation()
+        self.window.reject_visual_proposal()
+        self._assert_fit_evidence_withdrawn()
+        self.assertIsNone(self.window._vision_outcome)
+        self.assertIn("Visual proposal rejected", self.window.status_label.text())
+        self.assertEqual(self.window.summary_page.heading.text(), "Proposal withdrawn")
+
+    def test_dataset_revision_withdraws_completed_fit_numeric_summary(self):
+        self._complete_spatial_fit_for_invalidation()
+        self.host.scientific_observation_api.revision_clock.invalidate()
+        self.window._check_revision()
+        self._assert_fit_evidence_withdrawn()
+        self.assertTrue(self.window._stale)
+        self.assertEqual(self.window.summary_page.heading.text(), "Dataset changed")
+
+    def test_invalid_adjustment_preserves_completed_fit_evidence(self):
+        self._complete_spatial_fit_for_invalidation()
+        outcome = self.window._fit_outcome
+        self.window.roi_edits[0].setValue(20)
+        self.window.roi_edits[1].setValue(10)
+        self.window.preview_adjusted_roi()
+        self.assertIs(self.window._fit_outcome, outcome)
+        self.assertIn("d_fit", self.window.fit_detail_label.text())
+        self.assertIn("outside the current image or empty", self.window.status_label.text())
+
+    def test_stop_during_fit_waits_for_worker_retirement(self):
+        from NEAT.domain.agent_fitting import AgentFitRunStatus
+
+        self._prepare_spatial_fit_host()
+        fit_entered = threading.Event()
+        release_fit = threading.Event()
+
+        def paused_fit(_wave, _signal, config, **_kwargs):
+            fit_entered.set()
+            release_fit.wait(5)
+            return _successful_fit(config)
+
+        fit_engine = type(
+            "PausedFitSpy",
+            (),
+            {"fit_individual_edge": staticmethod(paused_fit)},
+        )()
+        with (
+            patch("NEAT.ui.agent_window.VisionWorker", _FakeSpatialVisionWorker),
+            patch("NEAT.services.agent_fitting.FittingEngine", return_value=fit_engine),
+        ):
+            self.window.start_autonomous_analysis()
+            self._wait_for(fit_entered.is_set, timeout=20)
+            worker = self.window._fit_worker
+            self.assertIsNotNone(worker)
+            self.assertTrue(self.window.stop_button.isVisible())
+            self.assertTrue(self.window.stop_button.isEnabled())
+            self.window.stop_button.click()
+            self.assertFalse(self.window.stop_button.isEnabled())
+            self.assertIs(self.window._fit_worker, worker)
+            self.assertFalse(self.window.start_autonomous_button.isEnabled())
+            release_fit.set()
+            self._wait_for(
+                lambda: self.window._fit_worker is None
+                and not self.host._shutdown_worker_inventory.workers,
+                timeout=20,
+            )
+
+        self.assertEqual(self.window._fit_outcome.status, AgentFitRunStatus.STOPPED)
+        self.assertEqual(self.window._fit_outcome.attempted, 1)
+        self.assertEqual(self.window._fit_outcome.cancelled, 6)
+        self.assertEqual(self.window._stage, "cancelled")
+        self.assertIn("stopped", self.window.status_label.text().lower())
+        self.assertIsNone(worker._handle)
+        self.assertIsNone(worker._plan)
+
+    def test_partial_fit_failure_is_visible_and_successful_cell_remains_selectable(self):
+        from NEAT.domain.agent_fitting import AgentFitRunStatus
+
+        self._prepare_spatial_fit_host()
+        calls = 0
+
+        def partially_failing_fit(_wave, _signal, config, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return IndividualEdgeFitAttempt(
+                    error_stage="Region 3 fit",
+                    error_message="synthetic fit failure",
+                )
+            return _successful_fit(config)
+
+        fit_engine = type(
+            "PartialFitSpy",
+            (),
+            {"fit_individual_edge": staticmethod(partially_failing_fit)},
+        )()
+        with (
+            patch("NEAT.ui.agent_window.VisionWorker", _FakeSpatialVisionWorker),
+            patch("NEAT.services.agent_fitting.FittingEngine", return_value=fit_engine),
+        ):
+            self.window.start_autonomous_analysis()
+            self._wait_for(
+                lambda: self.window._fit_outcome is not None
+                and self.window._fit_worker is None
+                and not self.host._shutdown_worker_inventory.workers,
+                timeout=20,
+            )
+
+        outcome = self.window._fit_outcome
+        self.assertEqual(outcome.status, AgentFitRunStatus.COMPLETE_WITH_ISSUES)
+        self.assertEqual((outcome.attempted, outcome.succeeded, outcome.failed), (7, 6, 1))
+        self.assertEqual(self.window.fit_matrix.item(0, 0).text(), "Failed")
+        self.assertIn("1 failed", self.window.fit_matrix_summary.text())
+        self.assertIn("1 failed", self.window.summary_page.rows[3].conclusion_label.text())
+        self.window.summary_page.review_button.click()
+        self.assertTrue(self.window.review_page.isVisible())
+        self.assertIn("Reference", self.window.review_identity.text())
+        self.assertTrue(self.window.review_reason.text())
+        self.assertFalse(self.window.fit_matrix.isVisible())
+        self.window.inspect_flagged_button.click()
+        self.assertTrue(self.window.fit_matrix.isVisible())
+        self.assertIn("Region 3 fit", self.window.fit_detail_label.text())
+        self.window.fit_matrix.setCurrentCell(1, 0)
+        self.app.processEvents(QEventLoop.AllEvents, 10)
+        self.assertIn("d_fit", self.window.fit_detail_label.text())
+        self.assertIs(
+            self.window.fit_curve_widgets[0]._curve,
+            outcome.cells[1].attempt.region1,
+        )
+
+    def test_ambiguous_spatial_proposal_blocks_all_fits(self):
+        self._prepare_spatial_fit_host()
+
+        class AmbiguousSpatialWorker(_FakeSpatialVisionWorker):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                candidates = list(self.outcome.spatial_roi_candidates)
+                candidates[3] = replace(candidates[3], confidence="medium")
+                self.outcome = replace(
+                    self.outcome, spatial_roi_candidates=tuple(candidates)
+                )
+
+        fit_engine = Mock()
+        with (
+            patch("NEAT.ui.agent_window.VisionWorker", AmbiguousSpatialWorker),
+            patch("NEAT.services.agent_fitting.FittingEngine", return_value=fit_engine),
+        ):
+            self.window.start_autonomous_analysis()
+            self._wait_for(
+                lambda: self.window._stage == "fitting_needs_input"
+                and not self.host._shutdown_worker_inventory.workers,
+                timeout=20,
+            )
+
+        fit_engine.fit_individual_edge.assert_not_called()
+        self.assertIsNone(self.window._fit_outcome)
+        self.assertIn("ROI C", self.window.status_label.text())
+        self.assertIn("no local fit was started", self.window.fit_matrix_summary.text())
+
+    def test_visual_response_error_and_uncertainty_have_distinct_pause_messages(self):
+        self._prepare_spatial_fit_host()
+        for diagnostic in ("Visual phase explanation is empty after whitespace normalization.", ""):
+            with self.subTest(diagnostic=diagnostic):
+                class UnacceptedPhaseWorker(_FakeSpatialVisionWorker):
+                    def __init__(self, *args, _diagnostic=diagnostic, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self.outcome = replace(
+                            self.outcome,
+                            phase_id="", hkls=(), edge_reasons=(),
+                            message="The visual model marked the overlay comparison as uncertain.",
+                            response_validation_error=_diagnostic,
+                            proposed_phase_id="Fe_bcc" if _diagnostic else "",
+                        )
+
+                fit_engine = Mock()
+                with (
+                    patch("NEAT.ui.agent_window.VisionWorker", UnacceptedPhaseWorker),
+                    patch("NEAT.services.agent_fitting.FittingEngine", return_value=fit_engine),
+                ):
+                    self.window.start_autonomous_analysis()
+                    self._wait_for(
+                        lambda: self.window._stage == "fitting_needs_input"
+                        and not self.host._shutdown_worker_inventory.workers,
+                        timeout=20,
+                    )
+                fit_engine.fit_individual_edge.assert_not_called()
+                self.assertIsNone(self.window._fit_outcome)
+                message = self.window.status_label.text()
+                self.assertIn("No fitting was started", message)
+                if diagnostic:
+                    self.assertIn(diagnostic, message)
+                    self.assertNotIn("uncertain", message)
+                else:
+                    self.assertIn("marked the overlay comparison as uncertain", message)
+                    self.assertNotIn("response validation failed", message)
 
     def test_frame_selection_is_bounded_and_deduplicated(self):
         self.assertEqual(representative_frame_indices(0), ())
@@ -181,20 +620,34 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIs(self.host.agent_window, self.window)
         self.assertTrue(self.window.isVisible())
 
-    def test_overview_and_visual_evidence_are_visible_together(self):
-        self.assertIsInstance(self.window.centralWidget(), QSplitter)
+    def test_step_conclusions_are_default_and_step_evidence_opens_on_request(self):
+        self.assertIs(self.window.centralWidget(), self.window.root_panel)
+        self.assertIsInstance(self.window.splitter, QSplitter)
         self.assertEqual(self.window.splitter.orientation(), Qt.Horizontal)
         self.assertEqual(self.window.splitter.count(), 2)
-        self.assertTrue(self.window.overview_panel.isVisible())
-        self.assertTrue(self.window.evidence_panel.isVisible())
-        self.assertTrue(self.window.dataset_summary_label.isVisible())
+        self.assertTrue(self.window.summary_page.isVisible())
+        self.assertFalse(self.window.overview_panel.isVisible())
+        self.assertFalse(self.window.evidence_panel.isVisible())
+        self.assertFalse(self.window.fit_matrix.isVisible())
+        self.assertFalse(self.window.plan_text.isVisible())
+        self.assertFalse(self.window.summary_page.results_button.isVisible())
+        for row in self.window.summary_page.rows:
+            self.assertFalse(row.evidence_panel.isVisible())
+        self.window.summary_page.rows[0].toggle_button.click()
+        self.assertTrue(self.window.summary_page.rows[0].evidence_panel.isVisible())
+        self.window._inspect_summary_step(0)
+        self.assertTrue(self.window.step_evidence_page.isVisible())
+        self.assertEqual(self.window.step_evidence_heading.text(), "Dataset check")
+        self.assertFalse(self.window.detail_page.isVisible())
+        self.assertFalse(self.window.evidence_panel.isVisible())
+        self.assertFalse(self.window.dataset_summary_label.isVisible())
         self.assertFalse(hasattr(self.window, "assessment_text"))
         self.assertFalse(hasattr(self.window, "objective_combo"))
         self.assertFalse(hasattr(self.window, "start_button"))
         self.assertEqual(self.window.settings_button.text(), "Agent settings…")
-        self.assertTrue(self.window.evidence_scroll.isVisible())
-        self.assertGreater(self.window.splitter.sizes()[0], 0)
-        self.assertGreater(self.window.splitter.sizes()[1], 0)
+        self.window.show_step_conclusions()
+        self.assertTrue(self.window.summary_page.isVisible())
+        self.assertFalse(self.window.evidence_panel.isVisible())
 
     def test_model_readiness_discloses_cloud_transfer_and_snapshot_authorization(self):
         self.window._agent_settings = AgentModelSettings()
@@ -224,7 +677,7 @@ class AgentPreflightTests(unittest.TestCase):
         )
         self.window._update_model_readiness()
         self.assertIn("automatically sends", self.window.model_readiness_label.text())
-        self.assertIn("up to 7 bounded PNGs", self.window.model_readiness_label.text())
+        self.assertIn("up to 16 bounded PNGs", self.window.model_readiness_label.text())
         self.assertIn("up to 3 image previews", self.window.model_readiness_label.text())
         self.assertIn("configured-model", self.window.model_readiness_label.text())
 
@@ -280,9 +733,13 @@ class AgentPreflightTests(unittest.TestCase):
                     callback(*args)
 
         class FakeConnectionWorker:
-            def __init__(self, settings, *, pending_api_key=None, parent=None):
+            def __init__(
+                self, settings, *, pending_api_key=None,
+                pending_langsmith_api_key=None, parent=None,
+            ):
                 self.settings = settings
                 self.pending_api_key = pending_api_key
+                self.pending_langsmith_api_key = pending_langsmith_api_key
                 self.parent = parent
                 self.completed = FakeSignal()
                 self.finished = FakeSignal()
@@ -744,13 +1201,16 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertFalse(self.window.stop_button.isVisible())
         self.assertFalse(self.window.progress_bar.isVisible())
         self.assertEqual(self.window.splitter.count(), 2)
-        self.assertTrue(self.window.overview_panel.isVisible())
-        self.assertTrue(self.window.evidence_panel.isVisible())
+        self.assertTrue(self.window.summary_page.isVisible())
+        self.window._inspect_summary_step(0)
+        self.assertTrue(self.window.step_evidence_page.isVisible())
+        self.assertEqual(self.window.step_evidence_heading.text(), "Dataset check")
+        self.assertFalse(self.window.evidence_panel.isVisible())
         self.assertNotIn("Preview Next Steps", self.window.plan_text.toPlainText())
         self.assertNotIn("fitting successful", self.window.plan_text.toPlainText().lower())
         if outcome.status is PlanningStatus.READY_PLAN:
             self.assertIn(
-                "Plan prepared — scientific execution is not yet implemented",
+                "Dataset preflight plan prepared. Visual checks and local exploratory fitting are the next stages.",
                 self.window.plan_text.toPlainText(),
             )
 
@@ -827,8 +1287,10 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIn("no planning result is claimed", self.window.plan_text.toPlainText())
         self.assertEqual(
             [call[0] for call in model.calls],
-            ["sample_roi", "phase_shortlist", "phase_overlay"],
+            ["sample_roi", "phase_shortlist", "phase_overlay", "sample_locations", "sample_locations", "sample_locations"],
         )
+        self.assertFalse(self.window.adjust_roi_button.isVisible())
+        self.window._inspect_summary_step(2)
         self.assertTrue(self.window.adjust_roi_button.isVisible())
         self.assertEqual(self.host.selected_area, None)
 
@@ -915,9 +1377,10 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(outcome.confidence, "user-selected")
         self.assertEqual(
             [call[0] for call in models[1].calls],
-            ["phase_shortlist", "phase_overlay"],
+            ["phase_shortlist", "phase_overlay", "sample_locations", "sample_locations", "sample_locations"],
         )
         self.assertIn("ROI x[1,10), y[1,10)", models[1].calls[0][2])
+        self.assertIn("Already accepted locations", models[1].calls[2][2])
         self.assertEqual(self.host.selected_area, (16, 52, 18, 50))
         self.assertEqual(self.window._adjusted_roi, adjusted)
         self.assertEqual(self.window._adjusted_roi_dataset_token, token)
@@ -1003,8 +1466,10 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(configured_for_vision, configured_for_planning)
         self.assertIs(self.host.images, source_images)
         self.assertEqual(self.host.selected_area, source_roi)
+        self.assertFalse(self.window.adjust_roi_button.isVisible())
+        self.window._inspect_summary_step(2)
         self.assertTrue(self.window.adjust_roi_button.isVisible())
-        self.assertIn("No fit, mapping", self.window.plan_text.toPlainText())
+        self.assertIn("Local fitting paused", self.window.plan_text.toPlainText())
         self.assertIn("OpenAI visual proposal", self.window.plan_text.toPlainText())
         self.assertIn("gpt-6-luna", self.window.plan_text.toPlainText())
         self.assertFalse(self.window.stop_button.isVisible())
@@ -1014,9 +1479,8 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIsNone(self.window._vision_outcome)
         self.assertIn("earlier spectrum and phase hypothesis no longer describe this ROI", self.window.plan_text.toPlainText())
         self.assertEqual(self.host.selected_area, source_roi)
-        self.assertTrue(self.window.reject_vision_button.isVisible())
-        self.assertEqual(self.window.reject_vision_button.text(), "Discard adjusted ROI")
-        self.window.reject_visual_proposal()
+        self.assertTrue(self.window.summary_page.discard_adjusted_button.isVisible())
+        self.window.summary_page.discard_adjusted_button.click()
         self.assertIsNone(self.window._vision_outcome)
         self.assertIsNone(self.window._adjusted_roi)
         self.assertIsNone(self.window._adjusted_roi_dataset_token)
@@ -1123,6 +1587,26 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIn("No provisional phase or candidate-edge suggestion was accepted.", displayed)
         self.assertIn("candidate-edge count failed", displayed)
         self.assertNotIn("model reported uncertainty", displayed)
+
+    def test_visual_response_failure_shows_proposed_phase_as_unaccepted(self):
+        self.window._planning_display_text = "Validated read-only plan."
+        diagnostic = "Visual phase explanation exceeds the 2048-character limit (received 2049 characters)."
+        outcome = VisionOutcome(
+            "run", "dataset", 3, VisionStatus.NEEDS_REVIEW,
+            "The visual model's phase explanation failed response validation.",
+            roi=RoiBounds(10, 20, 12, 22),
+            inspected_phases=("Fe_bcc", "Al"),
+            proposed_phase_id="Fe_bcc",
+            response_validation_error=diagnostic,
+        )
+        self.window._render_vision_outcome(outcome)
+        displayed = self.window.plan_text.toPlainText()
+
+        self.assertIn("Model proposed phase (not accepted): Fe_bcc", displayed)
+        self.assertIn("Response validation: " + diagnostic, displayed)
+        self.assertIn("No provisional phase or candidate-edge suggestion was accepted.", displayed)
+        self.assertNotIn("Provisional phase: Fe_bcc", displayed)
+        self.assertNotIn("model marked the overlay comparison as uncertain", displayed)
 
     def test_visual_review_requires_a_configured_openai_model_before_preflight(self):
         self._configure_synthetic_vision_dataset()

@@ -27,7 +27,7 @@ jobs:
       - name: Install package and test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[assistant,assistant-server,test]"
+          python -m pip install ".[assistant,assistant-server,agent-llm,test]"
 
       - name: Pin compatible ONNX runtime for newer Windows Python
         if: matrix.python-version != '3.10'
@@ -54,7 +54,7 @@ jobs:
       - name: Install package and quality tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[assistant,assistant-server,test]" ruff mypy
+          python -m pip install ".[assistant,assistant-server,agent-llm,test]" ruff mypy
 
       - name: Run full unit suite
         run: python -m unittest discover -s tests -v

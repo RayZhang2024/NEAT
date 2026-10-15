@@ -20,6 +20,8 @@ from typing import Protocol, cast
 from urllib.parse import urlparse
 
 from ..domain.agent_model import (
+    LANGSMITH_ENVIRONMENTS,
+    LANGSMITH_REGIONS,
     MAX_CANONICAL_REQUEST_BYTES,
     MAX_INPUT_TOKENS,
     MAX_OUTPUT_TOKENS,
@@ -39,6 +41,7 @@ from ..domain.agent_planning import (
     PlanStepType,
     context_to_state,
 )
+from .agent_tracing import trace_llm_call
 
 AGENT_KEYRING_SERVICE = "NEAT AI Agent"
 OPENAI_ENVIRONMENT_VARIABLE = "OPENAI_API_KEY"
@@ -78,8 +81,12 @@ class AgentCredentialStore(Protocol):
 class AgentKeyringCredentialStore:
     """OS keyring access under a namespace that never reads Assistant keys."""
 
-    def __init__(self, *, service_name: str = AGENT_KEYRING_SERVICE) -> None:
+    def __init__(
+        self, *, service_name: str = AGENT_KEYRING_SERVICE,
+        account_name: str = "openai",
+    ) -> None:
         self.service_name = service_name
+        self.account_name = account_name
 
     @staticmethod
     def _keyring():
@@ -87,12 +94,12 @@ class AgentKeyringCredentialStore:
             import keyring
         except ImportError as exc:  # pragma: no cover - optional install guard
             raise AgentModelUnavailable(
-                "Secure Agent key storage requires the optional [agent-llm] extra."
+                "Secure Agent key storage requires the optional [agent] extra."
             ) from exc
         return keyring
 
     def get(self) -> str | None:
-        value = self._keyring().get_password(self.service_name, "openai")
+        value = self._keyring().get_password(self.service_name, self.account_name)
         credential = str(value or "").strip()
         return credential or None
 
@@ -100,12 +107,12 @@ class AgentKeyringCredentialStore:
         value = str(credential or "").strip()
         if not value:
             raise ValueError("An API key cannot be empty.")
-        self._keyring().set_password(self.service_name, "openai", value)
+        self._keyring().set_password(self.service_name, self.account_name, value)
 
     def delete(self) -> None:
         keyring = self._keyring()
         try:
-            keyring.delete_password(self.service_name, "openai")
+            keyring.delete_password(self.service_name, self.account_name)
         except keyring.errors.PasswordDeleteError:
             return
 
@@ -171,8 +178,33 @@ def validate_agent_settings(settings: AgentModelSettings) -> AgentModelSettings:
         raise TypeError("Agent model mode is not supported.")
     if not isinstance(settings.allow_environment_credential, bool):
         raise TypeError("Environment credential setting must be boolean.")
+    if not isinstance(settings.langsmith_tracing_enabled, bool):
+        raise TypeError("LangSmith tracing setting must be boolean.")
+    agent_id = str(settings.langsmith_agent_id or "").strip()
+    if not re.fullmatch(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", agent_id):
+        raise ValueError(
+            "LangSmith Agent ID must be 1–63 lowercase letters, numbers, or hyphens, "
+            "start with a letter, and end with a letter or number."
+        )
+    environment = str(settings.langsmith_environment or "").strip().lower()
+    if environment not in LANGSMITH_ENVIRONMENTS:
+        raise ValueError("Select a supported LangSmith environment.")
+    region = str(settings.langsmith_region or "eu").strip().lower()
+    if region not in LANGSMITH_REGIONS:
+        raise ValueError("Select a supported LangSmith region.")
+    workspace_id = str(settings.langsmith_workspace_id or "").strip()
+    if len(workspace_id) > 128 or any(ord(char) < 32 for char in workspace_id):
+        raise ValueError("LangSmith workspace ID must contain at most 128 printable characters.")
+
     if settings.mode is AgentModelMode.OFFLINE:
-        return AgentModelSettings(mode=AgentModelMode.OFFLINE)
+        return AgentModelSettings(
+            mode=AgentModelMode.OFFLINE,
+            langsmith_tracing_enabled=settings.langsmith_tracing_enabled,
+            langsmith_agent_id=agent_id,
+            langsmith_environment=environment,
+            langsmith_region=region,
+            langsmith_workspace_id=workspace_id,
+        )
     if not MODEL_ID_PATTERN.fullmatch(settings.model_id or ""):
         raise ValueError("Enter an exact supported model ID before saving.")
     if settings.mode is AgentModelMode.LOCAL:
@@ -181,6 +213,11 @@ def validate_agent_settings(settings: AgentModelSettings) -> AgentModelSettings:
             model_id=settings.model_id,
             endpoint=normalize_local_endpoint(settings.endpoint),
             allow_environment_credential=False,
+            langsmith_tracing_enabled=settings.langsmith_tracing_enabled,
+            langsmith_agent_id=agent_id,
+            langsmith_environment=environment,
+            langsmith_region=region,
+            langsmith_workspace_id=workspace_id,
         )
     if settings.mode is AgentModelMode.OPENAI_CLOUD:
         return AgentModelSettings(
@@ -188,6 +225,11 @@ def validate_agent_settings(settings: AgentModelSettings) -> AgentModelSettings:
             model_id=settings.model_id,
             endpoint="",
             allow_environment_credential=settings.allow_environment_credential,
+            langsmith_tracing_enabled=settings.langsmith_tracing_enabled,
+            langsmith_agent_id=agent_id,
+            langsmith_environment=environment,
+            langsmith_region=region,
+            langsmith_workspace_id=workspace_id,
         )
     raise ValueError("Agent model mode is not supported.")
 
@@ -211,19 +253,39 @@ class AgentModelSettingsRepository:
             return AgentModelSettings()
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-            if set(payload) != {
+            legacy_fields = {
                 "schema_version",
                 "mode",
                 "model_id",
                 "endpoint",
                 "allow_environment_credential",
-            } or payload["schema_version"] != 1:
+            }
+            current_fields = legacy_fields | {
+                "langsmith_tracing_enabled", "langsmith_project"
+            }
+            agent_fields = legacy_fields | {
+                "langsmith_tracing_enabled",
+                "langsmith_agent_id",
+                "langsmith_environment",
+                "langsmith_region",
+                "langsmith_workspace_id",
+            }
+            if not (
+                (set(payload) == legacy_fields and payload["schema_version"] == 1)
+                or (set(payload) == current_fields and payload["schema_version"] == 2)
+                or (set(payload) == agent_fields and payload["schema_version"] == 3)
+            ):
                 return AgentModelSettings()
             settings = AgentModelSettings(
                 mode=AgentModelMode(payload["mode"]),
                 model_id=str(payload["model_id"]),
                 endpoint=str(payload["endpoint"]),
                 allow_environment_credential=payload["allow_environment_credential"],
+                langsmith_tracing_enabled=payload.get("langsmith_tracing_enabled", False),
+                langsmith_agent_id=payload.get("langsmith_agent_id", "neat-agentic-roi"),
+                langsmith_environment=payload.get("langsmith_environment", "local"),
+                langsmith_region=payload.get("langsmith_region", "eu"),
+                langsmith_workspace_id=payload.get("langsmith_workspace_id", ""),
             )
             return validate_agent_settings(settings)
         except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
@@ -232,11 +294,16 @@ class AgentModelSettingsRepository:
     def save(self, settings: AgentModelSettings) -> Path:
         selected = validate_agent_settings(settings)
         payload = {
-            "schema_version": 1,
+            "schema_version": 3,
             "mode": selected.mode.value,
             "model_id": selected.model_id,
             "endpoint": selected.endpoint,
             "allow_environment_credential": selected.allow_environment_credential,
+            "langsmith_tracing_enabled": selected.langsmith_tracing_enabled,
+            "langsmith_agent_id": selected.langsmith_agent_id,
+            "langsmith_environment": selected.langsmith_environment,
+            "langsmith_region": selected.langsmith_region,
+            "langsmith_workspace_id": selected.langsmith_workspace_id,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -468,12 +535,34 @@ class OpenAICompatibleStructuredModel:
             }
             if self.settings.mode is AgentModelMode.OPENAI_CLOUD:
                 headers["Authorization"] = f"Bearer {self._api_key}"
-            response = self._transport.post_json(
-                self.endpoint.rstrip("/")
-                + ("/chat/completions" if self.endpoint.endswith("/v1") else "/v1/chat/completions"),
-                headers=headers,
-                body=request_body,
-                timeout=REQUEST_TIMEOUT_SECONDS,
+
+            def send_request() -> dict[str, object]:
+                response = self._transport.post_json(
+                    self.endpoint.rstrip("/")
+                    + ("/chat/completions" if self.endpoint.endswith("/v1") else "/v1/chat/completions"),
+                    headers=headers,
+                    body=request_body,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                return {
+                    "status_code": response.status_code,
+                    "body": response.body.decode("utf-8", errors="replace"),
+                }
+
+            traced_response = trace_llm_call(
+                name="Structured planning completion",
+                provider=(
+                    "openai"
+                    if self.settings.mode is AgentModelMode.OPENAI_CLOUD
+                    else "openai-compatible"
+                ),
+                model_id=self.settings.model_id,
+                inputs=request_body,
+                operation=send_request,
+            )
+            response = TransportResponse(
+                status_code=cast(int, traced_response["status_code"]),
+                body=cast(str, traced_response["body"]).encode("utf-8"),
             )
         except AgentModelError:
             raise
