@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -61,6 +62,7 @@ from ..domain.agent_planning import (
 )
 from ..domain.agent_preflight import (
     PreflightOutcome,
+    PreflightReadiness,
     PreflightResult,
     PreflightRunState,
 )
@@ -88,6 +90,7 @@ from .agent_fitting_worker import AgentFitWorker
 from .agent_model_settings_dialog import AgentModelSettingsDialog
 from .agent_planning_worker import PlanningWorker
 from .agent_preflight_worker import PreflightWorker
+from .agent_summary import AgentSummaryWidget
 from .agent_vision_worker import VisionWorker
 
 
@@ -347,16 +350,19 @@ class AgentWindow(QMainWindow):
         self._agent_settings: AgentModelSettings = self._agent_settings_repository.load()
         self._run_snapshot: AgentRunSnapshot | None = None
         self._run_credential_resolver: AgentCredentialResolver | None = None
+        self._run_langsmith_credential_resolver: AgentCredentialResolver | None = None
         self._fit_plan: AgentFitPlan | None = None
         self._fit_outcome: AgentFitOutcome | None = None
         self._pending_fit_plan: AgentFitPlan | None = None
         self._selected_roi_index = 0
         self._selected_edge_index = 0
+        self._fit_results_filter = "all"
         self._fit_cells: dict[tuple[int, int], AgentFitCellResult] = {}
         self._fit_shape_initials: dict[tuple[int, int, int], tuple[float, float, float]] = {}
         self._fit_parameter_bounds = FittingParameterBounds()
+        self._proposal_withdrawn = False
 
-        self.setWindowTitle("NEAT AI Agent — Autonomous Seven-ROI Fitting (M5A-2)")
+        self.setWindowTitle("NEAT AI Agent — Analysis")
         self.setMinimumSize(820, 520)
         self.resize(1280, 820)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -394,8 +400,8 @@ class AgentWindow(QMainWindow):
         overview_heading = QLabel("Overview", self.overview_panel)
         overview_heading.setStyleSheet("font-size: 15px; font-weight: bold;")
         overview_layout.addWidget(overview_heading)
-        title = QLabel("Explore fitting across seven sample locations", self.overview_panel)
-        overview_layout.addWidget(title)
+        self.overview_heading = QLabel("Explore fitting across seven sample locations", self.overview_panel)
+        overview_layout.addWidget(self.overview_heading)
         self.scope_label = QLabel(
             "One run checks the dataset, reviews up to three representative frames and the measured spectrum, then fits one to five trusted edges at seven spatial locations. Fitting runs locally; the model receives only the bounded previews disclosed for this run. Results are exploratory and do not confirm a phase, strain, or stress.",
             self.overview_panel,
@@ -457,9 +463,9 @@ class AgentWindow(QMainWindow):
         self.dataset_summary_label.setAccessibleName("Dataset check summary")
         overview_layout.addWidget(self.dataset_summary_label)
 
-        matrix_heading = QLabel("Seven-location fit results", self.overview_panel)
-        matrix_heading.setStyleSheet("font-weight: bold;")
-        overview_layout.addWidget(matrix_heading)
+        self.fit_matrix_heading = QLabel("Seven-location fit results", self.overview_panel)
+        self.fit_matrix_heading.setStyleSheet("font-weight: bold;")
+        overview_layout.addWidget(self.fit_matrix_heading)
         self.fit_matrix_summary = QLabel(
             "The fit matrix will appear after visual evidence passes validation.",
             self.overview_panel,
@@ -472,7 +478,7 @@ class AgentWindow(QMainWindow):
         self.fit_matrix.setVerticalHeaderLabels(list(SPATIAL_ROI_LABELS))
         self.fit_matrix.setHorizontalHeaderLabels(["Waiting for validated edges"])
         self.fit_matrix.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.fit_matrix.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.fit_matrix.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.fit_matrix.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.fit_matrix.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.fit_matrix.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -484,9 +490,12 @@ class AgentWindow(QMainWindow):
         )
         self.fit_matrix.cellClicked.connect(self._select_fit_cell)
         self.fit_matrix.currentCellChanged.connect(self._matrix_current_cell_changed)
-        self.fit_matrix.setMinimumHeight(148)
-        self.fit_matrix.setMaximumHeight(222)
-        self.fit_matrix.verticalHeader().setDefaultSectionSize(25)
+        self.fit_matrix.setMinimumHeight(320)
+        self.fit_matrix.setMaximumHeight(410)
+        self.fit_matrix.verticalHeader().setDefaultSectionSize(48)
+        self.fit_matrix.setStyleSheet(
+            "QTableWidget::item:selected { background: #eaf3fc; color: #1767ae; }"
+        )
         overview_layout.addWidget(self.fit_matrix)
         self.fit_detail_label = QLabel(
             "Select a result cell after fitting begins.", self.overview_panel
@@ -533,7 +542,9 @@ class AgentWindow(QMainWindow):
         self.reject_vision_button.clicked.connect(self.reject_visual_proposal)
         roi_review.addWidget(self.adjust_roi_button, 3, 0)
         roi_review.addWidget(self.reject_vision_button, 3, 1)
-        overview_layout.addLayout(roi_review)
+        self.roi_controls_panel = QWidget(self.overview_panel)
+        self.roi_controls_panel.setLayout(roi_review)
+        self.roi_controls_panel.hide()
         self._set_vision_review_visible(False)
 
         self.overview_scroll.setWidget(self.overview_panel)
@@ -543,21 +554,22 @@ class AgentWindow(QMainWindow):
         self.evidence_panel.setMinimumWidth(0)
         self.evidence_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         evidence_layout = QVBoxLayout(self.evidence_panel)
-        evidence_heading = QLabel("Visual Evidence", self.evidence_panel)
-        evidence_heading.setStyleSheet("font-size: 15px; font-weight: bold;")
-        evidence_layout.addWidget(evidence_heading)
-        evidence_explanation = QLabel(
+        self.evidence_heading = QLabel("Visual Evidence", self.evidence_panel)
+        self.evidence_heading.setStyleSheet("font-size: 15px; font-weight: bold;")
+        evidence_layout.addWidget(self.evidence_heading)
+        self.evidence_explanation = QLabel(
             "Measured images and spectrum from the current dataset.", self.evidence_panel
         )
-        evidence_explanation.setWordWrap(True)
-        evidence_layout.addWidget(evidence_explanation)
+        self.evidence_explanation.setWordWrap(True)
+        evidence_layout.addWidget(self.evidence_explanation)
         self.evidence_splitter = QSplitter(Qt.Vertical, self.evidence_panel)
         self.evidence_splitter.setChildrenCollapsible(False)
         self.evidence_splitter.setHandleWidth(7)
         self.evidence_splitter.setAccessibleName(
             "Adjustable image, fit evidence and run evidence panels"
         )
-        image_preview_panel = QWidget(self.evidence_splitter)
+        self.image_preview_panel = QWidget(self.evidence_splitter)
+        image_preview_panel = self.image_preview_panel
         image_preview_layout = QVBoxLayout(image_preview_panel)
         image_preview_layout.setContentsMargins(0, 0, 0, 0)
         image_preview_layout.addWidget(
@@ -568,7 +580,8 @@ class AgentWindow(QMainWindow):
         self.spatial_roi_preview.setMaximumHeight(380)
         self.spatial_roi_preview.roiSelected.connect(self._select_roi_index)
         image_preview_layout.addWidget(self.spatial_roi_preview, 1)
-        fit_evidence_panel = QWidget(self.evidence_splitter)
+        self.fit_evidence_panel = QWidget(self.evidence_splitter)
+        fit_evidence_panel = self.fit_evidence_panel
         fit_evidence_layout = QGridLayout(fit_evidence_panel)
         fit_evidence_layout.setContentsMargins(0, 0, 0, 0)
         self.fit_curve_widgets = (
@@ -604,9 +617,95 @@ class AgentWindow(QMainWindow):
         self.splitter.handle(1).setToolTip(
             "Drag to give more space to Overview or Visual Evidence."
         )
+        chrome = QHBoxLayout()
+        brand = QLabel("NEAT  /  AI analysis", self.root_panel)
+        brand.setStyleSheet("font-size: 15px; font-weight: 600; padding: 8px;")
+        chrome.addWidget(brand)
+        chrome.addStretch()
+        self.back_to_summary_button = QPushButton("← Step conclusions", self.root_panel)
+        self.back_to_summary_button.clicked.connect(self.show_step_conclusions)
+        self.back_to_summary_button.hide()
+        chrome.addWidget(self.back_to_summary_button)
+        self.root_layout.addLayout(chrome)
+        self.analysis_pages = QStackedWidget(self.root_panel)
+        self.summary_page = AgentSummaryWidget(self.analysis_pages)
+        self.summary_page.inspectRequested.connect(self._inspect_summary_step)
+        self.summary_page.resultsRequested.connect(self._show_all_fit_results)
+        self.summary_page.reviewRequested.connect(self.review_flagged_fit)
+        self.summary_page.settingsRequested.connect(self.open_model_settings)
+        self.summary_page.dataPreviewRequested.connect(self.show_data_preview)
+        self.summary_page.adjustedRoiDiscardRequested.connect(self.reject_visual_proposal)
+        self.analysis_pages.addWidget(self.summary_page)
+        self.detail_page = QWidget(self.analysis_pages)
+        detail_layout = QVBoxLayout(self.detail_page)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.addWidget(self.status_label)
+        detail_layout.addWidget(self.splitter, 1)
+        self.analysis_pages.addWidget(self.detail_page)
+        self._build_fit_results_page()
+        self.review_page = QWidget(self.analysis_pages)
+        review_outer = QHBoxLayout(self.review_page)
+        review_content = QWidget(self.review_page)
+        review_content.setMaximumWidth(900)
+        review_layout = QVBoxLayout(review_content)
+        self.review_heading = QLabel(review_content)
+        self.review_heading.setStyleSheet("font-size: 22px; font-weight: 600;")
+        self.review_identity = QLabel(review_content)
+        self.review_identity.setTextFormat(Qt.PlainText)
+        self.review_reason = QLabel(review_content)
+        self.review_reason.setTextFormat(Qt.PlainText)
+        self.review_reason.setWordWrap(True)
+        self.review_reason.setFrameShape(QFrame.StyledPanel)
+        self.review_reason.setMargin(16)
+        review_layout.addWidget(self.review_heading)
+        review_layout.addWidget(self.review_identity)
+        review_layout.addSpacing(12)
+        review_layout.addWidget(self.review_reason)
+        review_hint = QLabel("Inspect this fit before using its numerical result.", review_content)
+        review_hint.setWordWrap(True)
+        review_layout.addWidget(review_hint)
+        review_actions = QHBoxLayout()
+        self.inspect_flagged_button = QPushButton("Show fit details", review_content)
+        self.inspect_flagged_button.clicked.connect(self.show_fit_results)
+        self.next_flagged_button = QPushButton("Next flagged fit", review_content)
+        self.next_flagged_button.clicked.connect(self._next_flagged_fit)
+        review_actions.addWidget(self.inspect_flagged_button)
+        review_actions.addWidget(self.next_flagged_button)
+        review_actions.addStretch()
+        review_layout.addLayout(review_actions)
+        review_layout.addStretch()
+        review_outer.addStretch()
+        review_outer.addWidget(review_content, 1)
+        review_outer.addStretch()
+        self.analysis_pages.addWidget(self.review_page)
+        self.step_evidence_page = QWidget(self.analysis_pages)
+        step_page_layout = QVBoxLayout(self.step_evidence_page)
+        step_page_layout.setContentsMargins(0, 0, 0, 0)
+        self.step_evidence_heading = QLabel(self.step_evidence_page)
+        self.step_evidence_heading.setStyleSheet("font-size: 22px; font-weight: 600;")
+        step_page_layout.addWidget(self.step_evidence_heading)
+        self.step_evidence_subtitle = QLabel(self.step_evidence_page)
+        self.step_evidence_subtitle.setWordWrap(True)
+        step_page_layout.addWidget(self.step_evidence_subtitle)
+        self.step_evidence_scroll = QScrollArea(self.step_evidence_page)
+        self.step_evidence_scroll.setWidgetResizable(True)
+        self.step_evidence_scroll.setFrameShape(QFrame.NoFrame)
+        self.step_evidence_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.step_evidence_scroll.setAccessibleName("Evidence for the selected analysis step")
+        self.step_evidence_content = QWidget(self.step_evidence_scroll)
+        self.step_evidence_layout = QVBoxLayout(self.step_evidence_content)
+        self.step_evidence_layout.setContentsMargins(8, 8, 8, 8)
+        self.step_evidence_layout.setSpacing(12)
+        self.step_evidence_layout.setAlignment(Qt.AlignTop)
+        self._step_evidence_pixmaps: list[tuple[QLabel, QPixmap]] = []
+        self.step_evidence_scroll.setWidget(self.step_evidence_content)
+        step_page_layout.addWidget(self.step_evidence_scroll, 1)
+        self.analysis_pages.addWidget(self.step_evidence_page)
+        self._flagged_review_index = 0
+        self.root_layout.addWidget(self.analysis_pages, 1)
+        controls.setStretch(0, 0)
+        controls.insertStretch(0, 1)
         self.root_layout.addLayout(controls)
-        self.root_layout.addWidget(self.status_label)
-        self.root_layout.addWidget(self.splitter, 1)
         self._show_evidence_message(
             "No measured evidence yet. Start Autonomous Analysis to review the dataset."
         )
@@ -617,12 +716,710 @@ class AgentWindow(QMainWindow):
         self._update_model_readiness()
         self._update_controls()
 
+    def _build_fit_results_page(self) -> None:
+        """Build a focused results view with the matrix and selected evidence together."""
+        self.fit_results_page = QWidget(self.analysis_pages)
+        self.fit_results_page.setObjectName("agentFitResultsPage")
+        self.fit_results_page.setAccessibleName("Seven-location fitting results")
+        page_layout = QVBoxLayout(self.fit_results_page)
+        page_layout.setContentsMargins(12, 8, 12, 12)
+        page_layout.setSpacing(8)
+
+        title_row = QHBoxLayout()
+        self.fit_results_title = QLabel("Analysis results", self.fit_results_page)
+        self.fit_results_title.setStyleSheet("font-size: 19px; font-weight: 600;")
+        title_row.addWidget(self.fit_results_title)
+        title_row.addStretch()
+        self.fit_results_status = QLabel(self.fit_results_page)
+        self.fit_results_status.setWordWrap(True)
+        self.fit_results_status.setAccessibleName("Fit run completion summary")
+        title_row.addWidget(self.fit_results_status)
+        page_layout.addLayout(title_row)
+
+        self.fit_results_splitter = QSplitter(Qt.Horizontal, self.fit_results_page)
+        self.fit_results_splitter.setChildrenCollapsible(False)
+        self.fit_results_splitter.setHandleWidth(7)
+
+        self.fit_results_left_scroll = QScrollArea(self.fit_results_splitter)
+        self.fit_results_left_scroll.setWidgetResizable(True)
+        self.fit_results_left_scroll.setFrameShape(QFrame.NoFrame)
+        self.fit_results_left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_panel = QFrame(self.fit_results_left_scroll)
+        left_panel.setFrameShape(QFrame.StyledPanel)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(6)
+        self.fit_results_matrix_heading = QLabel("Results by location", left_panel)
+        self.fit_results_matrix_heading.setStyleSheet("font-size: 15px; font-weight: 600;")
+        left_layout.addWidget(self.fit_results_matrix_heading)
+        self.fit_matrix_heading.hide()
+        self.fit_results_phase_label = QLabel("", left_panel)
+        self.fit_results_phase_label.setAccessibleName("Provisional phase comparison")
+        left_layout.addWidget(self.fit_results_phase_label)
+
+        filter_row = QHBoxLayout()
+        self.fit_results_all_button = QPushButton("All 7 locations", left_panel)
+        self.fit_results_all_button.setCheckable(True)
+        self.fit_results_all_button.setChecked(True)
+        self.fit_results_all_button.setAccessibleName("Show all fitting locations")
+        self.fit_results_all_button.clicked.connect(
+            lambda: self._set_fit_results_filter("all")
+        )
+        filter_row.addWidget(self.fit_results_all_button)
+        self.fit_results_review_button = QPushButton("Needs review · 0", left_panel)
+        self.fit_results_review_button.setCheckable(True)
+        self.fit_results_review_button.setEnabled(False)
+        self.fit_results_review_button.setAccessibleName("Show locations with flagged fits")
+        self.fit_results_review_button.clicked.connect(
+            lambda: self._set_fit_results_filter("review")
+        )
+        filter_row.addWidget(self.fit_results_review_button)
+        filter_row.addStretch()
+        left_layout.addLayout(filter_row)
+        self.fit_matrix_summary.setWordWrap(True)
+        left_layout.addWidget(self.fit_matrix_summary)
+        self.fit_matrix.setMinimumHeight(390)
+        self.fit_matrix.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        left_layout.addWidget(self.fit_matrix)
+        matrix_note = QLabel(
+            "Column wavelengths are trusted theoretical edge positions.", left_panel
+        )
+        matrix_note.setWordWrap(True)
+        matrix_note.setStyleSheet("color: #536073; font-size: 11px;")
+        left_layout.addWidget(matrix_note)
+
+        sample_header = QHBoxLayout()
+        sample_title = QLabel("Sample locations", left_panel)
+        sample_title.setStyleSheet("font-weight: 600;")
+        sample_header.addWidget(sample_title)
+        sample_header.addStretch()
+        self.fit_results_location_label = QLabel("Select a location", left_panel)
+        self.fit_results_location_label.setAccessibleName("Selected sample location")
+        sample_header.addWidget(self.fit_results_location_label)
+        left_layout.addLayout(sample_header)
+        self.fit_results_roi_preview = SpatialRoiPreviewWidget(left_panel)
+        self.fit_results_roi_preview.setMinimumHeight(160)
+        self.fit_results_roi_preview.setMaximumHeight(230)
+        self.fit_results_roi_preview.roiSelected.connect(self._select_roi_index)
+        self.fit_results_roi_preview.setToolTip(
+            "Select an outlined sample location to inspect its fit results."
+        )
+        left_layout.addWidget(self.fit_results_roi_preview, 1)
+        location_hint = QLabel(
+            "Select a matrix cell or outlined location to inspect its fit.", left_panel
+        )
+        location_hint.setWordWrap(True)
+        location_hint.setStyleSheet("color: #536073; font-size: 11px;")
+        left_layout.addWidget(location_hint)
+
+        self.fit_results_right_scroll = QScrollArea(self.fit_results_splitter)
+        self.fit_results_right_scroll.setWidgetResizable(True)
+        self.fit_results_right_scroll.setFrameShape(QFrame.NoFrame)
+        self.fit_results_right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right_panel = QFrame(self.fit_results_right_scroll)
+        right_panel.setFrameShape(QFrame.StyledPanel)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(12, 10, 12, 10)
+        right_layout.setSpacing(7)
+        selection_header = QHBoxLayout()
+        self.fit_selected_heading = QLabel("Selected fit", right_panel)
+        self.fit_selected_heading.setStyleSheet("font-size: 15px; font-weight: 600;")
+        self.fit_selected_heading.setAccessibleName("Selected ROI and edge")
+        selection_header.addWidget(self.fit_selected_heading)
+        selection_header.addStretch()
+        self.fit_result_state_label = QLabel("Waiting", right_panel)
+        self.fit_result_state_label.setMargin(4)
+        self.fit_result_state_label.setAccessibleName("Selected fit status")
+        selection_header.addWidget(self.fit_result_state_label)
+        right_layout.addLayout(selection_header)
+        self.fit_selected_marker = QLabel(right_panel)
+        self.fit_selected_marker.setAccessibleName("Theoretical edge wavelength")
+        self.fit_selected_marker.setStyleSheet("color: #536073;")
+        right_layout.addWidget(self.fit_selected_marker)
+        self.fit_result_warning_label = QLabel(right_panel)
+        self.fit_result_warning_label.setWordWrap(True)
+        self.fit_result_warning_label.setTextFormat(Qt.PlainText)
+        self.fit_result_warning_label.setStyleSheet(
+            "background: #fff4d9; color: #785000; padding: 8px; border-left: 3px solid #c58b17;"
+        )
+        self.fit_result_warning_label.hide()
+        right_layout.addWidget(self.fit_result_warning_label)
+        self.fit_detail_label.setMinimumHeight(0)
+        self.fit_detail_label.setStyleSheet(
+            "background: #f5f7f9; padding: 8px; border: 1px solid #dce1e8;"
+        )
+        right_layout.addWidget(self.fit_detail_label)
+        right_layout.addWidget(self.fit_evidence_panel, 1)
+        self.details_group.setTitle("Phase evidence & run details")
+        right_layout.addWidget(self.details_group)
+        caution = QLabel(
+            "Exploratory fit only. Calibration and the legacy d_fit convention need separate validation before physical interpretation.",
+            right_panel,
+        )
+        caution.setWordWrap(True)
+        caution.setStyleSheet("color: #536073; font-size: 11px;")
+        right_layout.addWidget(caution)
+
+        self.fit_results_left_scroll.setWidget(left_panel)
+        self.fit_results_right_scroll.setWidget(right_panel)
+        self.fit_results_splitter.addWidget(self.fit_results_left_scroll)
+        self.fit_results_splitter.addWidget(self.fit_results_right_scroll)
+        self.fit_results_splitter.setStretchFactor(0, 4)
+        self.fit_results_splitter.setStretchFactor(1, 6)
+        self.fit_results_splitter.setSizes([470, 690])
+        page_layout.addWidget(self.fit_results_splitter, 1)
+        self.analysis_pages.addWidget(self.fit_results_page)
+
     @property
     def result(self) -> PreflightResult | None:
         return self._result
 
     def _set_status(self, message: str) -> None:
         self.status_label.setText(message)
+        self._refresh_step_conclusions()
+
+    def show_step_conclusions(self) -> None:
+        self._set_fit_only_detail_view(False)
+        self.analysis_pages.setCurrentWidget(self.summary_page)
+        self.back_to_summary_button.hide()
+        self._refresh_step_conclusions()
+
+    def _inspect_summary_step(self, index: int) -> None:
+        if index == 3 and self._fit_plan is not None and self._fit_cells:
+            self._show_all_fit_results()
+            return
+        self._set_fit_only_detail_view(False)
+        self._populate_step_evidence(index)
+        self.analysis_pages.setCurrentWidget(self.step_evidence_page)
+        self.back_to_summary_button.show()
+        self.step_evidence_scroll.verticalScrollBar().setValue(0)
+        QTimer.singleShot(0, self._rescale_step_evidence_images)
+
+    def _clear_step_evidence(self) -> None:
+        self._step_evidence_pixmaps.clear()
+        while self.step_evidence_layout.count():
+            item = self.step_evidence_layout.takeAt(0)
+            widget = item.widget()
+            if widget is None:
+                continue
+            if widget is self.roi_controls_panel:
+                widget.hide()
+            else:
+                widget.deleteLater()
+
+    def _add_step_evidence_text(self, text: str) -> QLabel:
+        label = QLabel(text, self.step_evidence_content)
+        label.setTextFormat(Qt.PlainText)
+        label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.step_evidence_layout.addWidget(label)
+        return label
+
+    def _add_step_evidence_group(self, title: str, lines: tuple[str, ...] | list[str]) -> None:
+        group = QFrame(self.step_evidence_content)
+        group.setFrameShape(QFrame.StyledPanel)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(14, 10, 14, 10)
+        heading = QLabel(title, group)
+        heading.setStyleSheet("font-weight: 600;")
+        layout.addWidget(heading)
+        body = QLabel("\n".join(line for line in lines if line), group)
+        body.setTextFormat(Qt.PlainText)
+        body.setWordWrap(True)
+        layout.addWidget(body)
+        self.step_evidence_layout.addWidget(group)
+
+    def _add_step_evidence_png(self, caption: str, png: bytes | None) -> None:
+        caption_label = QLabel(caption, self.step_evidence_content)
+        caption_label.setWordWrap(True)
+        self.step_evidence_layout.addWidget(caption_label)
+        pixmap = QPixmap()
+        if png and pixmap.loadFromData(png, "PNG"):
+            image = QLabel(self.step_evidence_content)
+            image.setAccessibleName(caption)
+            image.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            image.setMinimumWidth(0)
+            image.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            self.step_evidence_layout.addWidget(image)
+            self._step_evidence_pixmaps.append((image, pixmap))
+
+    def _rescale_step_evidence_images(self) -> None:
+        if not hasattr(self, "_step_evidence_pixmaps"):
+            return
+        available_width = max(1, self.step_evidence_scroll.viewport().width() - 20)
+        for label, source in self._step_evidence_pixmaps:
+            width = min(available_width, source.width())
+            scaled = source.scaled(
+                width, source.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            label.setPixmap(scaled)
+            label.setFixedSize(scaled.size())
+
+    def _populate_step_evidence(self, index: int) -> None:
+        titles = ("Dataset check", "Sample locations", "Phase comparison")
+        index = max(0, min(index, 3))
+        if index in (1, 2):
+            index = 3 - index
+        self._clear_step_evidence()
+        result = self._result if not self._stale else None
+        visual = self._vision_outcome if not self._stale else None
+
+        if index == 0:
+            self.step_evidence_heading.setText(titles[0])
+            self.step_evidence_subtitle.setText(
+                "The dataset readiness checks and any limits found for this run."
+            )
+            if result is None:
+                self._add_step_evidence_text(self.status_label.text())
+                return
+            assessment = result.assessment
+            self._add_step_evidence_group(
+                "Readiness",
+                [
+                    "Status: " + assessment.readiness.value.replace("_", " ").title(),
+                    self.dataset_summary_label.text(),
+                    f"Dataset revision: {assessment.revision}",
+                ],
+            )
+            self._add_step_evidence_group(
+                "Checks completed",
+                list(assessment.observations) or ["No additional checks were recorded."],
+            )
+            self._add_step_evidence_group(
+                "Warnings",
+                list(assessment.warnings) or ["No dataset warnings were recorded."],
+            )
+            if assessment.unsupported_operations:
+                self._add_step_evidence_group(
+                    "Unavailable operations", list(assessment.unsupported_operations)
+                )
+            return
+
+        if index == 1:
+            self.step_evidence_heading.setText(titles[1])
+            self.step_evidence_subtitle.setText(
+                "The proposed sample regions, their original-pixel coordinates, and local checks."
+            )
+            candidates = visual.spatial_roi_candidates if visual is not None else ()
+            if result is not None and result.frames:
+                frame = result.frames[0].image
+                preview = SpatialRoiPreviewWidget(self.step_evidence_content)
+                preview.setMinimumHeight(250)
+                preview.setMaximumHeight(390)
+                preview.set_preview(frame.png_bytes, frame.coordinate_mapping, candidates)
+                self.step_evidence_layout.addWidget(preview)
+            if candidates:
+                accepted = sum(candidate.accepted for candidate in candidates)
+                self._add_step_evidence_group(
+                    "Location checks",
+                    [
+                        (
+                            f"{accepted} of {len(candidates)} locations have valid coordinates. "
+                            "NEAT separately checks bounds, overlap, and fitting windows before start."
+                        )
+                    ],
+                )
+                lines = []
+                for candidate in candidates:
+                    if candidate.roi is not None:
+                        bounds = (
+                            f"x[{candidate.roi.x_min},{candidate.roi.x_max}), "
+                            f"y[{candidate.roi.y_min},{candidate.roi.y_max})"
+                        )
+                    elif candidate.proposed_coordinates is not None:
+                        x_min, x_max, y_min, y_max = candidate.proposed_coordinates
+                        bounds = f"x[{x_min},{x_max}), y[{y_min},{y_max})"
+                    else:
+                        bounds = "coordinates unavailable"
+                    state = "Accepted" if candidate.accepted else "Not validated"
+                    reason = candidate.validation_error or candidate.reason
+                    details = f"{candidate.label}: {state} · {bounds}"
+                    if reason:
+                        details += f" · {reason}"
+                    if candidate.ambiguity_flags:
+                        details += " · " + "; ".join(candidate.ambiguity_flags)
+                    lines.append(details)
+                self._add_step_evidence_group("Proposed locations", lines)
+            elif result is not None and result.roi is not None:
+                roi = result.roi
+                self._add_step_evidence_group(
+                    "Selected region",
+                    [f"x[{roi.x_min},{roi.x_max}), y[{roi.y_min},{roi.y_max})"],
+                )
+            else:
+                self._add_step_evidence_text("No sample locations are available to inspect.")
+
+            self.roi_controls_panel.setParent(self.step_evidence_content)
+            self.roi_controls_panel.setVisible(not self.roi_review_label.isHidden())
+            if not self.roi_controls_panel.isHidden():
+                self.step_evidence_layout.addWidget(self.roi_controls_panel)
+            return
+
+        if index == 2:
+            self.step_evidence_heading.setText(titles[2])
+            self.step_evidence_subtitle.setText(
+                "The proposed phase and trusted edges, with the spectrum overlays used for comparison."
+            )
+            if visual is None:
+                self._add_step_evidence_text("No phase comparison is available.")
+                return
+            lines = []
+            if visual.phase_id and visual.hkls:
+                lines.append(f"Provisional match: {visual.phase_id}")
+                if visual.phase_reason:
+                    lines.append("Reason: " + visual.phase_reason)
+                for hkl, reason in zip(visual.hkls, visual.edge_reasons):
+                    lines.append(f"Candidate edge {hkl}: {reason or 'No explanation provided.'}")
+            else:
+                lines.append("No phase and edge proposal passed validation.")
+                if visual.proposed_phase_id:
+                    lines.append("Unaccepted model suggestion: " + visual.proposed_phase_id)
+                if visual.response_validation_error:
+                    lines.append("Validation: " + visual.response_validation_error)
+                if visual.phase_reason:
+                    lines.append(visual.phase_reason)
+                elif visual.message:
+                    lines.append(visual.message)
+            if visual.inspected_phases:
+                lines.append("Trusted phases compared: " + ", ".join(visual.inspected_phases))
+            if visual.alternatives:
+                lines.append("Other candidates: " + ", ".join(visual.alternatives))
+            if visual.unresolved:
+                lines.append("Unresolved: " + "; ".join(visual.unresolved))
+            if visual.display_interval_diagnostic:
+                lines.append("Display-window check: " + visual.display_interval_diagnostic)
+            self._add_step_evidence_group("Phase review", lines)
+            if visual.phase_overlays:
+                for phase, png in visual.phase_overlays:
+                    self._add_step_evidence_png(
+                        f"Measured spectrum with {phase} theoretical edge markers (provisional).",
+                        png,
+                    )
+            elif visual.spectrum_png:
+                self._add_step_evidence_png(
+                    "Measured spectrum used for the phase comparison.", visual.spectrum_png
+                )
+            self._add_step_evidence_text(
+                "Visual agreement is not crystallographic identification or proof of fit quality. "
+                "Physical d-spacing, strain, and stress need separate validation."
+            )
+            return
+
+        self.step_evidence_heading.setText("Local fitting")
+        self.step_evidence_subtitle.setText(
+            "The seven-location fit matrix, per-fit measurements, curves and residuals."
+        )
+        if self._fit_plan is None or not self._fit_cells:
+            self._add_step_evidence_group(
+                "Fitting status",
+                [self.fit_matrix_summary.text(), self._fit_outcome.message if self._fit_outcome else ""],
+            )
+            return
+        self.show_fit_results()
+
+    def show_fit_results(self) -> None:
+        if self._fit_plan is None or not self._fit_cells:
+            return
+        self.analysis_pages.setCurrentWidget(self.fit_results_page)
+        self.back_to_summary_button.show()
+        self.details_group.setChecked(False)
+        self.fit_matrix.scrollToTop()
+        self._refresh_fit_result_roi_preview()
+        self._update_selected_fit_evidence()
+        QTimer.singleShot(0, self._position_fit_results)
+
+    def _show_all_fit_results(self) -> None:
+        self._set_fit_results_filter("all")
+        self.show_fit_results()
+
+    def _position_fit_results(self) -> None:
+        self.fit_matrix.scrollToTop()
+        self.fit_results_splitter.setSizes(
+            [max(1, int(self.fit_results_splitter.width() * 0.42)),
+             max(1, int(self.fit_results_splitter.width() * 0.58))]
+        )
+
+    def _set_fit_results_filter(self, selected_filter: str) -> None:
+        if selected_filter not in {"all", "review"}:
+            return
+        flagged_rows = {
+            row
+            for (row, _column), cell in self._fit_cells.items()
+            if cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
+        }
+        if selected_filter == "review" and not flagged_rows:
+            selected_filter = "all"
+        self._fit_results_filter = selected_filter
+        self.fit_results_all_button.setChecked(selected_filter == "all")
+        self.fit_results_review_button.setChecked(selected_filter == "review")
+        for row in range(self.fit_matrix.rowCount()):
+            self.fit_matrix.setRowHidden(
+                row, selected_filter == "review" and row not in flagged_rows
+            )
+        selected_cell = self._fit_cells.get(
+            (self._selected_roi_index, self._selected_edge_index)
+        )
+        selected_cell_is_flagged = selected_cell is not None and selected_cell.state in {
+            AgentFitCellState.NEEDS_REVIEW,
+            AgentFitCellState.FAILED,
+        }
+        if selected_filter == "review" and not selected_cell_is_flagged:
+            row = min(flagged_rows)
+            columns = [
+                column
+                for (candidate_row, column), cell in self._fit_cells.items()
+                if candidate_row == row
+                and cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
+            ]
+            self._select_fit_cell(row, min(columns))
+            self.fit_matrix.setCurrentCell(row, min(columns))
+
+    def _refresh_fit_result_filters(self) -> None:
+        flagged_rows = {
+            row
+            for (row, _column), cell in self._fit_cells.items()
+            if cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
+        }
+        flagged_count = sum(
+            cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
+            for cell in self._fit_cells.values()
+        )
+        self.fit_results_all_button.setText(
+            f"All {self.fit_matrix.rowCount()} locations"
+        )
+        self.fit_results_review_button.setText(f"Needs review · {flagged_count}")
+        self.fit_results_review_button.setEnabled(flagged_count > 0)
+        if self._fit_results_filter == "review" and flagged_count == 0:
+            self._fit_results_filter = "all"
+        self.fit_results_all_button.setChecked(self._fit_results_filter == "all")
+        self.fit_results_review_button.setChecked(self._fit_results_filter == "review")
+        for row in range(self.fit_matrix.rowCount()):
+            self.fit_matrix.setRowHidden(
+                row,
+                self._fit_results_filter == "review" and row not in flagged_rows,
+            )
+
+    def _refresh_fit_result_roi_preview(self) -> None:
+        if (
+            self._stale
+            or self._result is None
+            or not self._result.frames
+            or self._vision_outcome is None
+        ):
+            self.fit_results_roi_preview.set_preview(None, None, ())
+            return
+        image = self._result.frames[0].image
+        self.fit_results_roi_preview.set_preview(
+            image.png_bytes,
+            image.coordinate_mapping,
+            self._vision_outcome.spatial_roi_candidates,
+        )
+
+    def _set_fit_only_detail_view(self, fit_only: bool) -> None:
+        for widget in (
+            self.overview_heading,
+            self.scope_label,
+            self.model_readiness_label,
+            self.settings_button,
+            self.preview_data_button,
+            self.dataset_summary_label,
+            self.details_group,
+            self.status_label,
+        ):
+            widget.setVisible(not fit_only)
+        self.image_preview_panel.setVisible(not fit_only)
+        self.evidence_scroll.setVisible(not fit_only)
+        self.fit_evidence_panel.setVisible(True)
+        self.evidence_heading.setText("Local fit evidence" if fit_only else "Visual Evidence")
+        self.evidence_explanation.setText(
+            "Curves and residuals for the selected sample location and edge."
+            if fit_only else "Measured images and spectrum from the current dataset."
+        )
+        self.evidence_splitter.setSizes(
+            [0, max(1, self.evidence_splitter.height()), 0]
+            if fit_only else [300, 250, 180]
+        )
+
+    def _set_detailed_context_visible(self, visible: bool) -> None:
+        for widget in (
+            self.scope_label, self.model_readiness_label, self.dataset_summary_label,
+            self.settings_button, self.preview_data_button,
+        ):
+            widget.setVisible(visible)
+
+    def review_flagged_fit(self) -> None:
+        self._flagged_review_index = 0
+        self._show_flagged_fit()
+
+    def _next_flagged_fit(self) -> None:
+        self._flagged_review_index += 1
+        self._show_flagged_fit()
+
+    def _show_flagged_fit(self) -> None:
+        if self._fit_plan is None:
+            return
+        flagged_cells = [
+            cell for cell in self._fit_cells.values() if cell.state in {
+                AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED,
+            }
+        ]
+        if not flagged_cells:
+            return
+        self._flagged_review_index %= len(flagged_cells)
+        flagged = flagged_cells[self._flagged_review_index]
+        edge_index = next(
+            index for index, edge in enumerate(self._fit_plan.edges) if edge.hkl == flagged.hkl
+        )
+        self._set_fit_results_filter("review")
+        self._select_fit_cell(flagged.roi_index, edge_index)
+        self.fit_matrix.setCurrentCell(flagged.roi_index, edge_index)
+        self.review_heading.setText(
+            "One fit needs your review" if len(flagged_cells) == 1
+            else f"Flagged fit {self._flagged_review_index + 1} of {len(flagged_cells)}"
+        )
+        self.review_identity.setText(
+            f"ROI {flagged.roi_label} · {self._fit_plan.phase_id} {flagged.hkl}"
+        )
+        self.review_reason.setText("; ".join(flagged.review_flags) or flagged.message)
+        self.next_flagged_button.setVisible(len(flagged_cells) > 1)
+        self.analysis_pages.setCurrentWidget(self.review_page)
+        self.back_to_summary_button.show()
+
+    def _refresh_step_conclusions(self) -> None:
+        """Describe captured outcomes; never infer scientific success from progress."""
+        if not hasattr(self, "summary_page"):
+            return
+        page = self.summary_page
+        active = self._has_active_worker()
+        conclusions = ["Not started"] * 4
+        evidence = ["No evidence is available yet."] * 4
+        inspectable = [False] * 4
+        result = self._result
+        visual = self._vision_outcome
+        fit = self._fit_outcome
+        heading = "Analysis in progress" if active else "Explore your dataset"
+        subtitle = "Each step will show a short conclusion."
+        notice = ""
+        if result is not None and not self._stale:
+            conclusions[0] = {
+                PreflightReadiness.READY: "Dataset is ready for exploration",
+                PreflightReadiness.LIMITED: "Dataset has limitations to review",
+                PreflightReadiness.INVALID: "Dataset is not ready for analysis",
+            }[result.assessment.readiness]
+            evidence[0] = self.dataset_summary_label.text()
+            inspectable[0] = True
+        elif self._stage == "preflight_running":
+            conclusions[0] = "Checking the dataset…"
+        if visual is not None:
+            candidates = visual.spatial_roi_candidates
+            accepted = sum(item.accepted for item in candidates)
+            conclusions[1] = (
+                "7 sample locations selected" if len(candidates) == 7 and accepted == 7
+                else "No safe set of seven locations found" if len(candidates) == 7
+                else "Locations not selected" if visual.phase_id
+                else "Waiting for phase comparison"
+            )
+            evidence[1] = (
+                f"{accepted} of {len(candidates)} proposed locations passed visual ROI checks. "
+                "NEAT also checks bounds, overlap and fitting windows before fitting."
+            )
+            inspectable[1] = True
+            conclusions[2] = (
+                f"Provisional match: {visual.phase_id}"
+                if visual.phase_id and visual.hkls else "No phase and edge proposal was accepted"
+            )
+            evidence[2] = visual.phase_reason or visual.message
+            inspectable[2] = True
+        elif self._stage == "vision_running":
+            conclusions[1] = "Waiting for phase comparison…"
+            conclusions[2] = "Comparing phase evidence…"
+        elif self._stage == "planning_running":
+            subtitle = "Preparing the dataset review."
+        if self._fit_plan is not None:
+            conclusions[1] = "7 sample locations selected"
+            conclusions[2] = f"Provisional match: {self._fit_plan.phase_id}"
+            if fit is None:
+                conclusions[3] = "Fitting selected edges locally…"
+                evidence[3] = self.fit_matrix_summary.text()
+        if fit is not None:
+            if fit.status in {AgentFitRunStatus.COMPLETE, AgentFitRunStatus.COMPLETE_WITH_ISSUES}:
+                heading = "Analysis complete"
+                conclusions[3] = (
+                    f"{fit.attempted} fits attempted · {fit.failed} failed"
+                    if fit.failed else f"{fit.succeeded} fits completed"
+                )
+                if fit.needs_review:
+                    conclusions[3] += (
+                        f" · {fit.needs_review} "
+                        + ("needs review" if fit.needs_review == 1 else "need review")
+                    )
+            elif fit.status is AgentFitRunStatus.STOPPED:
+                heading = "Analysis stopped"
+                conclusions[3] = f"Stopped · {fit.attempted}/{fit.total_fits} fits attempted"
+            else:
+                heading = "Analysis needs attention"
+                conclusions[3] = "Local fitting did not complete"
+                notice = fit.message
+            evidence[3] = self.fit_matrix_summary.text() + "\n" + fit.message
+            inspectable[3] = bool(self._fit_cells)
+        elif self._stage == "fitting_needs_input":
+            heading = "Analysis needs your review"
+            conclusions[3] = "Fitting paused · no fits started"
+            notice = self.status_label.text()
+        elif not active and self._stage == "complete" and result is not None:
+            heading = "Dataset check complete"
+        elif not active and self._stage not in {"idle", "complete"}:
+            heading = "Analysis paused"
+            notice = self.status_label.text()
+        if (
+            not active and fit is None and visual is None
+            and self._planning_outcome is not None
+            and self._planning_outcome.status is PlanningStatus.READY_PLAN
+            and self._agent_settings.mode is AgentModelMode.LOCAL
+        ):
+            heading = "Dataset review complete"
+            conclusions[1:] = ["Not run in local-model mode"] * 3
+            notice = "A read-only plan is available. Local-model mode does not run the OpenAI visual fitting workflow."
+        if self._proposal_withdrawn:
+            heading = "ROI adjustment saved" if self._adjusted_roi is not None else "Proposal withdrawn"
+            conclusions[1:] = ["Earlier proposal withdrawn", "Earlier proposal withdrawn", "Earlier fits withdrawn"]
+            evidence[1:] = ["Run analysis again to review current evidence."] * 3
+            inspectable[1:] = [False] * 3
+            notice = "Run analysis again to extract a fresh spectrum and prepare new results."
+        if self._cancellation_requested or self._stage in {"cancelled", "stopped"}:
+            heading = "Stopping analysis…" if active else "Analysis stopped"
+            notice = "Completed fit evidence remains available." if self._fit_cells else "No fit results are available."
+        if self._stale:
+            heading = "Dataset changed"
+            conclusions = ["Rerun required"] * 4
+            evidence = ["Earlier evidence no longer describes the current dataset."] * 4
+            inspectable = [False] * 4
+            notice = "Run analysis again to inspect the current dataset."
+        page.heading.setText(heading)
+        page.subtitle.setText("Here is what each step found." if fit is not None else subtitle)
+        page.notice.setText(notice)
+        page.notice.setVisible(bool(notice))
+        page.discard_adjusted_button.setVisible(self._adjusted_roi is not None)
+        conclusions[1], conclusions[2] = conclusions[2], conclusions[1]
+        evidence[1], evidence[2] = evidence[2], evidence[1]
+        inspectable[1], inspectable[2] = inspectable[2], inspectable[1]
+        for row, conclusion, detail, available in zip(page.rows, conclusions, evidence, inspectable):
+            row.set_conclusion(conclusion, detail, inspectable=available)
+        has_results = self._fit_plan is not None and bool(self._fit_cells) and not self._stale
+        flagged_count = sum(cell.state in {
+            AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED,
+        } for cell in self._fit_cells.values())
+        page.results_button.setVisible(has_results)
+        page.review_button.setVisible(has_results and flagged_count > 0)
+        page.review_button.setText(f"Review {flagged_count} flagged fit" + ("s" if flagged_count != 1 else ""))
+        settings = self._agent_settings
+        page.model_label.setText(
+            f"OpenAI · {settings.model_id or 'model not configured'}. Starting sends a dataset summary and bounded previews."
+            if settings.mode is AgentModelMode.OPENAI_CLOUD else
+            "Local model · requests stay on this computer; no OpenAI visual review."
+            if settings.mode is AgentModelMode.LOCAL else "Select a model in Agent settings before starting."
+        )
 
     def _clear_evidence(self) -> None:
         self._evidence_pixmaps.clear()
@@ -764,6 +1561,10 @@ class AgentWindow(QMainWindow):
                 )
         else:
             lines.append("No provisional phase or candidate-edge suggestion was accepted.")
+            if outcome.proposed_phase_id:
+                lines.append(f"Model proposed phase (not accepted): {outcome.proposed_phase_id}")
+            if outcome.response_validation_error:
+                lines.append(f"Response validation: {outcome.response_validation_error}")
             if outcome.phase_reason:
                 lines.append(f"Validation/review note: {outcome.phase_reason}")
         if outcome.alternatives:
@@ -818,12 +1619,19 @@ class AgentWindow(QMainWindow):
         self._fit_parameter_bounds = FittingParameterBounds.from_legacy_dict(raw_bounds)
 
     def _reset_fit_results(self) -> None:
+        if hasattr(self, "review_page"):
+            self.review_heading.clear()
+            self.review_identity.clear()
+            self.review_reason.clear()
+            if self.analysis_pages.currentWidget() is self.review_page:
+                self.show_step_conclusions()
         self._fit_plan = None
         self._fit_outcome = None
         self._pending_fit_plan = None
         self._fit_cells.clear()
         self._selected_roi_index = 0
         self._selected_edge_index = 0
+        self._fit_results_filter = "all"
         self.fit_matrix.setColumnCount(1)
         self.fit_matrix.setHorizontalHeaderLabels(["Waiting for validated edges"])
         for row in range(self.fit_matrix.rowCount()):
@@ -833,16 +1641,31 @@ class AgentWindow(QMainWindow):
         self.fit_matrix_summary.setText(
             "The fit matrix will appear after visual evidence passes validation."
         )
+        self.fit_results_title.setText("Analysis results")
+        self.fit_results_status.clear()
+        self.fit_results_phase_label.clear()
+        self.fit_results_location_label.setText("Select a location")
+        self.fit_selected_heading.setText("Selected fit")
+        self.fit_selected_marker.clear()
+        self.fit_result_state_label.setText("Waiting")
+        self.fit_result_warning_label.clear()
+        self.fit_result_warning_label.hide()
+        self._refresh_fit_result_filters()
+        self.fit_results_roi_preview.set_preview(None, None, ())
         for curve_widget in self.fit_curve_widgets:
             curve_widget.set_curve(None)
+        self.fit_matrix.clearSelection()
+        self.fit_matrix.setCurrentCell(-1, -1)
+        self.fit_detail_label.setText("Select a result cell after fitting begins.")
         self.spatial_roi_preview.set_selected_roi(None)
 
     def _configure_fit_matrix(self, plan: AgentFitPlan) -> None:
         self._fit_plan = plan
         self._fit_cells.clear()
+        self._fit_results_filter = "all"
         self.fit_matrix.setColumnCount(len(plan.edges))
         self.fit_matrix.setHorizontalHeaderLabels(
-            [f"{edge.hkl} · {edge.edge_wavelength:.3f} Å" for edge in plan.edges]
+            [f"{edge.hkl}\n{edge.edge_wavelength:.3f} Å" for edge in plan.edges]
         )
         for roi_index, label in enumerate(SPATIAL_ROI_LABELS):
             self.fit_matrix.setVerticalHeaderItem(roi_index, QTableWidgetItem(label))
@@ -857,6 +1680,12 @@ class AgentWindow(QMainWindow):
             f"Provisional phase: {plan.phase_id} · {len(plan.spatial_rois)} locations · "
             f"{len(plan.edges)} edges · {len(plan.spatial_rois) * len(plan.edges)} local fits"
         )
+        self.fit_results_title.setText("Fitting in progress")
+        self.fit_results_status.setText(
+            f"0/{len(plan.spatial_rois) * len(plan.edges)} attempted"
+        )
+        self.fit_results_phase_label.setText(f"{plan.phase_id} · provisional phase")
+        self._refresh_fit_result_filters()
         self.fit_matrix.setCurrentCell(0, 0)
         self._update_selected_fit_evidence()
 
@@ -880,7 +1709,6 @@ class AgentWindow(QMainWindow):
                 if np.isfinite(result.d_fit) and result.d_fit != 0 and np.isfinite(result.d_unc)
                 else float("nan")
             )
-            label = f"{label}\n{result.d_fit:.4g}"
             details += (
                 f"\nd_fit = {result.d_fit:.7g} ± {result.d_unc:.3g} Å"
                 f"\nRelative d uncertainty = {relative:.4g}%"
@@ -904,7 +1732,32 @@ class AgentWindow(QMainWindow):
         for widget, curve in zip(self.fit_curve_widgets, curves):
             widget.set_curve(curve)
         result = attempt.result if attempt is not None else None
-        heading = f"{cell.roi_label} · edge {cell.hkl}"
+        phase_id = self._fit_plan.phase_id if self._fit_plan is not None else ""
+        heading = f"ROI {cell.roi_label} · edge {cell.hkl} · {phase_id}".strip()
+        self.fit_selected_heading.setText(heading)
+        if self._fit_plan is not None:
+            edge = self._fit_plan.edges[self._selected_edge_index]
+            self.fit_selected_marker.setText(
+                f"Theoretical edge wavelength: {edge.edge_wavelength:.4f} Å"
+            )
+        state_text, state_color, state_background = {
+            AgentFitCellState.QUEUED: ("Queued", "#536073", "#eef1f4"),
+            AgentFitCellState.RUNNING: ("Fitting…", "#785000", "#fff0bf"),
+            AgentFitCellState.SUCCEEDED: ("Fit completed", "#326b4b", "#d7f1df"),
+            AgentFitCellState.NEEDS_REVIEW: ("Needs review", "#785000", "#fff4d9"),
+            AgentFitCellState.FAILED: ("Fit failed", "#8a3030", "#ffd9d9"),
+            AgentFitCellState.SKIPPED: ("Skipped", "#536073", "#e4e7eb"),
+            AgentFitCellState.CANCELLED: ("Stopped", "#536073", "#e4e7eb"),
+        }[cell.state]
+        self.fit_result_state_label.setText(state_text)
+        self.fit_result_state_label.setStyleSheet(
+            f"color: {state_color}; background: {state_background}; padding: 4px 8px;"
+        )
+        warning = "; ".join(cell.review_flags)
+        if not warning and cell.state is AgentFitCellState.FAILED:
+            warning = cell.message
+        self.fit_result_warning_label.setText(warning)
+        self.fit_result_warning_label.setVisible(bool(warning))
         if result is None:
             self.fit_detail_label.setText(f"{heading} · {cell.state.value.replace('_', ' ')}: {cell.message}")
             return
@@ -937,18 +1790,37 @@ class AgentWindow(QMainWindow):
     def _update_selected_fit_evidence(self) -> None:
         if self._fit_plan is None:
             self.fit_detail_label.setText("Select a result cell after fitting begins.")
+            self.fit_results_location_label.setText("Select a location")
+            self.fit_results_roi_preview.set_selected_roi(None)
             return
         roi_index = min(self._selected_roi_index, len(self._fit_plan.spatial_rois) - 1)
         edge_index = min(self._selected_edge_index, len(self._fit_plan.edges) - 1)
         self.spatial_roi_preview.set_selected_roi(roi_index)
+        self.fit_results_roi_preview.set_selected_roi(roi_index)
+        self.fit_results_location_label.setText(
+            f"Selected: {SPATIAL_ROI_LABELS[roi_index]}"
+        )
         cell = self._fit_cells.get((roi_index, edge_index))
         if cell is not None:
             self._show_fit_cell(cell)
         else:
             for widget in self.fit_curve_widgets:
                 widget.set_curve(None)
+            edge = self._fit_plan.edges[edge_index]
+            self.fit_selected_heading.setText(
+                f"ROI {SPATIAL_ROI_LABELS[roi_index]} · edge {edge.hkl} · {self._fit_plan.phase_id}"
+            )
+            self.fit_selected_marker.setText(
+                f"Theoretical edge wavelength: {edge.edge_wavelength:.4f} Å"
+            )
+            self.fit_result_state_label.setText("Waiting")
+            self.fit_result_state_label.setStyleSheet(
+                "color: #536073; background: #eef1f4; padding: 4px 8px;"
+            )
+            self.fit_result_warning_label.clear()
+            self.fit_result_warning_label.hide()
             self.fit_detail_label.setText(
-                f"{SPATIAL_ROI_LABELS[roi_index]} · edge {self._fit_plan.edges[edge_index].hkl} · waiting for fit evidence"
+                f"Theoretical edge wavelength: {edge.edge_wavelength:.4f} Å · waiting for fit evidence"
             )
 
     def _select_fit_cell(self, row: int, column: int) -> None:
@@ -964,6 +1836,14 @@ class AgentWindow(QMainWindow):
     def _select_roi_index(self, index: int) -> None:
         if self._fit_plan is None or not 0 <= index < len(self._fit_plan.spatial_rois):
             return
+        if self._fit_results_filter == "review":
+            flagged_rows = {
+                row
+                for (row, _column), cell in self._fit_cells.items()
+                if cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
+            }
+            if index not in flagged_rows:
+                self._set_fit_results_filter("all")
         self._selected_roi_index = index
         self.fit_matrix.setCurrentCell(index, self._selected_edge_index)
         self._update_selected_fit_evidence()
@@ -1084,7 +1964,13 @@ class AgentWindow(QMainWindow):
         if (handle.dataset_id, handle.revision) != (plan.dataset_id, plan.revision):
             self._mark_stale()
             return
-        worker = AgentFitWorker(handle, plan, parent=self._main_window)
+        worker = AgentFitWorker(
+            handle,
+            plan,
+            agent_settings=(self._run_snapshot.settings if self._run_snapshot else None),
+            langsmith_credential_resolver=self._run_langsmith_credential_resolver,
+            parent=self._main_window,
+        )
         self._fit_worker = worker
         self._main_window.agent_fitting_worker = worker
         self._main_window._track_shutdown_worker(worker, "agent_fitting")
@@ -1142,6 +2028,10 @@ class AgentWindow(QMainWindow):
                     self._update_selected_fit_evidence()
         if event.stage == "fit_edges" and event.total_fits:
             self.progress_bar.setValue(min(99, int(100 * event.attempted / event.total_fits)))
+            self.fit_results_title.setText("Fitting in progress")
+            self.fit_results_status.setText(
+                f"{event.attempted}/{event.total_fits} attempted"
+            )
         else:
             self.progress_bar.setValue(5)
         self._set_status(event.message)
@@ -1156,6 +2046,7 @@ class AgentWindow(QMainWindow):
         item.setText(label)
         item.setToolTip(details)
         item.setBackground(color)
+        self._refresh_fit_result_filters()
 
     def _on_fit_completed(self, run_id: str, worker: AgentFitWorker, outcome: AgentFitOutcome) -> None:
         if (
@@ -1195,14 +2086,32 @@ class AgentWindow(QMainWindow):
             f"{outcome.failed} failed · {outcome.needs_review} need review · {outcome.cancelled} stopped"
         )
         if outcome.status is AgentFitRunStatus.COMPLETE:
+            self.fit_results_title.setText("Analysis completed")
+            self.fit_results_status.setText(
+                f"{outcome.succeeded} fits completed · all results ready to inspect"
+            )
             status = "Seven-location fitting completed. Review the matrix and selected evidence."
         elif outcome.status is AgentFitRunStatus.COMPLETE_WITH_ISSUES:
-            status = "Fitting completed with results that need review or individual failures."
+            self.fit_results_title.setText("Results need review")
+            self.fit_results_status.setText(
+                f"{outcome.failed} failed · {outcome.needs_review} need review"
+            )
+            status = (
+                f"Fitting completed · {outcome.failed} failed · {outcome.needs_review} need review."
+            )
         elif outcome.status is AgentFitRunStatus.STOPPED:
+            self.fit_results_title.setText("Analysis stopped")
+            self.fit_results_status.setText(
+                f"{outcome.attempted}/{outcome.total_fits} attempted · completed results retained"
+            )
             status = "Fitting stopped safely. Completed cell results remain available for review."
         elif outcome.status is AgentFitRunStatus.BLOCKED:
+            self.fit_results_title.setText("Fitting was blocked")
+            self.fit_results_status.setText(outcome.message)
             status = "Fitting was blocked by a deterministic data or resource check."
         else:
+            self.fit_results_title.setText("Analysis ended")
+            self.fit_results_status.setText(outcome.message)
             status = "Fitting ended safely. Review the run details."
         self._set_status(status)
         self.progress_bar.setValue(100 if outcome.status is not AgentFitRunStatus.STOPPED else min(99, self.progress_bar.value()))
@@ -1281,6 +2190,9 @@ class AgentWindow(QMainWindow):
         self._adjusted_roi = roi
         self._adjusted_roi_dataset_token = self._dataset_token
         self._vision_outcome = None
+        self._proposal_withdrawn = True
+        self._reset_fit_results()
+        self.spatial_roi_preview.set_preview(None, None, ())
         self._clear_evidence()
         self._add_vision_png("User-adjusted ROI on actual frame; the next run will extract a fresh spectrum.", png)
         self.plan_text.setPlainText(
@@ -1291,8 +2203,7 @@ class AgentWindow(QMainWindow):
         )
         self._set_status("Adjusted ROI saved for the next visual review; earlier spectral findings were withdrawn.")
         self._set_vision_review_visible(False)
-        self.reject_vision_button.setText("Discard adjusted ROI")
-        self.reject_vision_button.setVisible(True)
+        self.show_step_conclusions()
 
     def _discard_adjusted_roi(self) -> None:
         self._adjusted_roi = None
@@ -1303,6 +2214,9 @@ class AgentWindow(QMainWindow):
             return
         had_adjusted_roi = self._adjusted_roi is not None
         self._vision_outcome = None
+        self._proposal_withdrawn = True
+        self._reset_fit_results()
+        self.spatial_roi_preview.set_preview(None, None, ())
         self._discard_adjusted_roi()
         self.reject_vision_button.setText("Reject visual proposal")
         self._set_vision_review_visible(False)
@@ -1314,6 +2228,7 @@ class AgentWindow(QMainWindow):
         self.plan_text.setPlainText(message)
         self._show_evidence_message(message + " Start another run to review current evidence.")
         self._set_status(message)
+        self.show_step_conclusions()
 
     def _check_revision(self) -> None:
         if self._dataset_token is None:
@@ -1368,6 +2283,7 @@ class AgentWindow(QMainWindow):
         ):
             self._revision_timer.stop()
         self._update_controls()
+        self.show_step_conclusions()
 
     def _has_active_worker(self) -> bool:
         inventory = getattr(self._main_window, "_shutdown_worker_inventory", None)
@@ -1426,6 +2342,11 @@ class AgentWindow(QMainWindow):
         self.stop_button.setText(
             "Stopping…" if active and self._cancellation_requested else "Stop"
         )
+        self.start_autonomous_button.setText(
+            "Run again" if self._result is not None or self._stage != "idle"
+            else "Start Autonomous Analysis"
+        )
+        self._refresh_step_conclusions()
 
     def _update_model_readiness(self) -> None:
         settings = self._agent_settings
@@ -1451,15 +2372,26 @@ class AgentWindow(QMainWindow):
             readiness = (
                 f"OpenAI LLM: {settings.model_id}. Each run automatically sends the "
                 "metadata-only dataset summary. Eligible image-stack reviews may send "
-                "up to 7 bounded PNGs in 3 visual requests: up to 3 image previews, 1 measured "
-                "spectrum plot, and up to 3 phase-overlay plots. No full image stack or source "
+                "up to 16 bounded PNGs in 6 visual requests: up to 3 image previews for the "
+                "reference region, 1 measured spectrum plot, up to 3 phase-overlay plots, and "
+                "up to 9 repeated image previews for location selection and retries. No full image stack or source "
                 "files are sent. If the model is unavailable, the run stops with its "
                 "reason; no offline plan is substituted."
                 if configured
                 else "OpenAI LLM is not configured. Enter an exact model ID in Agent "
                 "settings. No request or visual evidence will be sent until configured."
             )
+        if settings.langsmith_tracing_enabled:
+            readiness += (
+                f" LangSmith tracing is enabled for agent '{settings.langsmith_agent_id}' "
+                f"in {settings.langsmith_environment}; "
+                "graph state and model requests and responses are included in traces. "
+                "Visual model-call traces include the bounded PNG previews sent for review."
+            )
+        else:
+            readiness += " LangSmith tracing is off."
         self.model_readiness_label.setText("Planning method: " + readiness)
+        self._refresh_step_conclusions()
 
     def open_model_settings(self) -> None:
         dialog = AgentModelSettingsDialog(
@@ -1481,12 +2413,19 @@ class AgentWindow(QMainWindow):
             deterministic_fallback=False,
         )
         resolver = None
+        langsmith_resolver = None
         if settings.mode is AgentModelMode.OPENAI_CLOUD:
             resolver = AgentCredentialResolver(
                 AgentKeyringCredentialStore(),
                 environment_allowed=settings.allow_environment_credential,
             )
+        if settings.langsmith_tracing_enabled:
+            langsmith_resolver = AgentCredentialResolver(
+                AgentKeyringCredentialStore(account_name="langsmith"),
+                environment_allowed=False,
+            )
         self._run_credential_resolver = resolver
+        self._run_langsmith_credential_resolver = langsmith_resolver
         return snapshot
 
     def show_data_preview(self) -> None:
@@ -1504,7 +2443,7 @@ class AgentWindow(QMainWindow):
             destination = (
                 "OpenAI cloud model "
                 + (settings.model_id or "(model not configured)")
-                + "; Start authorizes one canonical metadata-only planning request when eligible, plus up to 7 bounded PNGs across 3 visual requests: up to 3 image previews, 1 measured-spectrum plot and up to 3 phase-overlay plots. A no-ROI run may skip metadata planning and start visual ROI discovery directly."
+                + "; Start authorizes one canonical metadata-only planning request when eligible, plus up to 16 bounded PNGs across 6 visual requests: up to 3 reference image previews, 1 measured-spectrum plot, up to 3 phase-overlay plots, and up to 9 repeated image previews for fitting-location selection and retries. A no-ROI run may skip metadata planning and start visual ROI discovery directly."
             )
         content = [
             "Configured destination:",
@@ -1515,12 +2454,19 @@ class AgentWindow(QMainWindow):
             json.dumps(canonical_planning_schema(), indent=2),
             "",
             "Planning limits: at most 1 request per run; complete serialized body ≤ 4,096 ASCII bytes; output ≤ 384 tokens; response ≤ 4,096 bytes; HTTP timeout 10 seconds and total deadline 15 seconds.",
-            "For OpenAI mode, visual review runs automatically using the same model and key: at most 3 vision requests with at most 7 PNGs total (up to 3 measured frames + 1 ROI spectrum plot + up to 3 trusted phase-overlay plots). Each request is ≤ 4 MB, each PNG ≤ 1 MB; responses ≤ 12 KB; 45-second per-request and 150-second total visual-stage limits. A separate metadata-only planning request may run when its preflight requirements are met.",
+            "For OpenAI mode, visual review runs automatically using the same model and key: at most 6 vision requests with at most 16 PNGs total (up to 3 reference frames + 1 ROI spectrum plot + up to 3 trusted phase-overlay plots + up to 9 repeated frames for fitting locations and two retries). Each request is ≤ 4 MB, each PNG ≤ 1 MB; responses ≤ 12 KB; 45-second per-request and 270-second total visual-stage limits. A separate metadata-only planning request may run when its preflight requirements are met.",
             "The connection test is a separate user-initiated operation and sends only its fixed test payload.",
             "",
                 "This metadata planning request never contains image bytes, thumbnails, spectra or arrays, actual wavelength/intensity values, file paths or names, sample titles, free-form observations/warnings, dataset/run IDs, credentials, or local files.",
-            "Opening this preview and saving settings send nothing. Pressing Start in OpenAI mode authorizes only the disclosed metadata and bounded PNG transfers for that run. Local mode uses loopback and sends no visual evidence to OpenAI; model failure does not trigger an offline fallback.",
+            "Opening this preview and saving settings send nothing. Start sends the disclosed OpenAI data only in OpenAI mode. When LangSmith tracing is enabled, graph state and model requests and responses are uploaded; visual-call traces include bounded PNG previews. Traces may contain dataset-derived values, ROI coordinates, spectra or rendered previews. Local mode sends model requests only to loopback; model failure does not trigger an offline fallback.",
         ]
+        if settings.langsmith_tracing_enabled:
+            content.insert(
+                1,
+                f"LangSmith trace destination: agent '{settings.langsmith_agent_id}' "
+                f"in {settings.langsmith_environment}. "
+                "Graph state, model requests and responses, and bounded visual previews are uploaded.",
+            )
         if self._result is not None and not self._stale:
             try:
                 run_id = self._agent_run_id or uuid4().hex
@@ -1563,6 +2509,8 @@ class AgentWindow(QMainWindow):
         """Run existing preflight and automatically continue to read-only planning."""
         if self._has_active_worker() or self._parent_closing:
             return
+        self.show_step_conclusions()
+        self.summary_page.reset_disclosures()
         if self._adjusted_roi is not None:
             adapter = getattr(self._main_window, "scientific_observation_api", None)
             if (
@@ -1596,6 +2544,7 @@ class AgentWindow(QMainWindow):
             return
         run_id = uuid4().hex
         self._agent_run_id = run_id
+        self._proposal_withdrawn = False
         self._planning_outcome = None
         self._planning_display_text = ""
         self._vision_outcome = None
@@ -1934,6 +2883,7 @@ class AgentWindow(QMainWindow):
             roi_override=roi_override,
             require_spatial_rois=True,
             credential_resolver=self._run_credential_resolver,
+            langsmith_credential_resolver=self._run_langsmith_credential_resolver,
             cloud_egress_authorized=self._vision_run_enabled,
             parent=self._main_window,
         )
@@ -2053,8 +3003,14 @@ class AgentWindow(QMainWindow):
                     "Visual phase and edge suggestions are available, but seven spatial locations were not validated. No fitting was started."
                 )
             else:
+                pause_message = (
+                    "Model response validation failed: " + outcome.response_validation_error
+                    + " No fitting was started. Review Analysis details."
+                    if outcome.response_validation_error
+                    else outcome.message + " No fitting was started."
+                )
                 self._block_agent_fitting(
-                    "Visual review did not produce a validated provisional phase and edge list. Review the evidence; no fitting was started.",
+                    pause_message,
                     outcome,
                 )
                 self.progress_bar.setValue(100)
@@ -2106,6 +3062,7 @@ class AgentWindow(QMainWindow):
             adapter.revision_clock,
             self._run_snapshot,
             credential_resolver=self._run_credential_resolver,
+            langsmith_credential_resolver=self._run_langsmith_credential_resolver,
             parent=self._main_window,
         )
         self._planning_worker = worker
@@ -2486,7 +3443,7 @@ class AgentWindow(QMainWindow):
             self._add_evidence_text("Spectrum-only input: image controls do not apply.")
         elif result.frames:
             image = result.frames[0].image
-            candidates = ()
+            candidates: tuple[SpatialRoiCandidate, ...] = ()
             if result.roi is not None:
                 candidates = (
                     SpatialRoiCandidate(
@@ -2595,5 +3552,13 @@ class AgentWindow(QMainWindow):
         self.spatial_roi_preview.set_preview(None, None, ())
         self._revision_timer.stop()
         self._show_evidence_message("No current evidence is displayed.")
+        self._proposal_withdrawn = False
+        self._stale = False
+        if not self._has_active_worker():
+            self._stage = "idle"
+            self._cancellation_requested = False
+        self.summary_page.reset_disclosures()
+        self.show_step_conclusions()
+        self._update_controls()
         self.hide()
         event.accept()

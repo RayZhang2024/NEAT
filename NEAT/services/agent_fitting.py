@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from math import isfinite
+from typing import TypedDict
 
 import numpy as np
 
@@ -31,6 +32,7 @@ from ..domain.fitting import (
 )
 from ..domain.individual_edge import IndividualEdgeFitConfig
 from ..domain.observation import DatasetMode, ObservationStatus, RoiBounds
+from .agent_tracing import agent_langsmith_context
 from .agent_vision import trusted_phase_edges
 from .fitting_engine import FittingEngine
 from .scientific_observation import (
@@ -45,6 +47,16 @@ MAX_ROI_WIDTH = 128
 MIN_FIT_SAMPLES_REGION1 = 3
 MIN_FIT_SAMPLES_REGION2 = 3
 MIN_FIT_SAMPLES_REGION3 = 9
+
+
+class FitGraphState(TypedDict):
+    index: int
+    cells: tuple[AgentFitCellResult, ...]
+    attempted: int
+    succeeded: int
+    failed: int
+    needs_review: int
+    stopped: bool
 
 
 class AgentFitBlocked(ValueError):
@@ -412,6 +424,12 @@ def run_agent_fitting(
     *,
     cancelled: Callable[[], bool] = lambda: False,
     progress: Callable[[AgentFitProgress], None] = lambda _event: None,
+    langsmith_enabled: bool = False,
+    langsmith_api_key: str | None = None,
+    langsmith_agent_id: str = "neat-agentic-roi",
+    langsmith_environment: str = "local",
+    langsmith_region: str = "eu",
+    langsmith_workspace_id: str = "",
 ) -> AgentFitOutcome:
     """Extract seven real ROI spectra and fit each trusted edge locally once."""
     total = len(plan.spatial_rois) * len(plan.edges)
@@ -480,115 +498,170 @@ def run_agent_fitting(
             message=str(exc),
         )
 
-    cells: list[AgentFitCellResult] = []
-    attempted = succeeded = failed = needs_review = 0
-    for roi_index, (candidate, spectrum) in enumerate(zip(plan.spatial_rois, spectra)):
-        for edge_index, edge in enumerate(plan.edges):
-            handle.assert_current()
-            if cancelled():
-                cells.extend(
-                    _new_cell(plan, remaining_roi, remaining_edge, AgentFitCellState.CANCELLED,
-                              message="Stopped before this fit was attempted.")
-                    for remaining_roi in range(roi_index, len(plan.spatial_rois))
-                    for remaining_edge in (
-                        plan.edges[edge_index:] if remaining_roi == roi_index else plan.edges
-                    )
+    def fit_next(state: FitGraphState) -> dict[str, object]:
+        index = state["index"]
+        cells = list(state["cells"])
+        attempted = state["attempted"]
+        succeeded = state["succeeded"]
+        failed = state["failed"]
+        needs_review = state["needs_review"]
+        if index >= total:
+            return {"index": index, "cells": tuple(cells)}
+        handle.assert_current()
+        if cancelled():
+            cells.extend(
+                _new_cell(
+                    plan, task_index // len(plan.edges), plan.edges[task_index % len(plan.edges)],
+                    AgentFitCellState.CANCELLED,
+                    message="Stopped before this fit was attempted.",
                 )
-                return _make_outcome(
-                    plan, AgentFitRunStatus.STOPPED, tuple(cells), attempted=attempted,
-                    message="Stopped safely between individual-edge fits.",
-                )
-            running = _new_cell(
-                plan, roi_index, edge, AgentFitCellState.RUNNING,
-                message=f"Fit {attempted + 1} of {total} is running.",
+                for task_index in range(index, total)
             )
-            progress(
-                AgentFitProgress(
-                    "fit_edges",
-                    f"Fitting ROI {candidate.label}, edge {edge.hkl} · {attempted + 1}/{total} fits",
-                    total,
-                    attempted,
-                    succeeded,
-                    failed,
-                    needs_review,
-                    current_roi_index=roi_index,
-                    current_roi_label=candidate.label,
-                    current_hkl=edge.hkl,
-                    cell=running,
-                )
+            return {"index": total, "cells": tuple(cells), "stopped": True}
+
+        roi_index, edge_index = divmod(index, len(plan.edges))
+        candidate = plan.spatial_rois[roi_index]
+        spectrum = spectra[roi_index]
+        edge = plan.edges[edge_index]
+        running = _new_cell(
+            plan, roi_index, edge, AgentFitCellState.RUNNING,
+            message=f"Fit {attempted + 1} of {total} is running.",
+        )
+        progress(
+            AgentFitProgress(
+                "fit_edges",
+                f"Fitting ROI {candidate.label}, edge {edge.hkl} · {attempted + 1}/{total} fits",
+                total, attempted, succeeded, failed, needs_review,
+                current_roi_index=roi_index,
+                current_roi_label=candidate.label,
+                current_hkl=edge.hkl,
+                cell=running,
             )
-            config = IndividualEdgeFitConfig(
-                source_row=edge.source_row,
-                hkl=edge.hkl,
-                d=None,
-                # The legacy typed contract is deliberately R2, R1, then R3.
-                regions=(edge.region2, edge.region1, edge.region3),
-                s=edge.s,
-                t=edge.t,
-                eta=edge.eta,
-                is_known_phase=True,
-                structure_type=plan.structure_type,
-                lattice_params=plan.lattice_params,
-                fitting_parameter_bounds=plan.fitting_parameter_bounds,
+        )
+        config = IndividualEdgeFitConfig(
+            source_row=edge.source_row,
+            hkl=edge.hkl,
+            d=None,
+            # The legacy typed contract is deliberately R2, R1, then R3.
+            regions=(edge.region2, edge.region1, edge.region3),
+            s=edge.s,
+            t=edge.t,
+            eta=edge.eta,
+            is_known_phase=True,
+            structure_type=plan.structure_type,
+            lattice_params=plan.lattice_params,
+            fitting_parameter_bounds=plan.fitting_parameter_bounds,
+        )
+        attempted += 1
+        try:
+            assert spectrum.wavelengths is not None
+            assert spectrum.intensities is not None
+            fit_attempt = FittingEngine().fit_individual_edge(
+                spectrum.wavelengths,
+                spectrum.intensities,
+                config,
+                fix_s=False,
+                fix_t=False,
+                fix_eta=False,
             )
-            attempted += 1
-            try:
-                assert spectrum.wavelengths is not None
-                assert spectrum.intensities is not None
-                fit_attempt = FittingEngine().fit_individual_edge(
-                    spectrum.wavelengths,
-                    spectrum.intensities,
-                    config,
-                    fix_s=False,
-                    fix_t=False,
-                    fix_eta=False,
-                )
-            except Exception as exc:  # noqa: BLE001 - independent fits must fail per cell
+        except Exception as exc:  # noqa: BLE001 - independent fits must fail per cell
+            cell = _new_cell(
+                plan, roi_index, edge, AgentFitCellState.FAILED,
+                message=f"Fit failed ({type(exc).__name__}).",
+            )
+            failed += 1
+        else:
+            if fit_attempt.result is None:
+                failure_detail = fit_attempt.error_message or "Fit did not return a numerical result."
+                if fit_attempt.error_stage:
+                    failure_detail = f"{fit_attempt.error_stage}: {failure_detail}"
                 cell = _new_cell(
                     plan, roi_index, edge, AgentFitCellState.FAILED,
-                    message=f"Fit failed ({type(exc).__name__}).",
+                    attempt=fit_attempt,
+                    message=failure_detail[:400],
                 )
                 failed += 1
             else:
-                if fit_attempt.result is None:
-                    failure_detail = fit_attempt.error_message or "Fit did not return a numerical result."
-                    if fit_attempt.error_stage:
-                        failure_detail = f"{fit_attempt.error_stage}: {failure_detail}"
-                    cell = _new_cell(
-                        plan, roi_index, edge, AgentFitCellState.FAILED,
-                        attempt=fit_attempt,
-                        message=failure_detail[:400],
-                    )
-                    failed += 1
-                else:
-                    flags = _review_flags(fit_attempt.result, plan.fitting_parameter_bounds)
-                    state = AgentFitCellState.NEEDS_REVIEW if flags else AgentFitCellState.SUCCEEDED
-                    cell = _new_cell(
-                        plan, roi_index, edge, state,
-                        attempt=fit_attempt,
-                        message="Fit completed." if not flags else "Fit completed; inspect the flagged values.",
-                        review_flags=flags,
-                    )
-                    succeeded += 1
-                    needs_review += bool(flags)
-            cells.append(cell)
-            handle.assert_current()
-            progress(
-                AgentFitProgress(
-                    "fit_edges",
-                    f"ROI {candidate.label}, edge {edge.hkl}: {cell.state.value.replace('_', ' ')} · "
-                    f"{attempted}/{total} fits",
-                    total,
-                    attempted,
-                    succeeded,
-                    failed,
-                    needs_review,
-                    current_roi_index=roi_index,
-                    current_roi_label=candidate.label,
-                    current_hkl=edge.hkl,
-                    cell=cell,
+                flags = _review_flags(fit_attempt.result, plan.fitting_parameter_bounds)
+                cell_state = AgentFitCellState.NEEDS_REVIEW if flags else AgentFitCellState.SUCCEEDED
+                cell = _new_cell(
+                    plan, roi_index, edge, cell_state,
+                    attempt=fit_attempt,
+                    message="Fit completed." if not flags else "Fit completed; inspect the flagged values.",
+                    review_flags=flags,
                 )
+                succeeded += 1
+                needs_review += bool(flags)
+        cells.append(cell)
+        handle.assert_current()
+        progress(
+            AgentFitProgress(
+                "fit_edges",
+                f"ROI {candidate.label}, edge {edge.hkl}: {cell.state.value.replace('_', ' ')} · "
+                f"{attempted}/{total} fits",
+                total, attempted, succeeded, failed, needs_review,
+                current_roi_index=roi_index,
+                current_roi_label=candidate.label,
+                current_hkl=edge.hkl,
+                cell=cell,
             )
+        )
+        return {
+            "index": index + 1,
+            "cells": tuple(cells),
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "failed": failed,
+            "needs_review": needs_review,
+        }
+
+    def route_fit(state: FitGraphState) -> str:
+        return "continue" if state["index"] < total else "finish"
+
+    try:
+        from langgraph.graph import END, START, StateGraph
+    except (ImportError, OSError) as exc:
+        raise AgentFitBlocked(
+            "Local fitting requires NEAT's optional [agent] extra."
+        ) from exc
+    fit_graph = StateGraph(FitGraphState)
+    fit_graph.add_node("fit_next_cell", fit_next)
+    fit_graph.add_edge(START, "fit_next_cell")
+    fit_graph.add_conditional_edges(
+        "fit_next_cell", route_fit,
+        {"continue": "fit_next_cell", "finish": END},
+    )
+    compiled_fit_graph = fit_graph.compile()
+    with agent_langsmith_context(
+        enabled=langsmith_enabled,
+        api_key=langsmith_api_key,
+        agent_id=langsmith_agent_id,
+        environment=langsmith_environment,
+        region=langsmith_region,
+        workspace_id=langsmith_workspace_id,
+        workflow="neat_local_fitting",
+    ):
+        fit_state = compiled_fit_graph.invoke(
+            {
+                "index": 0,
+                "cells": (),
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "needs_review": 0,
+                "stopped": False,
+            },
+            config={"recursion_limit": total + 5},
+        )
+    cells = list(fit_state["cells"])
+    attempted = fit_state["attempted"]
+    failed = fit_state["failed"]
+    needs_review = fit_state["needs_review"]
+    if fit_state["stopped"]:
+        return _make_outcome(
+            plan, AgentFitRunStatus.STOPPED, tuple(cells), attempted=attempted,
+            message="Stopped safely between individual-edge fits.",
+        )
 
     status = (
         AgentFitRunStatus.COMPLETE_WITH_ISSUES

@@ -57,15 +57,33 @@ the planning worker. Evidence references are opaque allowlisted IDs such as
 `image:frame:2` and `spectrum:plot`; they never identify a file or carry the
 evidence content.
 
-LangGraph is loaded lazily from the separate `NEAT[agent]` extra. A baseline
-NEAT install can import the domain/service and open the Agent window without
-LangGraph. If a user starts analysis without the required model dependencies,
-the window reports the missing dependency; it never substitutes an offline
-plan or reports a successful LLM plan. The
-graph has no provider adapters or API-key access. Its invocation disables
-LangSmith tracing even if tracing was enabled globally for another process
-task. No graph state is persisted during ordinary runs. Tests may inject an
-in-memory checkpointer; SQLite durability and restart/resume are future work.
+LangGraph and LangSmith are loaded lazily from the separate `NEAT[agent]`
+extra. A baseline NEAT install can import the domain/service and open the Agent
+window without either dependency. If a user starts analysis without the
+required graph dependency, the window reports the missing dependency; it never
+substitutes an offline plan or reports a successful plan. The planning graph
+has no provider adapters or API-key access. The phase-comparison, visual-location
+retry, and local-fitting loops also use bounded LangGraph state graphs. No graph
+state is persisted during ordinary runs. Tests may inject an in-memory
+checkpointer; SQLite durability and restart/resume are future work.
+
+LangSmith tracing is off by default and is separately enabled in Agent
+settings. Its API key is stored in the OS keyring, separate from the Agent's
+OpenAI key. When enabled, the planning, phase-comparison, location-selection,
+and local-fitting graphs send traces to the selected LangSmith agent and
+environment using the configured regional endpoint. The first successful trace
+creates the agent automatically. A workspace ID is optional for API keys linked
+to multiple workspaces. Direct model requests are recorded as `llm` child runs
+under graph nodes; the initial reference-ROI request is an LLM run in the same
+agent. LLM runs contain the request and response, including bounded PNG previews
+for visual calls. LangSmith receives graph inputs, outputs, metadata, errors,
+and runtime information without client-side redaction; these may include
+dataset-derived values, ROI coordinates, spectra, or rendered previews. Graph
+and node names identify the workflow stages. The settings connection test
+submits one synthetic trace with a fixed test payload and records its separate
+model request as an LLM run when tracing is enabled. When
+disabled, each graph explicitly suppresses inherited LangSmith tracing settings
+from the process environment.
 
 ## Worker, revision, and shutdown rules
 
@@ -131,15 +149,20 @@ gate before fitting or physical claims can be automated.
 5. Stop during a stage, reload or clear the dataset, and close/reopen the Agent
    window. Confirm stale evidence is discarded, Stop drains safely, the window
    can be reused, and NEAT shutdown waits for worker retirement. Confirm no
-   LangSmith request, fitting, mapping, ten-second countdown, or source write.
+   LangSmith request while tracing is off (the default), fitting, mapping,
+   ten-second countdown, or source write. As a separate optional check, enable
+   LangSmith with a user-supplied key and confirm graph nodes have visible LLM
+   child runs containing the request and response, including bounded previews
+   for visual calls.
 
 ## M4 structured planner and M5A-1 visual review
 
 M4 adds a structured-output proposer behind the existing LangGraph proposal
 seam. The no-model mode requires no model, key, HTTP client, or cloud access;
 starting autonomous analysis in that mode reports that no LLM is configured.
-Optional `NEAT[agent-llm]` adds the HTTPX transport, OS keyring integration,
-and LangGraph dependency. The RAG Assistant
+Optional `NEAT[agent]` adds LangGraph, LangSmith, and OS keyring integration.
+`NEAT[agent-llm]` adds the bounded HTTPX model transport alongside those
+dependencies. The RAG Assistant
 settings file and `NEAT AI Assistant` keyring service are never read by the
 Agent. Agent model selection is stored separately in the user's
 `NEAT/agent_model_settings.json`; secrets use the separate `NEAT AI Agent`
@@ -205,11 +228,33 @@ not to store the request but does not guarantee zero provider-side retention.
 A stopped run requests transport cancellation and remains owned until its
 tracked worker retires.
 
-Every M4 planner run disables LangSmith tracing. The model provider and
-LangSmith are separate network recipients; the Agent sends no LangSmith
-requests. No prompt, key, raw model output, or request payload is logged. Model
-failures or rejected output end the planning stage with a reason. No deterministic
-offline plan is substituted for a failed LLM response.
+Visual explanations use separate bounds: `reason` permits 2,048 characters,
+each `edge_reasons` entry permits 512, and short text entries permit 240.
+The system instructions and response-schema descriptions communicate these
+limits; local validation checks them after normalizing ordinary whitespace.
+An over-limit explanation is rejected explicitly, never silently truncated.
+The existing 12,000-byte response cap and three-request budget still apply.
+Analysis details show the exact sanitized validation error and any allowlisted
+phase proposed but not accepted. The fitting status distinguishes a response
+validation failure from an uncertain scientific comparison. Rejected model
+content is not echoed in diagnostics, and no extra model request is made.
+
+Adjusting or rejecting a visual proposal withdraws its fit plan, outcome,
+matrix cells, curves, numeric summary, and selectable spatial ROI overlay.
+Dataset invalidation also clears the numeric summary. An invalid ROI edit
+leaves the current evidence intact until a valid adjustment is previewed.
+Spatial overlays project half-open original-pixel bounds outwards into
+preview pixels before converting to inclusive drawing bounds. This keeps
+valid subpixel ROIs drawable without changing their extraction coordinates;
+rejected rectangles remain rejected even when clipped for display.
+
+M4 planner graph runs use the same explicit LangSmith opt-in. The model
+provider and LangSmith are separate network recipients. When tracing is
+enabled, the structured planning request and response appear as an LLM run
+under the planning node. Graph inputs, outputs, metadata, errors, and runtime
+information are uploaded without client-side redaction; these may contain
+dataset-derived values. Model failures or rejected output end the planning stage with a reason.
+No deterministic offline plan is substituted for a failed LLM response.
 
 ## M4 manual smoke test (optional, no live key needed for CI)
 
@@ -225,7 +270,8 @@ offline plan is substituted for a failed LLM response.
    user-supplied OpenAI key in the Agent keyring, choose an exact model ID, and
    inspect **Preview Data Sent**. Starting analysis in OpenAI mode sends the
    disclosed minimized summary and bounded visual evidence for image stacks.
-   Use only data authorized for this transfer. No LangSmith key is required.
+   Use only data authorized for this transfer. LangSmith remains off unless
+   separately enabled in Agent settings.
 4. Do not treat the plan as scientific interpretation or execution. Confirm
    incomplete preflight stops LLM planning with a reason and no offline substitute,
    and verify no fitting, mapping, report generation, phase identification, or

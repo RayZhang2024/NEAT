@@ -11,7 +11,9 @@ from ..domain.agent_fitting import (
     AgentFitPlan,
     AgentFitRunStatus,
 )
+from ..domain.agent_model import AgentModelSettings
 from ..services.agent_fitting import AgentFitBlocked, run_agent_fitting
+from ..services.agent_model import AgentCredentialResolver, AgentModelError
 from ..services.scientific_observation import ScientificDatasetHandle, StaleDatasetError
 
 
@@ -26,6 +28,8 @@ class AgentFitWorker(QThread):
         handle: ScientificDatasetHandle,
         plan: AgentFitPlan,
         *,
+        agent_settings: AgentModelSettings | None = None,
+        langsmith_credential_resolver: AgentCredentialResolver | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -34,6 +38,8 @@ class AgentFitWorker(QThread):
         self.revision = plan.revision
         self._handle: ScientificDatasetHandle | None = handle
         self._plan: AgentFitPlan | None = plan
+        self._agent_settings = agent_settings or AgentModelSettings()
+        self._langsmith_credential_resolver = langsmith_credential_resolver
         self._cancel = Event()
 
     def stop(self) -> None:
@@ -45,11 +51,26 @@ class AgentFitWorker(QThread):
         if handle is None or plan is None:
             return
         try:
+            langsmith_api_key = None
+            if (
+                self._agent_settings.langsmith_tracing_enabled
+                and self._langsmith_credential_resolver is not None
+            ):
+                try:
+                    langsmith_api_key = self._langsmith_credential_resolver.get()
+                except AgentModelError:
+                    langsmith_api_key = None
             outcome = run_agent_fitting(
                 handle,
                 plan,
                 cancelled=self._cancel.is_set,
                 progress=self.progress.emit,
+                langsmith_enabled=self._agent_settings.langsmith_tracing_enabled,
+                langsmith_api_key=langsmith_api_key,
+                langsmith_agent_id=self._agent_settings.langsmith_agent_id,
+                langsmith_environment=self._agent_settings.langsmith_environment,
+                langsmith_region=self._agent_settings.langsmith_region,
+                langsmith_workspace_id=self._agent_settings.langsmith_workspace_id,
             )
         except StaleDatasetError:
             outcome = AgentFitOutcome(

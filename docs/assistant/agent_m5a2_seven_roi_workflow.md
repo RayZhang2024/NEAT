@@ -2,11 +2,14 @@
 
 ## Feasibility and reuse
 
-M5A-1 already captures at most three representative, bounded image previews in
-its `sample_roi` request. This request can return the reference ROI and six
-additional spatial ROIs without another upload or request. The same visual
-workflow extracts the reference spectrum, compares trusted phase overlays, and
-returns provisional phase/HKL choices. A local fitting worker can then call the
+M5A-1 captures at most three representative, bounded image previews to choose
+a reference ROI. Its measured spectrum is used to compare trusted phase overlays
+and propose provisional phase/HKL choices. Only after that comparison does the
+visual workflow choose six additional fitting locations. Uncertain or invalid
+locations trigger up to two bounded replacement attempts; previously accepted
+locations stay fixed, and a replacement must use different coordinates. If a
+safe set of seven still cannot be found, fitting pauses. A local fitting worker
+can then call the
 read-only observation API for each ROI and reuse
 `FittingEngine.fit_individual_edge()` without accessing Qt widgets or changing
 the main fitting tab.
@@ -20,38 +23,51 @@ checks, and retirement tracking.
 ## User journey and layout
 
 One click starts dataset preflight, bounded M5A-1 visual inspection, seven-ROI
-validation, seven spectrum extractions, and every selected edge fit. No routine
-confirmation is inserted between stages. The top action/status strip remains
-visible while the resizable horizontal overview/evidence splitter is used for
-the results matrix and selected scientific evidence.
+validation, seven spectrum extractions, and every selected edge fit. The
+planning, phase-comparison, location-retry, and per-cell fitting stages are
+bounded LangGraph workflows that preserve cancellation and dataset-revision
+checks. No routine
+confirmation is inserted between stages. The default screen shows four short
+conclusions; evidence, the matrix and parameters are disclosed on request.
+Start/Run again, Stop and progress remain outside the content pages.
 
 ```text
-NEAT AI Agent — seven-location fitting
-[ Start Autonomous Analysis ] [ Stop ] [progress]    Fitting ROI C, edge (200) · 11/21
-Dataset/model status · Provisional phase · 7 locations · 3 edges
+NEAT / AI analysis
+Analysis complete
+Here is what each step found.
 
-OVERVIEW / RESULTS                         VISUAL EVIDENCE
-Agent settings · Preview model data        One actual frame with Reference and A–F labels
-Dataset summary · fit counts               Selected ROI/HKL fit curves and residuals
-ROI × HKL status matrix (7 × 1–5)          Existing image, spectrum and phase evidence
-Reference | queued | queued | ...
-A         | done   | done   | ...
-...                                        [Analysis details, collapsed by default]
+1 Dataset check       Dataset is ready for exploration
+2 Phase comparison    Provisional match: Fe_bcc
+3 Sample locations    7 sample locations selected
+4 Local fitting       21 fits completed · 1 needs review
+
+                        [View all results] [Review 1 flagged fit]
+Exploratory analysis · physical interpretation needs separate validation.
+Model/transfer disclosure     [Agent settings] [Data sent]
+                                                      [Run again]
 ```
 
-The sample image is a single actual representative preview with original-pixel
-ROI mapping. Each outline has a text label; colour alone does not encode ROI
-identity. The compact matrix is
-keyboard-selectable and selecting a cell updates the one detail view on demand.
-The default selection is the first failed or needs-review cell, otherwise the
-Reference ROI and first selected edge. Long covariance and error details stay
-collapsed until requested.
+Clicking a step expands a short evidence explanation. Inspect evidence opens
+only that step: dataset checks and warnings, the sample-location preview and
+ROI controls, phase-comparison overlays, or the local fit matrix and curves.
+The Step conclusions button returns to the summary. View all results and Show
+fit details open the same fit-only matrix and plot view. Review flagged fits
+first opens a concise reason and ROI/HKL identity. Multiple flagged fits can be
+traversed without marking them accepted or changing fitting settings.
 
-At 1280×820 the horizontal splitter gives useful room to both matrix and
-evidence. At 820×520 the top controls and status stay fixed; the overview can
-scroll vertically, the evidence area uses a vertically resizable image/plot
-splitter, and technical detail remains collapsed until requested. Critical
-stage, Stop, and selected-cell status do not depend on colour alone.
+The sample-location preview uses original-pixel mapping and text ROI labels.
+Selecting a fit-matrix cell changes its linked fit evidence. The matrix uses
+fixed row heights so all seven rows fit; evidence from other steps is hidden in
+the fit-only view. At 820×520 the summary scrolls as a single page and the
+shared action controls stay visible.
+Matrix cells show fit status; numerical values and the legacy `d_fit` convention
+are shown in the selected result and its tooltip rather than as unlabelled cell
+numbers. Column headers name the HKL and theoretical wavelength on separate lines.
+
+Conclusions are derived from captured result objects, not guessed from progress
+percentages or model prose. Limited data is labelled as limited, cancelled runs
+as stopped, and blocked runs as needing attention. Withdrawn proposals clear
+their result/review presentation. Dataset changes invalidate all four conclusions.
 
 ## Run states
 
@@ -59,8 +75,9 @@ stage, Stop, and selected-cell status do not depend on colour alone.
   proposed fit is implied.
 - **Running:** Show the actual stage and worker-reported fit count. Keep Stop
   visible and prevent overlapping runs.
-- **Completed:** Show the seven-ROI matrix and selected fit evidence. Label phase
-  provisional and fitted `d_fit` as a legacy numerical convention.
+- **Completed:** Show four step conclusions. Offer results and flagged-fit
+  review on request. Label phase provisional and fitted `d_fit` as a legacy
+  numerical convention in the detailed view.
 - **Completed with issues:** Preserve independent successes; failed or
   unavailable combinations remain individually marked with actionable detail.
 - **Needs input / blocked:** Show actual proposed/rejected locations and a short
@@ -75,10 +92,27 @@ stage, Stop, and selected-cell status do not depend on colour alone.
 
 ## Privacy and scientific scope
 
-The existing M5A-1 preview request count, image count, byte limits, consent and
-disclosure remain unchanged. No local spectra, fitted curves, parameters or
-results are sent to a model. Input images, fitting-tab controls, saved
+The OpenAI disclosure permits at most six visual requests and sixteen bounded
+PNG transfers, including repeated previews for location selection and retries.
+Per-request byte limits and run authorization still apply. The measured
+reference-spectrum plot is sent for phase comparison; fitted curves, parameters,
+and results are not sent to a model. Input images, fitting-tab controls, saved
 configurations, and source files are not modified. This is seven-location
 exploratory fitting; it does not create a map or validated phase, strain, stress,
 or physical d-spacing result. The existing `d_fit` convention caveats remain
 visible beside results.
+
+LangSmith tracing is separately opt-in in Agent settings and off by default.
+When enabled, graph stages are traced and each direct model request is added as
+an LLM run under its graph node where applicable. LLM runs include the request
+and response; visual calls include the bounded PNG previews sent for review.
+The traces go to the selected LangSmith agent and environment. The API key is stored in the OS keyring. The
+agent is created by LangSmith on its first trace. Select the region that matches
+the API key's workspace; a workspace ID is optional for keys linked to multiple
+workspaces. The settings connection test sends one synthetic trace with a fixed
+payload and records its separate model request as an LLM run when tracing is
+enabled. When tracing is enabled, graph state, model prompts and responses,
+metadata, errors, and runtime information are uploaded without client-side
+redaction. Trace data may include dataset-derived values, ROI coordinates,
+spectra, or rendered previews. Turning tracing off explicitly suppresses inherited LangSmith
+environment settings.

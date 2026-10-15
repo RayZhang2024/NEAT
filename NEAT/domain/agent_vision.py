@@ -61,6 +61,9 @@ class VisionOutcome:
     display_interval_diagnostic: str = ""
     spatial_roi_candidates: tuple[SpatialRoiCandidate, ...] = ()
     spatial_rois_png: bytes | None = None
+    # Diagnostic only: a model identifier that did not pass the full review.
+    proposed_phase_id: str = ""
+    response_validation_error: str = ""
 
 
 __all__ = ["SpatialRoiCandidate", "VisionOutcome", "VisionStatus"]

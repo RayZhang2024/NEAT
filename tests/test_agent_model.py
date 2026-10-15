@@ -215,6 +215,11 @@ class AgentModelPayloadTests(unittest.TestCase):
             mode=AgentModelMode.OPENAI_CLOUD,
             model_id="user-selected-model",
             allow_environment_credential=False,
+            langsmith_tracing_enabled=True,
+            langsmith_agent_id="neat-local-test",
+            langsmith_environment="development",
+            langsmith_region="eu",
+            langsmith_workspace_id="workspace-test-id",
         )
         writes = []
         with (
@@ -227,11 +232,30 @@ class AgentModelPayloadTests(unittest.TestCase):
         self.assertIn("user-selected-model", saved)
         self.assertNotIn("secret", saved.lower())
         self.assertNotIn("api_key", saved.lower())
+        self.assertEqual(json.loads(saved)["schema_version"], 3)
         with (
             patch.object(Path, "exists", return_value=True),
             patch.object(Path, "read_text", return_value=saved),
         ):
             self.assertEqual(repository.load(), settings)
+
+    def test_legacy_settings_load_with_langsmith_disabled_by_default(self):
+        legacy = json.dumps({
+            "schema_version": 1,
+            "mode": "openai_cloud",
+            "model_id": "user-selected-model",
+            "endpoint": "",
+            "allow_environment_credential": False,
+        })
+        repository = AgentModelSettingsRepository(Path("legacy_agent_model_settings.json"))
+        with (
+            patch.object(Path, "exists", return_value=True),
+            patch.object(Path, "read_text", return_value=legacy),
+        ):
+            loaded = repository.load()
+        self.assertFalse(loaded.langsmith_tracing_enabled)
+        self.assertEqual(loaded.langsmith_agent_id, "neat-agentic-roi")
+        self.assertEqual(loaded.langsmith_region, "eu")
 
     def test_keyring_namespace_and_opt_in_environment_fallback_are_isolated(self):
         accesses = []
