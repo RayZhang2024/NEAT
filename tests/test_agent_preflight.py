@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from NEAT.domain.agent_fitting import AgentFitCellState
 from NEAT.domain.agent_model import (
     AgentModelMode,
     AgentModelSettings,
@@ -277,7 +278,7 @@ class AgentPreflightTests(unittest.TestCase):
             )
 
         self.assertEqual(self.window._fit_outcome.status, AgentFitRunStatus.COMPLETE)
-        self.assertEqual((self.window._fit_outcome.total_fits, self.window._fit_outcome.attempted), (7, 7))
+        self.assertEqual((self.window._fit_outcome.total_fits, self.window._fit_outcome.attempted), (49, 49))
         self.assertEqual(self.window.fit_matrix.rowCount(), 7)
         self.assertEqual(self.window.fit_matrix.columnCount(), 1)
         self.assertEqual(len(self.window.spatial_roi_preview._candidates), 7)
@@ -285,20 +286,44 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(self.window.summary_page.heading.text(), "Analysis complete")
         self.assertIn("Fe_bcc", self.window.summary_page.rows[1].conclusion_label.text())
         self.assertIn("7 sample locations", self.window.summary_page.rows[2].conclusion_label.text())
-        self.assertEqual(self.window.summary_page.rows[3].conclusion_label.text(), "7 fits completed")
+        self.assertEqual(
+            self.window.summary_page.rows[3].conclusion_label.text(),
+            "49 fits attempted across 7 sizes",
+        )
         self.assertFalse(self.window.summary_page.review_button.isVisible())
         self.assertFalse(self.window.fit_matrix.isVisible())
         self.window.summary_page.results_button.click()
         self.assertTrue(self.window.fit_matrix.isVisible())
-        self.assertIn("7/7 attempted", self.window.fit_matrix_summary.text())
+        self.assertIn("49/49 attempted", self.window.fit_matrix_summary.text())
         self.assertIn("d_fit", self.window.fit_detail_label.text())
+        baseline_cell = next(
+            cell for cell in self.window._fit_outcome.cells
+            if cell.roi_index == 0 and cell.size_index == 3
+        )
         self.assertIs(
             self.window.fit_curve_widgets[0]._curve,
-            self.window._fit_outcome.cells[0].attempt.region1,
+            baseline_cell.attempt.region1,
         )
         self.window.fit_matrix.setCurrentCell(3, 0)
         self.app.processEvents(QEventLoop.AllEvents, 10)
-        self.assertIn("C · edge", self.window.fit_detail_label.text())
+        self.assertIn("ROI C ·", self.window.fit_detail_label.text())
+        self.assertEqual(self.window.fit_size_combo.count(), 7)
+        small_size_cell = next(
+            cell for cell in self.window._fit_outcome.cells
+            if cell.roi_index == 3 and cell.size_index == 0
+        )
+        self.window.fit_size_combo.setCurrentIndex(0)
+        self.app.processEvents(QEventLoop.AllEvents, 10)
+        self.assertIn(
+            f"{small_size_cell.macro_pixel_width} × {small_size_cell.macro_pixel_height} px",
+            self.window.fit_selected_heading.text(),
+        )
+        self.assertEqual(
+            self.window.fit_results_roi_preview._candidates[3].roi,
+            small_size_cell.roi,
+        )
+        self.window.fit_size_combo.setCurrentIndex(3)
+        self.app.processEvents(QEventLoop.AllEvents, 10)
         self.assertTrue(self.window.start_autonomous_button.isEnabled())
         self.assertFalse(self.window.stop_button.isVisible())
         self.assertIs(self.host.images, images)
@@ -437,7 +462,7 @@ class AgentPreflightTests(unittest.TestCase):
 
         self.assertEqual(self.window._fit_outcome.status, AgentFitRunStatus.STOPPED)
         self.assertEqual(self.window._fit_outcome.attempted, 1)
-        self.assertEqual(self.window._fit_outcome.cancelled, 6)
+        self.assertEqual(self.window._fit_outcome.cancelled, 48)
         self.assertEqual(self.window._stage, "cancelled")
         self.assertIn("stopped", self.window.status_label.text().lower())
         self.assertIsNone(worker._handle)
@@ -478,24 +503,32 @@ class AgentPreflightTests(unittest.TestCase):
 
         outcome = self.window._fit_outcome
         self.assertEqual(outcome.status, AgentFitRunStatus.COMPLETE_WITH_ISSUES)
-        self.assertEqual((outcome.attempted, outcome.succeeded, outcome.failed), (7, 6, 1))
-        self.assertEqual(self.window.fit_matrix.item(0, 0).text(), "Failed")
+        self.assertEqual((outcome.attempted, outcome.succeeded, outcome.failed), (49, 48, 1))
+        failed_cell = next(cell for cell in outcome.cells if cell.state is AgentFitCellState.FAILED)
+        self.assertEqual(
+            self.window.fit_matrix.item(failed_cell.roi_index, 0).text(), "Failed"
+        )
         self.assertIn("1 failed", self.window.fit_matrix_summary.text())
         self.assertIn("1 failed", self.window.summary_page.rows[3].conclusion_label.text())
         self.window.summary_page.review_button.click()
         self.assertTrue(self.window.review_page.isVisible())
-        self.assertIn("Reference", self.window.review_identity.text())
+        self.assertIn(f"{failed_cell.roi_label}", self.window.review_identity.text())
         self.assertTrue(self.window.review_reason.text())
         self.assertFalse(self.window.fit_matrix.isVisible())
         self.window.inspect_flagged_button.click()
         self.assertTrue(self.window.fit_matrix.isVisible())
         self.assertIn("Region 3 fit", self.window.fit_detail_label.text())
-        self.window.fit_matrix.setCurrentCell(1, 0)
+        successful_cell = next(
+            cell for cell in outcome.cells
+            if cell.roi_index == 1 and cell.size_index == failed_cell.size_index
+            and cell.state is AgentFitCellState.SUCCEEDED
+        )
+        self.window.fit_matrix.setCurrentCell(successful_cell.roi_index, 0)
         self.app.processEvents(QEventLoop.AllEvents, 10)
         self.assertIn("d_fit", self.window.fit_detail_label.text())
         self.assertIs(
             self.window.fit_curve_widgets[0]._curve,
-            outcome.cells[1].attempt.region1,
+            successful_cell.attempt.region1,
         )
 
     def test_ambiguous_spatial_proposal_blocks_all_fits(self):

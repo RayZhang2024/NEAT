@@ -19,6 +19,8 @@ from NEAT.domain.observation import DatasetMode, DatasetRevisionClock, RoiBounds
 from NEAT.services.agent_fitting import (
     AgentFitBlocked,
     build_agent_fit_plan,
+    build_macro_pixel_sizes,
+    roi_for_macro_pixel_size,
     run_agent_fitting,
     validate_spatial_roi_candidates,
 )
@@ -30,13 +32,13 @@ from NEAT.services.scientific_observation import (
 )
 
 ROI_BOUNDS = (
-    RoiBounds(0, 10, 0, 10),
-    RoiBounds(15, 25, 0, 10),
-    RoiBounds(30, 40, 0, 10),
-    RoiBounds(45, 55, 0, 10),
-    RoiBounds(0, 10, 15, 25),
-    RoiBounds(15, 25, 15, 25),
-    RoiBounds(30, 40, 15, 25),
+    RoiBounds(6, 14, 6, 14),
+    RoiBounds(31, 39, 6, 14),
+    RoiBounds(56, 64, 6, 14),
+    RoiBounds(6, 14, 31, 39),
+    RoiBounds(31, 39, 31, 39),
+    RoiBounds(56, 64, 31, 39),
+    RoiBounds(31, 39, 56, 64),
 )
 
 
@@ -44,7 +46,7 @@ def _make_run(edge_count: int = 3):
     wavelengths = np.linspace(0.5, 5.0, 800)
     images = []
     for frame_index in range(wavelengths.size):
-        image = np.zeros((60, 60), dtype=np.float32)
+        image = np.zeros((75, 75), dtype=np.float32)
         for roi_index, roi in enumerate(ROI_BOUNDS):
             image[roi.y_min : roi.y_max, roi.x_min : roi.x_max] = (
                 roi_index + frame_index / 100.0
@@ -126,6 +128,35 @@ def _successful_attempt(config):
 
 
 class AgentFittingTests(TestCase):
+    def test_macro_pixel_size_series_uses_requested_rounding_and_rectangles(self):
+        expected_square = ((6, 6), (8, 8), (10, 10), (13, 13), (17, 17), (21, 21), (26, 26))
+        sizes = build_macro_pixel_sizes(13, 13)
+        self.assertEqual(tuple((item.width, item.height) for item in sizes), expected_square)
+        self.assertEqual(tuple(item.scale_level for item in sizes), (-3, -2, -1, 0, 1, 2, 3))
+
+        rectangular = build_macro_pixel_sizes(13, 8)
+        self.assertEqual(
+            tuple((item.width, item.height) for item in rectangular),
+            ((6, 4), (8, 5), (10, 6), (13, 8), (17, 10), (21, 13), (26, 16)),
+        )
+
+    def test_macro_pixel_size_series_rejects_nonpositive_or_rounded_duplicates(self):
+        for dimensions in ((0, 13), (13, -1), (3, 3)):
+            with self.subTest(dimensions=dimensions), self.assertRaises(AgentFitBlocked):
+                build_macro_pixel_sizes(*dimensions)
+
+    def test_scaled_boxes_keep_each_location_center_with_at_most_half_pixel_rounding(self):
+        _plan_handle, plan, _clock = _make_run(1)
+        for candidate in plan.spatial_rois:
+            original = candidate.roi
+            self.assertIsNotNone(original)
+            for size in plan.macro_pixel_sizes:
+                scaled = roi_for_macro_pixel_size(original, size)
+                self.assertEqual((scaled.width, scaled.height), (size.width, size.height))
+                self.assertLessEqual(abs((scaled.x_min + scaled.x_max - original.x_min - original.x_max) / 2), 0.5)
+                self.assertLessEqual(abs((scaled.y_min + scaled.y_max - original.y_min - original.y_max) / 2), 0.5)
+            self.assertEqual(roi_for_macro_pixel_size(original, plan.macro_pixel_sizes[3]), original)
+
     def test_plan_uses_seven_distinct_spatial_rois_and_trusted_windows(self):
         handle, plan, _clock = _make_run()
         validated = validate_spatial_roi_candidates(plan.spatial_rois, handle.image_shape)
@@ -153,15 +184,16 @@ class AgentFittingTests(TestCase):
                 SpatialRoiCandidate("F", ROI_BOUNDS[-2], "overlap", "high"),
             ),
             plan.spatial_rois[:6] + (
-                SpatialRoiCandidate("F", RoiBounds(55, 65, 15, 25), "outside", "high"),
+                SpatialRoiCandidate("F", RoiBounds(70, 80, 56, 66), "outside", "high"),
             ),
         )
+        handle, _plan, _clock = _make_run()
         for candidates in variants:
             with (
                 self.subTest(candidates=candidates[-1]),
                 self.assertRaises(AgentFitBlocked),
             ):
-                validate_spatial_roi_candidates(candidates, (60, 60))
+                validate_spatial_roi_candidates(candidates, handle.image_shape)
 
     def test_three_edges_fit_all_seven_rois_using_legacy_window_order_and_free_shape(self):
         handle, plan, _clock = _make_run(3)
@@ -178,9 +210,12 @@ class AgentFittingTests(TestCase):
             outcome = run_agent_fitting(handle, plan, progress=progress.append)
 
         self.assertEqual(outcome.status, AgentFitRunStatus.COMPLETE)
-        self.assertEqual((outcome.total_fits, outcome.attempted, outcome.succeeded), (21, 21, 21))
-        self.assertEqual(len(calls), 21)
-        self.assertEqual(len({(cell.roi_label, cell.hkl) for cell in outcome.cells}), 21)
+        self.assertEqual((outcome.total_fits, outcome.attempted, outcome.succeeded), (147, 147, 147))
+        self.assertEqual(len(calls), 147)
+        self.assertEqual(
+            len({(cell.roi_label, cell.size_index, cell.hkl) for cell in outcome.cells}),
+            147,
+        )
         for _wavelengths, _intensities, config, kwargs in calls:
             edge = next(edge for edge in plan.edges if edge.hkl == config.hkl)
             self.assertEqual(config.window(0), (edge.region2.min_wavelength, edge.region2.max_wavelength))
@@ -188,14 +223,26 @@ class AgentFittingTests(TestCase):
             self.assertEqual(config.window(2), (edge.region3.min_wavelength, edge.region3.max_wavelength))
             self.assertEqual(kwargs, {"fix_s": False, "fix_t": False, "fix_eta": False})
         expected_reference = get_roi_spectrum(handle, ROI_BOUNDS[0]).intensities
-        np.testing.assert_array_equal(calls[0][1], expected_reference)
+        call_index = 0
+        baseline_reference_call = None
+        for size_index, size in enumerate(plan.macro_pixel_sizes):
+            for candidate in plan.spatial_rois:
+                scaled_roi = roi_for_macro_pixel_size(candidate.roi, size)
+                expected_spectrum = get_roi_spectrum(handle, scaled_roi).intensities
+                for _edge in plan.edges:
+                    np.testing.assert_allclose(calls[call_index][1], expected_spectrum, atol=1e-6)
+                    if size_index == 3 and candidate.label == "Reference":
+                        baseline_reference_call = calls[call_index][1]
+                    call_index += 1
+        self.assertEqual(call_index, len(calls))
+        np.testing.assert_allclose(baseline_reference_call, expected_reference, atol=1e-6)
         np.testing.assert_allclose(expected_reference, np.arange(800) / 100.0, atol=2e-6)
         self.assertTrue(all(not frame.flags.writeable for frame in handle.frames))
         for before, after in zip(source_snapshot, handle.frames):
             np.testing.assert_array_equal(before, after)
-        self.assertTrue(any(event.attempted == 21 for event in progress))
+        self.assertTrue(any(event.attempted == 147 for event in progress))
 
-    def test_five_edges_are_bounded_to_thirty_five_attempts(self):
+    def test_five_edges_run_every_safe_location_size_combination(self):
         handle, plan, _clock = _make_run(5)
         calls = []
 
@@ -207,7 +254,7 @@ class AgentFittingTests(TestCase):
         with patch("NEAT.services.agent_fitting.FittingEngine", return_value=engine):
             outcome = run_agent_fitting(handle, plan)
 
-        self.assertEqual((outcome.total_fits, outcome.attempted, len(calls)), (35, 35, 35))
+        self.assertEqual((outcome.total_fits, outcome.attempted, len(calls)), (245, 245, 245))
         self.assertEqual(outcome.status, AgentFitRunStatus.COMPLETE)
 
     def test_duplicate_edge_is_rejected_before_local_fit(self):
@@ -236,8 +283,36 @@ class AgentFittingTests(TestCase):
             outcome = run_agent_fitting(handle, plan)
 
         self.assertEqual(outcome.status, AgentFitRunStatus.COMPLETE_WITH_ISSUES)
-        self.assertEqual((outcome.attempted, outcome.succeeded, outcome.failed), (7, 6, 1))
-        self.assertEqual(outcome.cells[1].state, AgentFitCellState.FAILED)
+        self.assertEqual((outcome.attempted, outcome.succeeded, outcome.failed), (49, 48, 1))
+        failed_cells = [cell for cell in outcome.cells if cell.state is AgentFitCellState.FAILED]
+        self.assertEqual(len(failed_cells), 1)
+        self.assertIn("synthetic failure", failed_cells[0].message)
+
+    def test_out_of_bounds_scaled_boxes_are_skipped_without_stopping_safe_combinations(self):
+        handle, plan, _clock = _make_run(1)
+        shifted_reference = replace(
+            plan.spatial_rois[0],
+            roi=RoiBounds(1, 9, 6, 14),
+            proposed_coordinates=(1, 9, 6, 14),
+        )
+        plan = replace(plan, spatial_rois=(shifted_reference,) + plan.spatial_rois[1:])
+        calls = []
+
+        def fit(_wavelengths, _intensities, config, **_kwargs):
+            calls.append(config.hkl)
+            return _successful_attempt(config)
+
+        engine = type("FitSpy", (), {"fit_individual_edge": staticmethod(fit)})()
+        with patch("NEAT.services.agent_fitting.FittingEngine", return_value=engine):
+            outcome = run_agent_fitting(handle, plan)
+
+        self.assertEqual(outcome.total_fits, 49)
+        self.assertEqual((outcome.attempted, outcome.skipped, len(calls)), (47, 2, 47))
+        self.assertEqual(outcome.status, AgentFitRunStatus.COMPLETE_WITH_ISSUES)
+        skipped = [cell for cell in outcome.cells if cell.state is AgentFitCellState.SKIPPED]
+        self.assertEqual({cell.size_index for cell in skipped}, {5, 6})
+        self.assertTrue(all(cell.roi_label == "Reference" for cell in skipped))
+        self.assertTrue(all("extends outside the image" in cell.message for cell in skipped))
 
     def test_stop_is_checked_between_fits_and_marks_unattempted_cells(self):
         handle, plan, _clock = _make_run(3)
@@ -257,7 +332,7 @@ class AgentFittingTests(TestCase):
 
         self.assertEqual(outcome.status, AgentFitRunStatus.STOPPED)
         self.assertEqual(outcome.attempted, 2)
-        self.assertEqual(outcome.cancelled, 19)
+        self.assertEqual(outcome.cancelled, 145)
         self.assertEqual(len(calls), 2)
 
     def test_dataset_invalidation_during_a_fit_aborts_stale_evidence(self):

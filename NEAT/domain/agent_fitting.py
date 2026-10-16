@@ -15,7 +15,8 @@ from .observation import RoiBounds
 
 MAX_SPATIAL_ROIS = 7
 MAX_SELECTED_EDGES = 5
-MAX_AUTONOMOUS_FITS = MAX_SPATIAL_ROIS * MAX_SELECTED_EDGES
+MACRO_PIXEL_SIZE_LEVELS = 3
+MACRO_PIXEL_SCALE_FACTOR = 1.25
 MAX_STORED_FIT_CURVE_POINTS = 1_000_000
 SPATIAL_ROI_LABELS = ("Reference", "A", "B", "C", "D", "E", "F")
 
@@ -37,6 +38,19 @@ class AgentFitRunStatus(str, Enum):
     STOPPED = "stopped"
     STALE = "stale"
     FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class AgentMacroPixelSize:
+    """One deterministic macro-pixel size in the seven-level sweep."""
+
+    scale_level: int
+    width: int
+    height: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.width} × {self.height} px"
 
 
 @dataclass(frozen=True)
@@ -86,10 +100,12 @@ class AgentFitPlan:
     fitting_parameter_bounds: FittingParameterBounds = field(
         default_factory=FittingParameterBounds
     )
+    macro_pixel_sizes: tuple[AgentMacroPixelSize, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "spatial_rois", tuple(self.spatial_rois))
         object.__setattr__(self, "edges", tuple(self.edges))
+        object.__setattr__(self, "macro_pixel_sizes", tuple(self.macro_pixel_sizes))
         object.__setattr__(self, "lattice_params", MappingProxyType(dict(self.lattice_params)))
         if not isinstance(self.fitting_parameter_bounds, FittingParameterBounds):
             raise TypeError("Fitting bounds must be FittingParameterBounds.")
@@ -97,16 +113,19 @@ class AgentFitPlan:
 
 @dataclass(frozen=True)
 class AgentFitCellResult:
-    """Fit state and actual numerical evidence for one ROI × HKL cell."""
+    """Fit state and numerical evidence for one location × size × HKL cell."""
 
     roi_index: int
     roi_label: str
-    roi: RoiBounds
+    roi: RoiBounds | None
     hkl: HKL
     state: AgentFitCellState
     attempt: IndividualEdgeFitAttempt | None = None
     message: str = ""
     review_flags: tuple[str, ...] = ()
+    size_index: int = 3
+    macro_pixel_width: int = 0
+    macro_pixel_height: int = 0
 
 
 @dataclass(frozen=True)
@@ -122,6 +141,10 @@ class AgentFitProgress:
     current_roi_label: str = ""
     current_hkl: HKL | None = None
     cell: AgentFitCellResult | None = None
+    completed: int = 0
+    current_size_index: int | None = None
+    current_macro_pixel_width: int | None = None
+    current_macro_pixel_height: int | None = None
 
 
 @dataclass(frozen=True)
@@ -141,10 +164,12 @@ class AgentFitOutcome:
     skipped: int
     cancelled: int
     message: str = ""
+    macro_pixel_sizes: tuple[AgentMacroPixelSize, ...] = ()
 
 
 __all__ = [
-    "MAX_AUTONOMOUS_FITS",
+    "MACRO_PIXEL_SCALE_FACTOR",
+    "MACRO_PIXEL_SIZE_LEVELS",
     "MAX_SELECTED_EDGES",
     "MAX_SPATIAL_ROIS",
     "MAX_STORED_FIT_CURVE_POINTS",
@@ -156,4 +181,5 @@ __all__ = [
     "AgentFitPlan",
     "AgentFitProgress",
     "AgentFitRunStatus",
+    "AgentMacroPixelSize",
 ]

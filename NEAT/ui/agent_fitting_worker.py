@@ -7,12 +7,18 @@ from threading import Event
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from ..domain.agent_fitting import (
+    AgentFitCellResult,
+    AgentFitCellState,
     AgentFitOutcome,
     AgentFitPlan,
     AgentFitRunStatus,
 )
 from ..domain.agent_model import AgentModelSettings
-from ..services.agent_fitting import AgentFitBlocked, run_agent_fitting
+from ..services.agent_fitting import (
+    AgentFitBlocked,
+    roi_for_macro_pixel_size,
+    run_agent_fitting,
+)
 from ..services.agent_model import AgentCredentialResolver, AgentModelError
 from ..services.scientific_observation import ScientificDatasetHandle, StaleDatasetError
 
@@ -44,6 +50,55 @@ class AgentFitWorker(QThread):
 
     def stop(self) -> None:
         self._cancel.set()
+
+    @staticmethod
+    def _terminal_outcome(
+        plan: AgentFitPlan,
+        *,
+        status: AgentFitRunStatus,
+        cell_state: AgentFitCellState,
+        message: str,
+    ) -> AgentFitOutcome:
+        cells = tuple(
+            AgentFitCellResult(
+                roi_index=roi_index,
+                roi_label=candidate.label,
+                roi=(
+                    roi_for_macro_pixel_size(candidate.roi, size)
+                    if candidate.roi is not None else None
+                ),
+                hkl=edge.hkl,
+                state=cell_state,
+                message=message,
+                size_index=size_index,
+                macro_pixel_width=size.width,
+                macro_pixel_height=size.height,
+            )
+            for roi_index, candidate in enumerate(plan.spatial_rois)
+            for size_index, size in enumerate(plan.macro_pixel_sizes)
+            for edge in plan.edges
+        )
+        total = len(plan.spatial_rois) * len(plan.macro_pixel_sizes) * len(plan.edges)
+        failed = total if cell_state is AgentFitCellState.FAILED else 0
+        skipped = total if cell_state is AgentFitCellState.SKIPPED else 0
+        return AgentFitOutcome(
+            plan.run_id,
+            plan.dataset_id,
+            plan.revision,
+            status,
+            plan.phase_id,
+            plan.edges,
+            cells,
+            total,
+            0,
+            0,
+            failed,
+            0,
+            skipped,
+            0,
+            message,
+            plan.macro_pixel_sizes,
+        )
 
     def run(self) -> None:
         handle = self._handle
@@ -81,7 +136,7 @@ class AgentFitWorker(QThread):
                 plan.phase_id,
                 plan.edges,
                 (),
-                len(plan.spatial_rois) * len(plan.edges),
+                len(plan.spatial_rois) * len(plan.macro_pixel_sizes) * len(plan.edges),
                 0,
                 0,
                 0,
@@ -89,44 +144,21 @@ class AgentFitWorker(QThread):
                 0,
                 0,
                 "Dataset changed during fitting; all displayed fit evidence was withdrawn.",
+                plan.macro_pixel_sizes,
             )
         except AgentFitBlocked as exc:
-            total = len(plan.spatial_rois) * len(plan.edges)
-            outcome = AgentFitOutcome(
-                plan.run_id,
-                plan.dataset_id,
-                plan.revision,
-                AgentFitRunStatus.BLOCKED,
-                plan.phase_id,
-                plan.edges,
-                (),
-                total,
-                0,
-                0,
-                0,
-                0,
-                total,
-                0,
-                str(exc),
+            outcome = self._terminal_outcome(
+                plan,
+                status=AgentFitRunStatus.BLOCKED,
+                cell_state=AgentFitCellState.SKIPPED,
+                message=str(exc),
             )
         except Exception as exc:  # noqa: BLE001 - contain unexpected worker errors at Qt boundary
-            total = len(plan.spatial_rois) * len(plan.edges)
-            outcome = AgentFitOutcome(
-                plan.run_id,
-                plan.dataset_id,
-                plan.revision,
-                AgentFitRunStatus.FAILED,
-                plan.phase_id,
-                plan.edges,
-                (),
-                total,
-                0,
-                0,
-                0,
-                0,
-                total,
-                0,
-                f"Local fitting failed safely ({type(exc).__name__}).",
+            outcome = self._terminal_outcome(
+                plan,
+                status=AgentFitRunStatus.FAILED,
+                cell_state=AgentFitCellState.FAILED,
+                message=f"Local fitting failed safely ({type(exc).__name__}).",
             )
         finally:
             self._handle = None
@@ -148,6 +180,7 @@ class AgentFitWorker(QThread):
                 outcome.skipped,
                 outcome.cancelled,
                 "Stop was requested as fitting completed; completed cell evidence is retained as stopped-run evidence.",
+                outcome.macro_pixel_sizes,
             )
         self.completed.emit(outcome)
 
