@@ -41,7 +41,11 @@ from ..domain.agent_planning import (
     PlanStepType,
     context_to_state,
 )
-from .agent_tracing import trace_llm_call
+from .agent_tracing import (
+    TracedLLMCallResult,
+    openai_chat_completion_usage_metadata,
+    trace_llm_call,
+)
 
 AGENT_KEYRING_SERVICE = "NEAT AI Agent"
 OPENAI_ENVIRONMENT_VARIABLE = "OPENAI_API_KEY"
@@ -536,7 +540,7 @@ class OpenAICompatibleStructuredModel:
             if self.settings.mode is AgentModelMode.OPENAI_CLOUD:
                 headers["Authorization"] = f"Bearer {self._api_key}"
 
-            def send_request() -> dict[str, object]:
+            def send_request() -> TracedLLMCallResult:
                 response = self._transport.post_json(
                     self.endpoint.rstrip("/")
                     + ("/chat/completions" if self.endpoint.endswith("/v1") else "/v1/chat/completions"),
@@ -544,10 +548,20 @@ class OpenAICompatibleStructuredModel:
                     body=request_body,
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
-                return {
-                    "status_code": response.status_code,
-                    "body": response.body.decode("utf-8", errors="replace"),
-                }
+                response_body = response.body.decode("utf-8", errors="replace")
+                try:
+                    response_envelope = json.loads(response_body)
+                except ValueError:
+                    response_envelope = None
+                return TracedLLMCallResult(
+                    output={
+                        "status_code": response.status_code,
+                        "body": response_body,
+                    },
+                    usage_metadata=openai_chat_completion_usage_metadata(
+                        response_envelope
+                    ),
+                )
 
             traced_response = trace_llm_call(
                 name="Structured planning completion",
