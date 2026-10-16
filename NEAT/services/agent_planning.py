@@ -656,6 +656,7 @@ def run_planning(
     builder.add_edge("terminal", END)
     app = builder.compile(checkpointer=checkpointer)
     config = {
+        "run_name": "NEAT: Dataset planning",
         "configurable": {"thread_id": context.run_id},
         "recursion_limit": MAX_GRAPH_NODES + 1,
         "metadata": {"workflow": "neat_read_only_plan", "run_id": context.run_id},

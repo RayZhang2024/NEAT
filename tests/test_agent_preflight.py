@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from NEAT.domain.agent_fitting import AgentFitCellState
 from NEAT.domain.agent_model import (
     AgentModelMode,
     AgentModelSettings,
@@ -110,13 +111,13 @@ class _FakeSpatialVisionWorker(QThread):
         self.run_id = run_id
         self._stopped = False
         bounds = (
-            RoiBounds(8, 13, 8, 13),
-            RoiBounds(18, 23, 8, 13),
-            RoiBounds(28, 33, 8, 13),
-            RoiBounds(38, 43, 8, 13),
-            RoiBounds(8, 13, 20, 25),
-            RoiBounds(18, 23, 20, 25),
-            RoiBounds(28, 33, 20, 25),
+            RoiBounds(23, 28, 23, 28),
+            RoiBounds(28, 33, 23, 28),
+            RoiBounds(33, 38, 23, 28),
+            RoiBounds(23, 28, 28, 33),
+            RoiBounds(28, 33, 28, 33),
+            RoiBounds(33, 38, 28, 33),
+            RoiBounds(28, 33, 33, 38),
         )
         candidates = tuple(
             SpatialRoiCandidate(
@@ -277,7 +278,7 @@ class AgentPreflightTests(unittest.TestCase):
             )
 
         self.assertEqual(self.window._fit_outcome.status, AgentFitRunStatus.COMPLETE)
-        self.assertEqual((self.window._fit_outcome.total_fits, self.window._fit_outcome.attempted), (7, 7))
+        self.assertEqual((self.window._fit_outcome.total_fits, self.window._fit_outcome.attempted), (49, 49))
         self.assertEqual(self.window.fit_matrix.rowCount(), 7)
         self.assertEqual(self.window.fit_matrix.columnCount(), 1)
         self.assertEqual(len(self.window.spatial_roi_preview._candidates), 7)
@@ -285,20 +286,44 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertEqual(self.window.summary_page.heading.text(), "Analysis complete")
         self.assertIn("Fe_bcc", self.window.summary_page.rows[1].conclusion_label.text())
         self.assertIn("7 sample locations", self.window.summary_page.rows[2].conclusion_label.text())
-        self.assertEqual(self.window.summary_page.rows[3].conclusion_label.text(), "7 fits completed")
+        self.assertEqual(
+            self.window.summary_page.rows[3].conclusion_label.text(),
+            "49 fits attempted across 7 sizes",
+        )
         self.assertFalse(self.window.summary_page.review_button.isVisible())
         self.assertFalse(self.window.fit_matrix.isVisible())
         self.window.summary_page.results_button.click()
         self.assertTrue(self.window.fit_matrix.isVisible())
-        self.assertIn("7/7 attempted", self.window.fit_matrix_summary.text())
+        self.assertIn("49/49 attempted", self.window.fit_matrix_summary.text())
         self.assertIn("d_fit", self.window.fit_detail_label.text())
+        baseline_cell = next(
+            cell for cell in self.window._fit_outcome.cells
+            if cell.roi_index == 0 and cell.size_index == 3
+        )
         self.assertIs(
             self.window.fit_curve_widgets[0]._curve,
-            self.window._fit_outcome.cells[0].attempt.region1,
+            baseline_cell.attempt.region1,
         )
         self.window.fit_matrix.setCurrentCell(3, 0)
         self.app.processEvents(QEventLoop.AllEvents, 10)
-        self.assertIn("C · edge", self.window.fit_detail_label.text())
+        self.assertIn("ROI C ·", self.window.fit_detail_label.text())
+        self.assertEqual(self.window.fit_size_combo.count(), 7)
+        small_size_cell = next(
+            cell for cell in self.window._fit_outcome.cells
+            if cell.roi_index == 3 and cell.size_index == 0
+        )
+        self.window.fit_size_combo.setCurrentIndex(0)
+        self.app.processEvents(QEventLoop.AllEvents, 10)
+        self.assertIn(
+            f"{small_size_cell.macro_pixel_width} × {small_size_cell.macro_pixel_height} px",
+            self.window.fit_selected_heading.text(),
+        )
+        self.assertEqual(
+            self.window.fit_results_roi_preview._candidates[3].roi,
+            small_size_cell.roi,
+        )
+        self.window.fit_size_combo.setCurrentIndex(3)
+        self.app.processEvents(QEventLoop.AllEvents, 10)
         self.assertTrue(self.window.start_autonomous_button.isEnabled())
         self.assertFalse(self.window.stop_button.isVisible())
         self.assertIs(self.host.images, images)
@@ -437,7 +462,7 @@ class AgentPreflightTests(unittest.TestCase):
 
         self.assertEqual(self.window._fit_outcome.status, AgentFitRunStatus.STOPPED)
         self.assertEqual(self.window._fit_outcome.attempted, 1)
-        self.assertEqual(self.window._fit_outcome.cancelled, 6)
+        self.assertEqual(self.window._fit_outcome.cancelled, 48)
         self.assertEqual(self.window._stage, "cancelled")
         self.assertIn("stopped", self.window.status_label.text().lower())
         self.assertIsNone(worker._handle)
@@ -478,27 +503,37 @@ class AgentPreflightTests(unittest.TestCase):
 
         outcome = self.window._fit_outcome
         self.assertEqual(outcome.status, AgentFitRunStatus.COMPLETE_WITH_ISSUES)
-        self.assertEqual((outcome.attempted, outcome.succeeded, outcome.failed), (7, 6, 1))
-        self.assertEqual(self.window.fit_matrix.item(0, 0).text(), "Failed")
+        self.assertEqual((outcome.attempted, outcome.succeeded, outcome.failed), (49, 48, 1))
+        failed_cell = next(cell for cell in outcome.cells if cell.state is AgentFitCellState.FAILED)
+        self.assertEqual(
+            self.window.fit_matrix.item(failed_cell.roi_index, 0).text(), "Failed"
+        )
         self.assertIn("1 failed", self.window.fit_matrix_summary.text())
         self.assertIn("1 failed", self.window.summary_page.rows[3].conclusion_label.text())
         self.window.summary_page.review_button.click()
         self.assertTrue(self.window.review_page.isVisible())
-        self.assertIn("Reference", self.window.review_identity.text())
+        self.assertIn(f"{failed_cell.roi_label}", self.window.review_identity.text())
         self.assertTrue(self.window.review_reason.text())
         self.assertFalse(self.window.fit_matrix.isVisible())
         self.window.inspect_flagged_button.click()
         self.assertTrue(self.window.fit_matrix.isVisible())
         self.assertIn("Region 3 fit", self.window.fit_detail_label.text())
-        self.window.fit_matrix.setCurrentCell(1, 0)
+        successful_cell = next(
+            cell for cell in outcome.cells
+            if cell.roi_index == 1 and cell.size_index == failed_cell.size_index
+            and cell.state is AgentFitCellState.SUCCEEDED
+        )
+        self.window.fit_matrix.setCurrentCell(successful_cell.roi_index, 0)
         self.app.processEvents(QEventLoop.AllEvents, 10)
         self.assertIn("d_fit", self.window.fit_detail_label.text())
         self.assertIs(
             self.window.fit_curve_widgets[0]._curve,
-            outcome.cells[1].attempt.region1,
+            successful_cell.attempt.region1,
         )
 
-    def test_ambiguous_spatial_proposal_blocks_all_fits(self):
+    def test_medium_confidence_spatial_proposal_does_not_block_fits(self):
+        from NEAT.domain.agent_fitting import AgentFitRunStatus
+
         self._prepare_spatial_fit_host()
 
         class AmbiguousSpatialWorker(_FakeSpatialVisionWorker):
@@ -510,22 +545,26 @@ class AgentPreflightTests(unittest.TestCase):
                     self.outcome, spatial_roi_candidates=tuple(candidates)
                 )
 
-        fit_engine = Mock()
+        fit_method = Mock(side_effect=lambda _wave, _signal, config, **_kwargs: _successful_fit(config))
+        fit_engine = type(
+            "FitSpy", (), {"fit_individual_edge": staticmethod(fit_method)}
+        )()
         with (
             patch("NEAT.ui.agent_window.VisionWorker", AmbiguousSpatialWorker),
             patch("NEAT.services.agent_fitting.FittingEngine", return_value=fit_engine),
         ):
             self.window.start_autonomous_analysis()
             self._wait_for(
-                lambda: self.window._stage == "fitting_needs_input"
+                lambda: self.window._fit_outcome is not None
+                and self.window._fit_worker is None
                 and not self.host._shutdown_worker_inventory.workers,
                 timeout=20,
             )
 
-        fit_engine.fit_individual_edge.assert_not_called()
-        self.assertIsNone(self.window._fit_outcome)
-        self.assertIn("ROI C", self.window.status_label.text())
-        self.assertIn("no local fit was started", self.window.fit_matrix_summary.text())
+        self.assertEqual(self.window._fit_outcome.status, AgentFitRunStatus.COMPLETE)
+        self.assertEqual(self.window._fit_outcome.attempted, 49)
+        self.assertEqual(fit_method.call_count, 49)
+        self.assertEqual(self.window._vision_outcome.spatial_roi_candidates[3].confidence, "medium")
 
     def test_visual_response_error_and_uncertainty_have_distinct_pause_messages(self):
         self._prepare_spatial_fit_host()
@@ -1380,7 +1419,7 @@ class AgentPreflightTests(unittest.TestCase):
             ["phase_shortlist", "phase_overlay", "sample_locations", "sample_locations", "sample_locations"],
         )
         self.assertIn("ROI x[1,10), y[1,10)", models[1].calls[0][2])
-        self.assertIn("Already accepted locations", models[1].calls[2][2])
+        self.assertIn("Existing locations", models[1].calls[2][2])
         self.assertEqual(self.host.selected_area, (16, 52, 18, 50))
         self.assertEqual(self.window._adjusted_roi, adjusted)
         self.assertEqual(self.window._adjusted_roi_dataset_token, token)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from fractions import Fraction
 from math import isfinite
 from typing import TypedDict
 
@@ -11,7 +12,10 @@ import numpy as np
 from ..core import PHASE_DATA
 from ..core.fitting import initial_value_within_bounds
 from ..domain.agent_fitting import (
-    MAX_AUTONOMOUS_FITS,
+    MACRO_PIXEL_BASELINE_HEIGHT,
+    MACRO_PIXEL_BASELINE_WIDTH,
+    MACRO_PIXEL_SCALE_FACTOR,
+    MACRO_PIXEL_SIZE_LEVELS,
     MAX_SELECTED_EDGES,
     MAX_SPATIAL_ROIS,
     MAX_STORED_FIT_CURVE_POINTS,
@@ -23,6 +27,7 @@ from ..domain.agent_fitting import (
     AgentFitPlan,
     AgentFitProgress,
     AgentFitRunStatus,
+    AgentMacroPixelSize,
 )
 from ..domain.agent_vision import SpatialRoiCandidate, VisionOutcome
 from ..domain.fitting import (
@@ -31,7 +36,12 @@ from ..domain.fitting import (
     default_bragg_edge_windows,
 )
 from ..domain.individual_edge import IndividualEdgeFitConfig
-from ..domain.observation import DatasetMode, ObservationStatus, RoiBounds
+from ..domain.observation import (
+    DatasetMode,
+    ObservationStatus,
+    RoiBounds,
+    SpectrumObservation,
+)
 from .agent_tracing import agent_langsmith_context
 from .agent_vision import trusted_phase_edges
 from .fitting_engine import FittingEngine
@@ -50,31 +60,79 @@ MIN_FIT_SAMPLES_REGION3 = 9
 
 
 class FitGraphState(TypedDict):
-    index: int
-    cells: tuple[AgentFitCellResult, ...]
+    extraction_index: int
+    fit_index: int
+    completed: int
     attempted: int
     succeeded: int
     failed: int
     needs_review: int
     stopped: bool
+    blocked: bool
 
 
 class AgentFitBlocked(ValueError):
     """A deterministic input or resource check prevented local fitting."""
 
 
-def _roi_overlap(left: RoiBounds, right: RoiBounds) -> bool:
-    return (
-        min(left.x_max, right.x_max) > max(left.x_min, right.x_min)
-        and min(left.y_max, right.y_max) > max(left.y_min, right.y_min)
-    )
+def build_macro_pixel_sizes(width: int, height: int) -> tuple[AgentMacroPixelSize, ...]:
+    """Build three smaller, baseline, and three larger pixel sizes.
+
+    The exact 5/4 ratio avoids floating-point boundary surprises. Smaller
+    dimensions round down; larger dimensions round up.
+    """
+    if (
+        isinstance(width, bool) or not isinstance(width, int) or width <= 0
+        or isinstance(height, bool) or not isinstance(height, int) or height <= 0
+    ):
+        raise AgentFitBlocked("Baseline macro-pixel width and height must be positive integers.")
+    sizes: list[AgentMacroPixelSize] = []
+    for level in range(-MACRO_PIXEL_SIZE_LEVELS, MACRO_PIXEL_SIZE_LEVELS + 1):
+        factor = Fraction(str(MACRO_PIXEL_SCALE_FACTOR)) ** level
+
+        def dimension(
+            value: int,
+            *,
+            factor: Fraction = factor,
+            level: int = level,
+        ) -> int:
+            numerator = value * factor.numerator
+            denominator = factor.denominator
+            if level < 0:
+                return numerator // denominator
+            if level > 0:
+                return -(-numerator // denominator)
+            return value
+
+        sizes.append(AgentMacroPixelSize(level, dimension(width), dimension(height)))
+    if any(size.width <= 0 or size.height <= 0 for size in sizes):
+        raise AgentFitBlocked("The 1.25 macro-pixel size series contains a non-positive size.")
+    dimensions = [(size.width, size.height) for size in sizes]
+    if len(set(dimensions)) != len(dimensions):
+        raise AgentFitBlocked(
+            "The 1.25 macro-pixel size series repeats a rounded size; choose a larger baseline."
+        )
+    return tuple(sizes)
+
+
+def roi_for_macro_pixel_size(
+    roi: RoiBounds, size: AgentMacroPixelSize
+) -> RoiBounds:
+    """Return a half-open box at the requested size, centered as closely as pixels allow."""
+    # The source rectangle's geometric center is represented in doubled
+    # coordinates. Integer half-open bounds can preserve it exactly when the
+    # old and new dimensions share parity; otherwise the nearest box differs
+    # by at most half a pixel.
+    x_min = (roi.x_min + roi.x_max - size.width) // 2
+    y_min = (roi.y_min + roi.y_max - size.height) // 2
+    return RoiBounds(x_min, x_min + size.width, y_min, y_min + size.height)
 
 
 def validate_spatial_roi_candidates(
     candidates: tuple[SpatialRoiCandidate, ...],
     image_shape: tuple[int, int],
 ) -> tuple[RoiBounds, ...]:
-    """Independently validate seven original-coordinate, non-overlapping ROIs."""
+    """Validate seven fitting ROIs by geometry; visual cautions are advisory."""
     if len(candidates) != MAX_SPATIAL_ROIS:
         raise AgentFitBlocked(
             f"Seven valid sample locations are required; NEAT received {len(candidates)}."
@@ -98,10 +156,8 @@ def validate_spatial_roi_candidates(
             and MIN_ROI_WIDTH <= roi.height <= MAX_ROI_WIDTH
         ):
             raise AgentFitBlocked(f"ROI {candidate.label} exceeds the 3–128 pixel bounds.")
-        if candidate.confidence not in {"high", "user-selected"} or candidate.ambiguity_flags:
-            raise AgentFitBlocked(f"ROI {candidate.label} still has unresolved visual ambiguity.")
-        if any(_roi_overlap(roi, other) for other in accepted):
-            raise AgentFitBlocked(f"ROI {candidate.label} overlaps another sample location.")
+        # Overlap, model confidence, and visual ambiguity are retained as
+        # review evidence, but do not prevent fitting a geometrically valid ROI.
         accepted.append(roi)
     return tuple(accepted)
 
@@ -141,6 +197,10 @@ def build_agent_fit_plan(
 
     rois = tuple(visual_outcome.spatial_roi_candidates)
     validate_spatial_roi_candidates(rois, image_shape)
+    macro_pixel_sizes = build_macro_pixel_sizes(
+        MACRO_PIXEL_BASELINE_WIDTH,
+        MACRO_PIXEL_BASELINE_HEIGHT,
+    )
     all_phase_edges = sorted(
         trusted_phase_edges(phase_id), key=lambda item: (item[1], item[0])
     )
@@ -207,12 +267,14 @@ def build_agent_fit_plan(
         lattice_params=dict(lattice_params),
         edges=tuple(specs),
         fitting_parameter_bounds=bounds,
+        macro_pixel_sizes=macro_pixel_sizes,
     )
 
 
 def _new_cell(
     plan: AgentFitPlan,
     roi_index: int,
+    size_index: int,
     edge: AgentEdgeFitPlan,
     state: AgentFitCellState,
     *,
@@ -222,15 +284,19 @@ def _new_cell(
 ) -> AgentFitCellResult:
     roi_candidate = plan.spatial_rois[roi_index]
     assert roi_candidate.roi is not None
+    size = plan.macro_pixel_sizes[size_index]
     return AgentFitCellResult(
-        roi_index,
-        roi_candidate.label,
-        roi_candidate.roi,
-        edge.hkl,
-        state,
-        attempt,
-        message,
-        review_flags,
+        roi_index=roi_index,
+        roi_label=roi_candidate.label,
+        roi=roi_for_macro_pixel_size(roi_candidate.roi, size),
+        hkl=edge.hkl,
+        state=state,
+        attempt=attempt,
+        message=message,
+        review_flags=review_flags,
+        size_index=size_index,
+        macro_pixel_width=size.width,
+        macro_pixel_height=size.height,
     )
 
 
@@ -240,8 +306,9 @@ def _empty_cells(
     message: str,
 ) -> tuple[AgentFitCellResult, ...]:
     return tuple(
-        _new_cell(plan, roi_index, edge, state, message=message)
+        _new_cell(plan, roi_index, size_index, edge, state, message=message)
         for roi_index in range(len(plan.spatial_rois))
+        for size_index in range(len(plan.macro_pixel_sizes))
         for edge in plan.edges
     )
 
@@ -262,7 +329,7 @@ def _make_outcome(
     needs_review = sum(cell.state is AgentFitCellState.NEEDS_REVIEW for cell in cells)
     skipped = sum(cell.state is AgentFitCellState.SKIPPED for cell in cells)
     cancelled = sum(cell.state is AgentFitCellState.CANCELLED for cell in cells)
-    total = len(plan.spatial_rois) * len(plan.edges)
+    total = len(plan.spatial_rois) * len(plan.macro_pixel_sizes) * len(plan.edges)
     return AgentFitOutcome(
         plan.run_id,
         plan.dataset_id,
@@ -279,53 +346,51 @@ def _make_outcome(
         skipped,
         cancelled,
         message,
+        plan.macro_pixel_sizes,
     )
 
 
-def _validate_spectra(plan: AgentFitPlan, spectra) -> None:
-    points = 0
+def _validate_spectrum_edge(
+    spectrum: SpectrumObservation,
+    roi: RoiBounds,
+    edge: AgentEdgeFitPlan,
+) -> tuple[int, str | None]:
+    if (
+        spectrum.status is not ObservationStatus.OK
+        or spectrum.wavelengths is None
+        or spectrum.intensities is None
+        or spectrum.valid_pair_mask is None
+        or spectrum.roi_effective != roi
+    ):
+        return 0, "NEAT could not extract a valid measured spectrum for this location and size."
+    wavelengths = np.asarray(spectrum.wavelengths)
+    intensities = np.asarray(spectrum.intensities)
+    valid = np.asarray(spectrum.valid_pair_mask, dtype=bool)
+    if wavelengths.shape != intensities.shape or valid.shape != wavelengths.shape:
+        return 0, "Spectrum arrays are inconsistent for this location and size."
+    if not np.isfinite(wavelengths[valid]).all() or not np.isfinite(intensities[valid]).all():
+        return 0, "Spectrum contains invalid finite-pair data."
     required = (
         ("Region 1", "region1", MIN_FIT_SAMPLES_REGION1),
         ("Region 2", "region2", MIN_FIT_SAMPLES_REGION2),
         ("Region 3", "region3", MIN_FIT_SAMPLES_REGION3),
     )
-    for roi_candidate, spectrum in zip(plan.spatial_rois, spectra):
-        if roi_candidate.roi is None:
-            raise AgentFitBlocked(f"ROI {roi_candidate.label} has no validated bounds.")
-        if (
-            spectrum.status is not ObservationStatus.OK
-            or spectrum.wavelengths is None
-            or spectrum.intensities is None
-            or spectrum.valid_pair_mask is None
-            or spectrum.roi_effective != roi_candidate.roi
-        ):
-            raise AgentFitBlocked(f"NEAT could not extract a valid spectrum for ROI {roi_candidate.label}.")
-        wavelengths = np.asarray(spectrum.wavelengths)
-        intensities = np.asarray(spectrum.intensities)
-        valid = np.asarray(spectrum.valid_pair_mask, dtype=bool)
-        if wavelengths.shape != intensities.shape or valid.shape != wavelengths.shape:
-            raise AgentFitBlocked(f"Spectrum arrays for ROI {roi_candidate.label} are inconsistent.")
-        if not np.isfinite(wavelengths[valid]).all() or not np.isfinite(intensities[valid]).all():
-            raise AgentFitBlocked(f"Spectrum for ROI {roi_candidate.label} contains invalid finite-pair data.")
-        for edge in plan.edges:
-            for label, region_name, minimum_count in required:
-                region = getattr(edge, region_name)
-                mask = (
-                    valid
-                    & (wavelengths >= region.min_wavelength)
-                    & (wavelengths <= region.max_wavelength)
-                )
-                count = int(np.count_nonzero(mask))
-                if count < minimum_count:
-                    raise AgentFitBlocked(
-                        f"ROI {roi_candidate.label}, edge {edge.hkl}: {label} has {count} "
-                        f"finite samples; at least {minimum_count} are required."
-                    )
-                points += count
-    if points > MAX_STORED_FIT_CURVE_POINTS:
-        raise AgentFitBlocked(
-            "Selected fitting windows exceed NEAT's bounded in-memory fit-evidence limit."
+    points = 0
+    for label, region_name, minimum_count in required:
+        region = getattr(edge, region_name)
+        mask = (
+            valid
+            & (wavelengths >= region.min_wavelength)
+            & (wavelengths <= region.max_wavelength)
         )
+        count = int(np.count_nonzero(mask))
+        if count < minimum_count:
+            return 0, (
+                f"{label} has {count} finite wavelength samples; at least "
+                f"{minimum_count} are required."
+            )
+        points += count
+    return points, None
 
 
 def _validate_fit_plan(plan: AgentFitPlan) -> None:
@@ -339,8 +404,16 @@ def _validate_fit_plan(plan: AgentFitPlan) -> None:
         raise AgentFitBlocked("The selected phase structure is not supported by this fit path.")
     if dict(plan.lattice_params) != phase.get("lattice_params"):
         raise AgentFitBlocked("The fit lattice parameters do not match the trusted phase catalogue.")
-    if not 1 <= len(plan.edges) <= MAX_SELECTED_EDGES or len(plan.edges) > MAX_AUTONOMOUS_FITS:
+    if not 1 <= len(plan.edges) <= MAX_SELECTED_EDGES:
         raise AgentFitBlocked("One to five selected edges are required.")
+    if len(plan.macro_pixel_sizes) != MACRO_PIXEL_SIZE_LEVELS * 2 + 1:
+        raise AgentFitBlocked("The run requires exactly seven macro-pixel sizes.")
+    expected_sizes = build_macro_pixel_sizes(
+        MACRO_PIXEL_BASELINE_WIDTH,
+        MACRO_PIXEL_BASELINE_HEIGHT,
+    )
+    if plan.macro_pixel_sizes != expected_sizes:
+        raise AgentFitBlocked("Macro-pixel sizes differ from the validated 1.25 scale series.")
     if len({edge.hkl for edge in plan.edges}) != len(plan.edges):
         raise AgentFitBlocked("Selected edges must be distinct trusted HKLs.")
     if len({edge.source_row for edge in plan.edges}) != len(plan.edges):
@@ -431,10 +504,10 @@ def run_agent_fitting(
     langsmith_region: str = "eu",
     langsmith_workspace_id: str = "",
 ) -> AgentFitOutcome:
-    """Extract seven real ROI spectra and fit each trusted edge locally once."""
-    total = len(plan.spatial_rois) * len(plan.edges)
-    if total < 1 or total > MAX_AUTONOMOUS_FITS:
-        raise AgentFitBlocked("The fit plan exceeds the 7 ROI × 5 edge limit.")
+    """Run the seven-location, seven-size exploratory edge-fit graph locally."""
+    total = len(plan.spatial_rois) * len(plan.macro_pixel_sizes) * len(plan.edges)
+    if total < 1:
+        raise AgentFitBlocked("The fit plan does not contain any location, size, and edge combinations.")
     if (handle.dataset_id, handle.revision) != (plan.dataset_id, plan.revision):
         return _make_outcome(
             plan, AgentFitRunStatus.STALE, (), attempted=0,
@@ -442,100 +515,212 @@ def run_agent_fitting(
         )
     if handle.mode is not DatasetMode.IMAGES or handle.image_shape is None:
         raise AgentFitBlocked("Seven spatial image ROIs require an image-stack dataset.")
-    validated_rois = validate_spatial_roi_candidates(plan.spatial_rois, handle.image_shape)
+    validate_spatial_roi_candidates(plan.spatial_rois, handle.image_shape)
     if plan.structure_type not in {"fcc", "bcc"} or "a" not in plan.lattice_params:
         raise AgentFitBlocked("The local Region 3 fit requires a trusted fcc/bcc lattice parameter.")
     if not isinstance(plan.fitting_parameter_bounds, FittingParameterBounds):
         raise AgentFitBlocked("Configured fitting bounds are invalid.")
     _validate_fit_plan(plan)
 
-    spectra = []
-    for roi_index, (candidate, roi) in enumerate(zip(plan.spatial_rois, validated_rois)):
+    cells_by_key: dict[tuple[int, int, int], AgentFitCellResult] = {}
+    spectra: dict[tuple[int, int], SpectrumObservation] = {}
+    geometry: dict[tuple[int, int], RoiBounds] = {}
+    geometry_errors: dict[tuple[int, int], str] = {}
+    for size_index, size in enumerate(plan.macro_pixel_sizes):
+        for roi_index, candidate in enumerate(plan.spatial_rois):
+            assert candidate.roi is not None
+            roi = roi_for_macro_pixel_size(candidate.roi, size)
+            key = (roi_index, size_index)
+            if not (
+                0 <= roi.x_min < roi.x_max <= handle.image_shape[1]
+                and 0 <= roi.y_min < roi.y_max <= handle.image_shape[0]
+            ):
+                geometry_errors[key] = (
+                    f"The {size.label} box at location {candidate.label} extends outside the image."
+                )
+            else:
+                geometry[key] = roi
+    # The original seven locations are validated as distinct above. Scaled
+    # boxes may overlap as their sizes increase; each still defines an
+    # independently extracted spectrum, so overlap alone must not skip a fit.
+    for (roi_index, size_index), reason in geometry_errors.items():
+        for edge_index, edge in enumerate(plan.edges):
+            cells_by_key[(roi_index, size_index, edge_index)] = _new_cell(
+                plan, roi_index, size_index, edge, AgentFitCellState.SKIPPED,
+                message=reason,
+            )
+
+    extraction_jobs = tuple(
+        key for key in geometry if key not in geometry_errors
+    )
+    fit_tasks: list[tuple[int, int, int]] = []
+    fit_points = 0
+
+    def add_skipped(roi_index: int, size_index: int, message: str) -> None:
+        for edge_index, edge in enumerate(plan.edges):
+            cells_by_key[(roi_index, size_index, edge_index)] = _new_cell(
+                plan, roi_index, size_index, edge, AgentFitCellState.SKIPPED,
+                message=message,
+            )
+
+    def add_cancelled(roi_index: int, size_index: int) -> None:
+        for edge_index, edge in enumerate(plan.edges):
+            key = (roi_index, size_index, edge_index)
+            if key not in cells_by_key:
+                cells_by_key[key] = _new_cell(
+                    plan, roi_index, size_index, edge, AgentFitCellState.CANCELLED,
+                    message="Stopped before this size-specific fit was attempted.",
+                )
+
+    def extract_next_spectrum(state: FitGraphState) -> dict[str, object]:
+        nonlocal fit_points
+        index = state["extraction_index"]
+        if index >= len(extraction_jobs):
+            return {"extraction_index": index, "completed": len(cells_by_key)}
         if cancelled():
-            terminal_cells = _empty_cells(
-                plan, AgentFitCellState.CANCELLED, "Stopped before spectrum extraction."
-            )
-            return _make_outcome(
-                plan, AgentFitRunStatus.STOPPED, terminal_cells, attempted=0,
-                message="Stopped before local fitting began.",
-            )
+            for roi_index, size_index, _edge_index in fit_tasks:
+                add_cancelled(roi_index, size_index)
+            for roi_index, size_index in extraction_jobs[index:]:
+                add_cancelled(roi_index, size_index)
+            return {
+                "extraction_index": len(extraction_jobs),
+                "completed": len(cells_by_key),
+                "stopped": True,
+            }
+        roi_index, size_index = extraction_jobs[index]
+        candidate = plan.spatial_rois[roi_index]
+        size = plan.macro_pixel_sizes[size_index]
+        roi = geometry[(roi_index, size_index)]
         handle.assert_current()
         try:
             spectrum = get_roi_spectrum(handle, roi, display_window=None)
         except StaleDatasetError:
             raise
         except (ObservationErrorBase, ValueError) as exc:
-            terminal_cells = _empty_cells(
-                plan, AgentFitCellState.SKIPPED,
-                f"Spectrum extraction blocked: {type(exc).__name__}.",
+            add_skipped(
+                roi_index,
+                size_index,
+                f"Spectrum extraction failed for {size.label} ({type(exc).__name__}).",
             )
-            return _make_outcome(
-                plan, AgentFitRunStatus.BLOCKED, terminal_cells, attempted=0,
-                message=f"Could not extract the measured spectrum for ROI {candidate.label}.",
-            )
-        spectra.append(spectrum)
+        else:
+            handle.assert_current()
+            spectra[(roi_index, size_index)] = spectrum
+            for edge_index, edge in enumerate(plan.edges):
+                points, reason = _validate_spectrum_edge(spectrum, roi, edge)
+                key = (roi_index, size_index, edge_index)
+                if reason:
+                    cells_by_key[key] = _new_cell(
+                        plan, roi_index, size_index, edge, AgentFitCellState.SKIPPED,
+                        message=f"{size.label}: {reason}",
+                    )
+                else:
+                    fit_points += points
+                    fit_tasks.append((roi_index, size_index, edge_index))
         handle.assert_current()
         progress(
             AgentFitProgress(
                 "extract_spectra",
-                f"Extracted spectrum for ROI {candidate.label} ({roi_index + 1}/7).",
+                f"Prepared {size.label} spectrum for {candidate.label} · "
+                f"location {roi_index + 1}/7, size {size_index + 1}/7.",
                 total,
-                0,
-                0,
-                0,
-                0,
+                state["attempted"],
+                state["succeeded"],
+                state["failed"],
+                state["needs_review"],
                 current_roi_index=roi_index,
                 current_roi_label=candidate.label,
+                completed=len(cells_by_key),
+                current_size_index=size_index,
+                current_macro_pixel_width=size.width,
+                current_macro_pixel_height=size.height,
             )
         )
+        return {
+            "extraction_index": index + 1,
+            "completed": len(cells_by_key),
+        }
 
-    try:
-        _validate_spectra(plan, spectra)
-    except AgentFitBlocked as exc:
-        terminal_cells = _empty_cells(plan, AgentFitCellState.SKIPPED, str(exc))
-        return _make_outcome(
-            plan, AgentFitRunStatus.BLOCKED, terminal_cells, attempted=0,
-            message=str(exc),
-        )
+    def route_after_extraction(state: FitGraphState) -> str:
+        if state["stopped"]:
+            return "finish"
+        if state["extraction_index"] < len(extraction_jobs):
+            return "extract_more"
+        return "check_fit_budget"
 
-    def fit_next(state: FitGraphState) -> dict[str, object]:
-        index = state["index"]
-        cells = list(state["cells"])
+    def check_fit_evidence_budget(state: FitGraphState) -> dict[str, object]:
+        if fit_points > MAX_STORED_FIT_CURVE_POINTS:
+            message = (
+                "Selected fitting windows exceed NEAT's bounded in-memory fit-evidence limit; "
+                "no local fits were started."
+            )
+            for roi_index, size_index, _edge_index in fit_tasks:
+                for edge_index, edge in enumerate(plan.edges):
+                    cells_by_key[(roi_index, size_index, edge_index)] = _new_cell(
+                        plan, roi_index, size_index, edge, AgentFitCellState.SKIPPED,
+                        message=message,
+                    )
+            fit_tasks.clear()
+            progress(
+                AgentFitProgress(
+                    "validate_fit_evidence", message, total, 0, 0, 0, 0,
+                    completed=len(cells_by_key),
+                )
+            )
+            return {"blocked": True, "completed": len(cells_by_key)}
+        if not fit_tasks:
+            return {
+                "blocked": True,
+                "completed": len(cells_by_key),
+            }
+        return {"blocked": False, "completed": len(cells_by_key)}
+
+    def route_after_fit_budget(state: FitGraphState) -> str:
+        return "fit" if not state["blocked"] else "finish"
+
+    def fit_next_cell(state: FitGraphState) -> dict[str, object]:
+        index = state["fit_index"]
         attempted = state["attempted"]
         succeeded = state["succeeded"]
         failed = state["failed"]
         needs_review = state["needs_review"]
-        if index >= total:
-            return {"index": index, "cells": tuple(cells)}
-        handle.assert_current()
+        if index >= len(fit_tasks):
+            return {"fit_index": index, "completed": len(cells_by_key)}
         if cancelled():
-            cells.extend(
-                _new_cell(
-                    plan, task_index // len(plan.edges), plan.edges[task_index % len(plan.edges)],
-                    AgentFitCellState.CANCELLED,
-                    message="Stopped before this fit was attempted.",
-                )
-                for task_index in range(index, total)
-            )
-            return {"index": total, "cells": tuple(cells), "stopped": True}
-
-        roi_index, edge_index = divmod(index, len(plan.edges))
+            for roi_index, size_index, _edge_index in fit_tasks[index:]:
+                add_cancelled(roi_index, size_index)
+            return {
+                "fit_index": len(fit_tasks),
+                "completed": len(cells_by_key),
+                "stopped": True,
+            }
+        roi_index, size_index, edge_index = fit_tasks[index]
         candidate = plan.spatial_rois[roi_index]
-        spectrum = spectra[roi_index]
+        size = plan.macro_pixel_sizes[size_index]
+        spectrum = spectra[(roi_index, size_index)]
         edge = plan.edges[edge_index]
         running = _new_cell(
-            plan, roi_index, edge, AgentFitCellState.RUNNING,
+            plan, roi_index, size_index, edge, AgentFitCellState.RUNNING,
             message=f"Fit {attempted + 1} of {total} is running.",
         )
+        cells_by_key[(roi_index, size_index, edge_index)] = running
         progress(
             AgentFitProgress(
                 "fit_edges",
-                f"Fitting ROI {candidate.label}, edge {edge.hkl} · {attempted + 1}/{total} fits",
-                total, attempted, succeeded, failed, needs_review,
+                f"Fitting {candidate.label} at {size.label}, edge {edge.hkl} · "
+                f"{attempted + 1}/{total} attempts.",
+                total,
+                attempted,
+                succeeded,
+                failed,
+                needs_review,
                 current_roi_index=roi_index,
                 current_roi_label=candidate.label,
                 current_hkl=edge.hkl,
                 cell=running,
+                completed=len(cells_by_key),
+                current_size_index=size_index,
+                current_macro_pixel_width=size.width,
+                current_macro_pixel_height=size.height,
             )
         )
         config = IndividualEdgeFitConfig(
@@ -566,7 +751,7 @@ def run_agent_fitting(
             )
         except Exception as exc:  # noqa: BLE001 - independent fits must fail per cell
             cell = _new_cell(
-                plan, roi_index, edge, AgentFitCellState.FAILED,
+                plan, roi_index, size_index, edge, AgentFitCellState.FAILED,
                 message=f"Fit failed ({type(exc).__name__}).",
             )
             failed += 1
@@ -576,7 +761,7 @@ def run_agent_fitting(
                 if fit_attempt.error_stage:
                     failure_detail = f"{fit_attempt.error_stage}: {failure_detail}"
                 cell = _new_cell(
-                    plan, roi_index, edge, AgentFitCellState.FAILED,
+                    plan, roi_index, size_index, edge, AgentFitCellState.FAILED,
                     attempt=fit_attempt,
                     message=failure_detail[:400],
                 )
@@ -585,38 +770,48 @@ def run_agent_fitting(
                 flags = _review_flags(fit_attempt.result, plan.fitting_parameter_bounds)
                 cell_state = AgentFitCellState.NEEDS_REVIEW if flags else AgentFitCellState.SUCCEEDED
                 cell = _new_cell(
-                    plan, roi_index, edge, cell_state,
+                    plan, roi_index, size_index, edge, cell_state,
                     attempt=fit_attempt,
                     message="Fit completed." if not flags else "Fit completed; inspect the flagged values.",
                     review_flags=flags,
                 )
                 succeeded += 1
                 needs_review += bool(flags)
-        cells.append(cell)
+        cells_by_key[(roi_index, size_index, edge_index)] = cell
         handle.assert_current()
         progress(
             AgentFitProgress(
                 "fit_edges",
-                f"ROI {candidate.label}, edge {edge.hkl}: {cell.state.value.replace('_', ' ')} · "
-                f"{attempted}/{total} fits",
-                total, attempted, succeeded, failed, needs_review,
+                f"{candidate.label}, {size.label}, edge {edge.hkl}: "
+                f"{cell.state.value.replace('_', ' ')} · {attempted}/{total} attempts.",
+                total,
+                attempted,
+                succeeded,
+                failed,
+                needs_review,
                 current_roi_index=roi_index,
                 current_roi_label=candidate.label,
                 current_hkl=edge.hkl,
                 cell=cell,
+                completed=len(cells_by_key),
+                current_size_index=size_index,
+                current_macro_pixel_width=size.width,
+                current_macro_pixel_height=size.height,
             )
         )
         return {
-            "index": index + 1,
-            "cells": tuple(cells),
+            "fit_index": index + 1,
             "attempted": attempted,
             "succeeded": succeeded,
             "failed": failed,
             "needs_review": needs_review,
+            "completed": len(cells_by_key),
         }
 
-    def route_fit(state: FitGraphState) -> str:
-        return "continue" if state["index"] < total else "finish"
+    def route_after_fit(state: FitGraphState) -> str:
+        if state["stopped"] or state["fit_index"] >= len(fit_tasks):
+            return "finish"
+        return "fit_more"
 
     try:
         from langgraph.graph import END, START, StateGraph
@@ -625,11 +820,28 @@ def run_agent_fitting(
             "Local fitting requires NEAT's optional [agent] extra."
         ) from exc
     fit_graph = StateGraph(FitGraphState)
-    fit_graph.add_node("fit_next_cell", fit_next)
-    fit_graph.add_edge(START, "fit_next_cell")
+    fit_graph.add_node("extract_next_location_size_spectrum", extract_next_spectrum)
+    fit_graph.add_node("check_fit_evidence_budget", check_fit_evidence_budget)
+    fit_graph.add_node("fit_next_location_size_edge", fit_next_cell)
+    fit_graph.add_edge(START, "extract_next_location_size_spectrum")
     fit_graph.add_conditional_edges(
-        "fit_next_cell", route_fit,
-        {"continue": "fit_next_cell", "finish": END},
+        "extract_next_location_size_spectrum",
+        route_after_extraction,
+        {
+            "extract_more": "extract_next_location_size_spectrum",
+            "check_fit_budget": "check_fit_evidence_budget",
+            "finish": END,
+        },
+    )
+    fit_graph.add_conditional_edges(
+        "check_fit_evidence_budget",
+        route_after_fit_budget,
+        {"fit": "fit_next_location_size_edge", "finish": END},
+    )
+    fit_graph.add_conditional_edges(
+        "fit_next_location_size_edge",
+        route_after_fit,
+        {"fit_more": "fit_next_location_size_edge", "finish": END},
     )
     compiled_fit_graph = fit_graph.compile()
     with agent_langsmith_context(
@@ -639,33 +851,56 @@ def run_agent_fitting(
         environment=langsmith_environment,
         region=langsmith_region,
         workspace_id=langsmith_workspace_id,
-        workflow="neat_local_fitting",
+        workflow="neat_macro_pixel_size_sweep",
     ):
         fit_state = compiled_fit_graph.invoke(
             {
-                "index": 0,
-                "cells": (),
+                "extraction_index": 0,
+                "fit_index": 0,
+                "completed": len(cells_by_key),
                 "attempted": 0,
                 "succeeded": 0,
                 "failed": 0,
                 "needs_review": 0,
                 "stopped": False,
+                "blocked": False,
             },
-            config={"recursion_limit": total + 5},
+            config={
+                "run_name": "NEAT: Macro-pixel fitting",
+                "configurable": {"thread_id": plan.run_id},
+                "recursion_limit": (
+                    len(plan.spatial_rois) * len(plan.macro_pixel_sizes) + total + 10
+                )
+            },
         )
-    cells = list(fit_state["cells"])
+    cells = tuple(
+        cells_by_key[(roi_index, size_index, edge_index)]
+        for roi_index in range(len(plan.spatial_rois))
+        for size_index in range(len(plan.macro_pixel_sizes))
+        for edge_index in range(len(plan.edges))
+        if (roi_index, size_index, edge_index) in cells_by_key
+    )
     attempted = fit_state["attempted"]
     failed = fit_state["failed"]
     needs_review = fit_state["needs_review"]
     if fit_state["stopped"]:
         return _make_outcome(
-            plan, AgentFitRunStatus.STOPPED, tuple(cells), attempted=attempted,
-            message="Stopped safely between individual-edge fits.",
+            plan, AgentFitRunStatus.STOPPED, cells, attempted=attempted,
+            message="Stopped safely between spectrum extractions or individual-edge fits.",
+        )
+    if fit_state["blocked"]:
+        return _make_outcome(
+            plan, AgentFitRunStatus.BLOCKED, cells, attempted=attempted,
+            message=(
+                "No location, size, and edge combination had enough valid spectrum data to fit."
+                if not fit_tasks and fit_points <= MAX_STORED_FIT_CURVE_POINTS
+                else "The bounded fit-evidence memory limit prevented local fitting."
+            ),
         )
 
     status = (
         AgentFitRunStatus.COMPLETE_WITH_ISSUES
-        if failed or needs_review
+        if failed or needs_review or any(cell.state is AgentFitCellState.SKIPPED for cell in cells)
         else AgentFitRunStatus.COMPLETE
     )
     return _make_outcome(
@@ -674,9 +909,9 @@ def run_agent_fitting(
         tuple(cells),
         attempted=attempted,
         message=(
-            "All selected edge fits were attempted. Review flagged results and scientific limitations."
-            if failed or needs_review
-            else "All selected edge fits completed. Numerical convergence is not scientific validation."
+            "Every safe location, size, and edge fit was attempted. Review skipped or flagged results and scientific limitations."
+            if status is AgentFitRunStatus.COMPLETE_WITH_ISSUES
+            else "All selected location, size, and edge fits completed. Numerical convergence is not scientific validation."
         ),
     )
 
@@ -684,6 +919,8 @@ def run_agent_fitting(
 __all__ = [
     "AgentFitBlocked",
     "build_agent_fit_plan",
+    "build_macro_pixel_sizes",
+    "roi_for_macro_pixel_size",
     "run_agent_fitting",
     "validate_spatial_roi_candidates",
 ]

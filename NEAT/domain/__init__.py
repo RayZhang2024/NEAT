@@ -1,7 +1,10 @@
 """GUI-independent scientific contracts."""
 
 from .agent_fitting import (
-    MAX_AUTONOMOUS_FITS,
+    MACRO_PIXEL_BASELINE_HEIGHT,
+    MACRO_PIXEL_BASELINE_WIDTH,
+    MACRO_PIXEL_SCALE_FACTOR,
+    MACRO_PIXEL_SIZE_LEVELS,
     MAX_SELECTED_EDGES,
     MAX_SPATIAL_ROIS,
     MAX_STORED_FIT_CURVE_POINTS,
@@ -13,6 +16,7 @@ from .agent_fitting import (
     AgentFitPlan,
     AgentFitProgress,
     AgentFitRunStatus,
+    AgentMacroPixelSize,
 )
 from .agent_planning import (
     FuturePermissionClass,
@@ -64,7 +68,10 @@ from .preprocessing import (
 from .preprocessing_inputs import LoadedImageRun
 
 __all__ = [
-    "MAX_AUTONOMOUS_FITS",
+    "MACRO_PIXEL_BASELINE_HEIGHT",
+    "MACRO_PIXEL_BASELINE_WIDTH",
+    "MACRO_PIXEL_SCALE_FACTOR",
+    "MACRO_PIXEL_SIZE_LEVELS",
     "MAX_SELECTED_EDGES",
     "MAX_SPATIAL_ROIS",
     "MAX_STORED_FIT_CURVE_POINTS",
@@ -76,6 +83,7 @@ __all__ = [
     "AgentFitPlan",
     "AgentFitProgress",
     "AgentFitRunStatus",
+    "AgentMacroPixelSize",
     "DatasetCapabilities",
     "DatasetMode",
     "DatasetObservation",

@@ -12,6 +12,7 @@ from PyQt5.QtCore import QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -74,7 +75,11 @@ from ..domain.observation import (
     RoiBounds,
     WavelengthAxisStatus,
 )
-from ..services.agent_fitting import AgentFitBlocked, build_agent_fit_plan
+from ..services.agent_fitting import (
+    AgentFitBlocked,
+    build_agent_fit_plan,
+    roi_for_macro_pixel_size,
+)
 from ..services.agent_model import (
     AgentCredentialResolver,
     AgentKeyringCredentialStore,
@@ -116,9 +121,13 @@ class SpatialRoiPreviewWidget(QWidget):
         self.setAccessibleName("Actual sample image with labelled, clickable spatial ROIs")
         self.setAccessibleDescription(
             "Seven original-pixel sample regions are labelled Reference and A through F. "
+            "A dashed outline and exclamation mark indicate advisory visual cautions. "
             "Click a rectangle or press 1 through 7 to select its fitting results."
         )
-        self.setToolTip("Click a labelled ROI to show its result row; keyboard keys 1–7 also select ROIs.")
+        self.setToolTip(
+            "Dashed outlines and ! indicate visual cautions, which do not block fitting. "
+            "Click a labelled ROI to show its result row; keyboard keys 1–7 also select ROIs."
+        )
 
     def set_preview(self, png_bytes, mapping, candidates=()) -> None:
         pixmap = QPixmap()
@@ -174,13 +183,23 @@ class SpatialRoiPreviewWidget(QWidget):
             ).intersected(target)
             if rect.isEmpty():
                 continue
+            caution = (
+                candidate.confidence not in {"high", "user-selected"}
+                or bool(candidate.ambiguity_flags)
+                or "boundary" in candidate.reason.casefold()
+                or "overlap" in candidate.reason.casefold()
+            )
             color = QColor(self._COLORS[index] if candidate.accepted else "#ff3030")
             pen = QPen(color, 3 if index == self._selected_index else 2)
-            if not candidate.accepted:
+            if not candidate.accepted or caution:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
             painter.drawRect(rect)
-            text = candidate.label if candidate.accepted else f"{candidate.label}?"
+            text = (
+                f"{candidate.label}!" if candidate.accepted and caution
+                else candidate.label if candidate.accepted
+                else f"{candidate.label}?"
+            )
             label_rect = QRectF(rect.left(), rect.top(), max(30, len(text) * 9 + 8), 18)
             painter.fillRect(label_rect, QColor("#17212b"))
             painter.setPen(color)
@@ -355,9 +374,10 @@ class AgentWindow(QMainWindow):
         self._fit_outcome: AgentFitOutcome | None = None
         self._pending_fit_plan: AgentFitPlan | None = None
         self._selected_roi_index = 0
+        self._selected_size_index = 3
         self._selected_edge_index = 0
         self._fit_results_filter = "all"
-        self._fit_cells: dict[tuple[int, int], AgentFitCellResult] = {}
+        self._fit_cells: dict[tuple[int, int, int], AgentFitCellResult] = {}
         self._fit_shape_initials: dict[tuple[int, int, int], tuple[float, float, float]] = {}
         self._fit_parameter_bounds = FittingParameterBounds()
         self._proposal_withdrawn = False
@@ -403,7 +423,7 @@ class AgentWindow(QMainWindow):
         self.overview_heading = QLabel("Explore fitting across seven sample locations", self.overview_panel)
         overview_layout.addWidget(self.overview_heading)
         self.scope_label = QLabel(
-            "One run checks the dataset, reviews up to three representative frames and the measured spectrum, then fits one to five trusted edges at seven spatial locations. Fitting runs locally; the model receives only the bounded previews disclosed for this run. Results are exploratory and do not confirm a phase, strain, or stress.",
+            "One run checks the dataset, reviews representative frames and the measured spectrum, then fits one to five trusted edges at seven locations and seven macro-pixel sizes. Fitting runs locally; results are exploratory and do not confirm a phase, strain, or stress.",
             self.overview_panel,
         )
         self.scope_label.setWordWrap(True)
@@ -720,7 +740,7 @@ class AgentWindow(QMainWindow):
         """Build a focused results view with the matrix and selected evidence together."""
         self.fit_results_page = QWidget(self.analysis_pages)
         self.fit_results_page.setObjectName("agentFitResultsPage")
-        self.fit_results_page.setAccessibleName("Seven-location fitting results")
+        self.fit_results_page.setAccessibleName("Seven-location, seven-size fitting results")
         page_layout = QVBoxLayout(self.fit_results_page)
         page_layout.setContentsMargins(12, 8, 12, 12)
         page_layout.setSpacing(8)
@@ -756,6 +776,23 @@ class AgentWindow(QMainWindow):
         self.fit_results_phase_label = QLabel("", left_panel)
         self.fit_results_phase_label.setAccessibleName("Provisional phase comparison")
         left_layout.addWidget(self.fit_results_phase_label)
+
+        size_row = QHBoxLayout()
+        size_label = QLabel("Macro-pixel size:", left_panel)
+        size_row.addWidget(size_label)
+        self.fit_size_combo = QComboBox(left_panel)
+        self.fit_size_combo.setAccessibleName("Macro-pixel size results")
+        self.fit_size_combo.setToolTip(
+            "Show results for one of the seven tested sizes at the same sample locations."
+        )
+        self.fit_size_combo.setEnabled(False)
+        self.fit_size_combo.currentIndexChanged.connect(self._select_size_index)
+        size_row.addWidget(self.fit_size_combo, 1)
+        left_layout.addLayout(size_row)
+        self.fit_size_baseline_note = QLabel("", left_panel)
+        self.fit_size_baseline_note.setWordWrap(True)
+        self.fit_size_baseline_note.setStyleSheet("color: #536073; font-size: 11px;")
+        left_layout.addWidget(self.fit_size_baseline_note)
 
         filter_row = QHBoxLayout()
         self.fit_results_all_button = QPushButton("All 7 locations", left_panel)
@@ -999,7 +1036,7 @@ class AgentWindow(QMainWindow):
         if index == 1:
             self.step_evidence_heading.setText(titles[1])
             self.step_evidence_subtitle.setText(
-                "The proposed sample regions, their original-pixel coordinates, and local checks."
+                "The proposed sample regions, their coordinates, and any visual cautions."
             )
             candidates = visual.spatial_roi_candidates if visual is not None else ()
             if result is not None and result.frames:
@@ -1015,8 +1052,10 @@ class AgentWindow(QMainWindow):
                     "Location checks",
                     [
                         (
-                            f"{accepted} of {len(candidates)} locations have valid coordinates. "
-                            "NEAT separately checks bounds, overlap, and fitting windows before start."
+                            f"{accepted} of 7 required locations have fit-ready coordinates. "
+                            f"{max(0, len(candidates) - accepted)} proposed locations need valid coordinates; "
+                            f"{max(0, 7 - len(candidates))} proposals are missing. "
+                            "Image bounds and size are required; overlap, confidence, and boundary proximity are advisory."
                         )
                     ],
                 )
@@ -1032,9 +1071,11 @@ class AgentWindow(QMainWindow):
                         bounds = f"x[{x_min},{x_max}), y[{y_min},{y_max})"
                     else:
                         bounds = "coordinates unavailable"
-                    state = "Accepted" if candidate.accepted else "Not validated"
+                    state = "Ready" if candidate.accepted else "Needs valid coordinates"
                     reason = candidate.validation_error or candidate.reason
                     details = f"{candidate.label}: {state} · {bounds}"
+                    if candidate.confidence:
+                        details += f" · confidence: {candidate.confidence} (advisory)"
                     if reason:
                         details += f" · {reason}"
                     if candidate.ambiguity_flags:
@@ -1145,8 +1186,9 @@ class AgentWindow(QMainWindow):
             return
         flagged_rows = {
             row
-            for (row, _column), cell in self._fit_cells.items()
-            if cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
+            for (row, size_index, _column), cell in self._fit_cells.items()
+            if size_index == self._selected_size_index
+            and cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
         }
         if selected_filter == "review" and not flagged_rows:
             selected_filter = "all"
@@ -1158,7 +1200,7 @@ class AgentWindow(QMainWindow):
                 row, selected_filter == "review" and row not in flagged_rows
             )
         selected_cell = self._fit_cells.get(
-            (self._selected_roi_index, self._selected_edge_index)
+            (self._selected_roi_index, self._selected_size_index, self._selected_edge_index)
         )
         selected_cell_is_flagged = selected_cell is not None and selected_cell.state in {
             AgentFitCellState.NEEDS_REVIEW,
@@ -1168,8 +1210,9 @@ class AgentWindow(QMainWindow):
             row = min(flagged_rows)
             columns = [
                 column
-                for (candidate_row, column), cell in self._fit_cells.items()
+                for (candidate_row, size_index, column), cell in self._fit_cells.items()
                 if candidate_row == row
+                and size_index == self._selected_size_index
                 and cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
             ]
             self._select_fit_cell(row, min(columns))
@@ -1178,12 +1221,14 @@ class AgentWindow(QMainWindow):
     def _refresh_fit_result_filters(self) -> None:
         flagged_rows = {
             row
-            for (row, _column), cell in self._fit_cells.items()
-            if cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
+            for (row, size_index, _column), cell in self._fit_cells.items()
+            if size_index == self._selected_size_index
+            and cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
         }
         flagged_count = sum(
-            cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
-            for cell in self._fit_cells.values()
+            size_index == self._selected_size_index
+            and cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
+            for (_row, size_index, _column), cell in self._fit_cells.items()
         )
         self.fit_results_all_button.setText(
             f"All {self.fit_matrix.rowCount()} locations"
@@ -1210,10 +1255,19 @@ class AgentWindow(QMainWindow):
             self.fit_results_roi_preview.set_preview(None, None, ())
             return
         image = self._result.frames[0].image
+        candidates = self._vision_outcome.spatial_roi_candidates
+        if self._fit_plan is not None and self._fit_plan.macro_pixel_sizes:
+            size_index = min(self._selected_size_index, len(self._fit_plan.macro_pixel_sizes) - 1)
+            size = self._fit_plan.macro_pixel_sizes[size_index]
+            candidates = tuple(
+                replace(candidate, roi=roi_for_macro_pixel_size(candidate.roi, size))
+                if candidate.roi is not None else candidate
+                for candidate in candidates
+            )
         self.fit_results_roi_preview.set_preview(
             image.png_bytes,
             image.coordinate_mapping,
-            self._vision_outcome.spatial_roi_candidates,
+            candidates,
         )
 
     def _set_fit_only_detail_view(self, fit_only: bool) -> None:
@@ -1271,6 +1325,8 @@ class AgentWindow(QMainWindow):
         edge_index = next(
             index for index, edge in enumerate(self._fit_plan.edges) if edge.hkl == flagged.hkl
         )
+        self._selected_size_index = flagged.size_index
+        self.fit_size_combo.setCurrentIndex(flagged.size_index)
         self._set_fit_results_filter("review")
         self._select_fit_cell(flagged.roi_index, edge_index)
         self.fit_matrix.setCurrentCell(flagged.roi_index, edge_index)
@@ -1279,7 +1335,8 @@ class AgentWindow(QMainWindow):
             else f"Flagged fit {self._flagged_review_index + 1} of {len(flagged_cells)}"
         )
         self.review_identity.setText(
-            f"ROI {flagged.roi_label} · {self._fit_plan.phase_id} {flagged.hkl}"
+            f"ROI {flagged.roi_label} · {flagged.macro_pixel_width} × "
+            f"{flagged.macro_pixel_height} px · {self._fit_plan.phase_id} {flagged.hkl}"
         )
         self.review_reason.setText("; ".join(flagged.review_flags) or flagged.message)
         self.next_flagged_button.setVisible(len(flagged_cells) > 1)
@@ -1316,13 +1373,16 @@ class AgentWindow(QMainWindow):
             accepted = sum(item.accepted for item in candidates)
             conclusions[1] = (
                 "7 sample locations selected" if len(candidates) == 7 and accepted == 7
-                else "No safe set of seven locations found" if len(candidates) == 7
+                else f"{accepted} of 7 locations have valid coordinates" if len(candidates) == 7
+                else "Reference only · six locations missing" if len(candidates) == 1 and visual.phase_id
                 else "Locations not selected" if visual.phase_id
                 else "Waiting for phase comparison"
             )
             evidence[1] = (
-                f"{accepted} of {len(candidates)} proposed locations passed visual ROI checks. "
-                "NEAT also checks bounds, overlap and fitting windows before fitting."
+                f"{accepted} of 7 required locations have fit-ready coordinates. "
+                f"{max(0, len(candidates) - accepted)} proposed locations need valid coordinates; "
+                f"{max(0, 7 - len(candidates))} proposals are missing. "
+                "Image bounds and size are required; overlap, confidence, and boundary proximity are advisory."
             )
             inspectable[1] = True
             conclusions[2] = (
@@ -1340,15 +1400,14 @@ class AgentWindow(QMainWindow):
             conclusions[1] = "7 sample locations selected"
             conclusions[2] = f"Provisional match: {self._fit_plan.phase_id}"
             if fit is None:
-                conclusions[3] = "Fitting selected edges locally…"
+                conclusions[3] = "Fitting across 7 macro-pixel sizes…"
                 evidence[3] = self.fit_matrix_summary.text()
         if fit is not None:
             if fit.status in {AgentFitRunStatus.COMPLETE, AgentFitRunStatus.COMPLETE_WITH_ISSUES}:
                 heading = "Analysis complete"
-                conclusions[3] = (
-                    f"{fit.attempted} fits attempted · {fit.failed} failed"
-                    if fit.failed else f"{fit.succeeded} fits completed"
-                )
+                conclusions[3] = f"{fit.attempted} fits attempted across 7 sizes"
+                if fit.failed or fit.skipped:
+                    conclusions[3] += f" · {fit.failed} failed, {fit.skipped} skipped"
                 if fit.needs_review:
                     conclusions[3] += (
                         f" · {fit.needs_review} "
@@ -1630,8 +1689,13 @@ class AgentWindow(QMainWindow):
         self._pending_fit_plan = None
         self._fit_cells.clear()
         self._selected_roi_index = 0
+        self._selected_size_index = 3
         self._selected_edge_index = 0
         self._fit_results_filter = "all"
+        self.fit_size_combo.blockSignals(True)
+        self.fit_size_combo.clear()
+        self.fit_size_combo.setEnabled(False)
+        self.fit_size_combo.blockSignals(False)
         self.fit_matrix.setColumnCount(1)
         self.fit_matrix.setHorizontalHeaderLabels(["Waiting for validated edges"])
         for row in range(self.fit_matrix.rowCount()):
@@ -1663,6 +1727,28 @@ class AgentWindow(QMainWindow):
         self._fit_plan = plan
         self._fit_cells.clear()
         self._fit_results_filter = "all"
+        self.fit_size_combo.blockSignals(True)
+        self.fit_size_combo.clear()
+        for size in plan.macro_pixel_sizes:
+            label = f"{size.label} · baseline" if size.scale_level == 0 else (
+                f"{size.label} · {size.scale_level:+d} step"
+            )
+            self.fit_size_combo.addItem(label)
+        baseline_size = next(
+            (size for size in plan.macro_pixel_sizes if size.scale_level == 0),
+            plan.macro_pixel_sizes[0],
+        )
+        self.fit_size_baseline_note.setText(
+            f"Fixed baseline: {baseline_size.width} × {baseline_size.height} px. "
+            "Each location is tested at this size and three smaller and larger sizes."
+        )
+        self._selected_size_index = next(
+            (index for index, size in enumerate(plan.macro_pixel_sizes) if size.scale_level == 0),
+            0,
+        )
+        self.fit_size_combo.setCurrentIndex(self._selected_size_index)
+        self.fit_size_combo.setEnabled(bool(plan.macro_pixel_sizes))
+        self.fit_size_combo.blockSignals(False)
         self.fit_matrix.setColumnCount(len(plan.edges))
         self.fit_matrix.setHorizontalHeaderLabels(
             [f"{edge.hkl}\n{edge.edge_wavelength:.3f} Å" for edge in plan.edges]
@@ -1673,20 +1759,21 @@ class AgentWindow(QMainWindow):
                 item = QTableWidgetItem("Queued")
                 item.setTextAlignment(Qt.AlignCenter)
                 item.setToolTip(
-                    f"{label}, edge {edge.hkl}. Select to inspect this fit result."
+                    f"{label}, {plan.macro_pixel_sizes[self._selected_size_index].label}, "
+                    f"edge {edge.hkl}. Select to inspect this fit result."
                 )
                 self.fit_matrix.setItem(roi_index, edge_index, item)
+        total_fits = len(plan.spatial_rois) * len(plan.macro_pixel_sizes) * len(plan.edges)
         self.fit_matrix_summary.setText(
-            f"Provisional phase: {plan.phase_id} · {len(plan.spatial_rois)} locations · "
-            f"{len(plan.edges)} edges · {len(plan.spatial_rois) * len(plan.edges)} local fits"
+            f"{len(plan.spatial_rois)} locations · {len(plan.macro_pixel_sizes)} sizes · "
+            f"{len(plan.edges)} edges · {total_fits} combinations"
         )
         self.fit_results_title.setText("Fitting in progress")
-        self.fit_results_status.setText(
-            f"0/{len(plan.spatial_rois) * len(plan.edges)} attempted"
-        )
+        self.fit_results_status.setText(f"0/{total_fits} attempted")
         self.fit_results_phase_label.setText(f"{plan.phase_id} · provisional phase")
         self._refresh_fit_result_filters()
         self.fit_matrix.setCurrentCell(0, 0)
+        self._refresh_fit_result_roi_preview()
         self._update_selected_fit_evidence()
 
     @staticmethod
@@ -1733,12 +1820,20 @@ class AgentWindow(QMainWindow):
             widget.set_curve(curve)
         result = attempt.result if attempt is not None else None
         phase_id = self._fit_plan.phase_id if self._fit_plan is not None else ""
-        heading = f"ROI {cell.roi_label} · edge {cell.hkl} · {phase_id}".strip()
+        heading = (
+            f"ROI {cell.roi_label} · {cell.macro_pixel_width} × "
+            f"{cell.macro_pixel_height} px · edge {cell.hkl} · {phase_id}"
+        ).strip()
         self.fit_selected_heading.setText(heading)
         if self._fit_plan is not None:
             edge = self._fit_plan.edges[self._selected_edge_index]
+            roi_box = (
+                f"ROI box: {cell.roi.width} × {cell.roi.height} px"
+                if cell.roi is not None else "ROI box unavailable"
+            )
             self.fit_selected_marker.setText(
-                f"Theoretical edge wavelength: {edge.edge_wavelength:.4f} Å"
+                f"Theoretical edge wavelength: {edge.edge_wavelength:.4f} Å · "
+                f"{roi_box}"
             )
         state_text, state_color, state_background = {
             AgentFitCellState.QUEUED: ("Queued", "#536073", "#eef1f4"),
@@ -1794,13 +1889,14 @@ class AgentWindow(QMainWindow):
             self.fit_results_roi_preview.set_selected_roi(None)
             return
         roi_index = min(self._selected_roi_index, len(self._fit_plan.spatial_rois) - 1)
+        size_index = min(self._selected_size_index, len(self._fit_plan.macro_pixel_sizes) - 1)
         edge_index = min(self._selected_edge_index, len(self._fit_plan.edges) - 1)
         self.spatial_roi_preview.set_selected_roi(roi_index)
         self.fit_results_roi_preview.set_selected_roi(roi_index)
         self.fit_results_location_label.setText(
             f"Selected: {SPATIAL_ROI_LABELS[roi_index]}"
         )
-        cell = self._fit_cells.get((roi_index, edge_index))
+        cell = self._fit_cells.get((roi_index, size_index, edge_index))
         if cell is not None:
             self._show_fit_cell(cell)
         else:
@@ -1808,7 +1904,9 @@ class AgentWindow(QMainWindow):
                 widget.set_curve(None)
             edge = self._fit_plan.edges[edge_index]
             self.fit_selected_heading.setText(
-                f"ROI {SPATIAL_ROI_LABELS[roi_index]} · edge {edge.hkl} · {self._fit_plan.phase_id}"
+                f"ROI {SPATIAL_ROI_LABELS[roi_index]} · "
+                f"{self._fit_plan.macro_pixel_sizes[size_index].label} · "
+                f"edge {edge.hkl} · {self._fit_plan.phase_id}"
             )
             self.fit_selected_marker.setText(
                 f"Theoretical edge wavelength: {edge.edge_wavelength:.4f} Å"
@@ -1820,7 +1918,8 @@ class AgentWindow(QMainWindow):
             self.fit_result_warning_label.clear()
             self.fit_result_warning_label.hide()
             self.fit_detail_label.setText(
-                f"Theoretical edge wavelength: {edge.edge_wavelength:.4f} Å · waiting for fit evidence"
+                f"Theoretical edge wavelength: {edge.edge_wavelength:.4f} Å · "
+                "waiting for fit evidence"
             )
 
     def _select_fit_cell(self, row: int, column: int) -> None:
@@ -1828,6 +1927,43 @@ class AgentWindow(QMainWindow):
             return
         self._selected_roi_index = max(0, min(row, len(self._fit_plan.spatial_rois) - 1))
         self._selected_edge_index = max(0, min(column, len(self._fit_plan.edges) - 1))
+        self._update_selected_fit_evidence()
+
+    def _select_size_index(self, index: int) -> None:
+        if self._fit_plan is None or not 0 <= index < len(self._fit_plan.macro_pixel_sizes):
+            return
+        self._selected_size_index = index
+        size = self._fit_plan.macro_pixel_sizes[index]
+        for roi_index in range(self.fit_matrix.rowCount()):
+            for edge_index, edge in enumerate(self._fit_plan.edges):
+                cell = self._fit_cells.get((roi_index, index, edge_index))
+                if cell is None:
+                    candidate = self._fit_plan.spatial_rois[roi_index]
+                    cell = AgentFitCellResult(
+                        roi_index=roi_index,
+                        roi_label=candidate.label,
+                        roi=(
+                            roi_for_macro_pixel_size(candidate.roi, size)
+                            if candidate.roi is not None
+                            else None
+                        ),
+                        hkl=edge.hkl,
+                        state=AgentFitCellState.QUEUED,
+                        message="Waiting for this size-specific fit.",
+                        size_index=index,
+                        macro_pixel_width=size.width,
+                        macro_pixel_height=size.height,
+                    )
+                self._paint_fit_cell(roi_index, edge_index, cell)
+                item = self.fit_matrix.item(roi_index, edge_index)
+                if item is not None:
+                    item.setToolTip(
+                        f"{self._fit_plan.spatial_rois[roi_index].label}, {size.label}, "
+                        f"edge {edge.hkl}. Select to inspect this fit result."
+                    )
+        self._refresh_fit_result_roi_preview()
+        self._refresh_fit_result_filters()
+        self.fit_matrix.setCurrentCell(self._selected_roi_index, self._selected_edge_index)
         self._update_selected_fit_evidence()
 
     def _matrix_current_cell_changed(self, row: int, column: int, *_previous) -> None:
@@ -1839,8 +1975,9 @@ class AgentWindow(QMainWindow):
         if self._fit_results_filter == "review":
             flagged_rows = {
                 row
-                for (row, _column), cell in self._fit_cells.items()
-                if cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
+                for (row, size_index, _column), cell in self._fit_cells.items()
+                if size_index == self._selected_size_index
+                and cell.state in {AgentFitCellState.NEEDS_REVIEW, AgentFitCellState.FAILED}
             }
             if index not in flagged_rows:
                 self._set_fit_results_filter("all")
@@ -1924,7 +2061,7 @@ class AgentWindow(QMainWindow):
         )
         self.plan_text.setPlainText(
             self.plan_text.toPlainText()
-            + "\n\nNEAT validated seven distinct spatial ROIs, the provisional built-in phase, and the selected trusted edges. Local fitting is queued."
+            + "\n\nNEAT validated seven spatial ROI coordinate sets, the provisional built-in phase, and the selected trusted edges. Visual cautions remain available in the location evidence. Local fitting is queued."
         )
 
     def _start_pending_fitting(self) -> None:
@@ -1995,7 +2132,8 @@ class AgentWindow(QMainWindow):
         self._stage = "fitting_running"
         self.progress_bar.setValue(1)
         self._set_status(
-            f"Fitting {plan.phase_id} edges locally · 0/{len(plan.spatial_rois) * len(plan.edges)} attempted."
+            f"Fitting {plan.phase_id} edges locally across seven macro-pixel sizes · "
+            f"0/{len(plan.spatial_rois) * len(plan.macro_pixel_sizes) * len(plan.edges)} attempted."
         )
         self._update_controls()
         worker.start()
@@ -2019,21 +2157,32 @@ class AgentWindow(QMainWindow):
                 None,
             )
             if edge_index is not None:
-                self._fit_cells[(cell.roi_index, edge_index)] = cell
-                self._paint_fit_cell(cell.roi_index, edge_index, cell)
+                self._fit_cells[(cell.roi_index, cell.size_index, edge_index)] = cell
+                if cell.size_index == self._selected_size_index:
+                    self._paint_fit_cell(cell.roi_index, edge_index, cell)
                 if cell.state is not AgentFitCellState.RUNNING and (
                     cell.roi_index == self._selected_roi_index
+                    and cell.size_index == self._selected_size_index
                     and edge_index == self._selected_edge_index
                 ):
                     self._update_selected_fit_evidence()
         if event.stage == "fit_edges" and event.total_fits:
-            self.progress_bar.setValue(min(99, int(100 * event.attempted / event.total_fits)))
+            self.progress_bar.setValue(min(99, int(100 * event.completed / event.total_fits)))
             self.fit_results_title.setText("Fitting in progress")
             self.fit_results_status.setText(
-                f"{event.attempted}/{event.total_fits} attempted"
+                f"{event.attempted}/{event.total_fits} attempted · "
+                f"{event.completed}/{event.total_fits} checked"
+            )
+        elif event.stage == "extract_spectra" and event.total_fits:
+            self.progress_bar.setValue(min(20, int(20 * event.completed / event.total_fits)))
+            self.fit_results_title.setText("Preparing size-specific spectra")
+            self.fit_results_status.setText(
+                f"{event.completed}/{event.total_fits} combinations checked"
             )
         else:
-            self.progress_bar.setValue(5)
+            self.progress_bar.setValue(
+                min(20, int(20 * event.completed / max(1, event.total_fits)))
+            )
         self._set_status(event.message)
 
     def _paint_fit_cell(self, row: int, column: int, cell: AgentFitCellResult) -> None:
@@ -2078,26 +2227,30 @@ class AgentWindow(QMainWindow):
                 None,
             )
             if edge_index is not None:
-                self._fit_cells[(cell.roi_index, edge_index)] = cell
-                self._paint_fit_cell(cell.roi_index, edge_index, cell)
+                self._fit_cells[(cell.roi_index, cell.size_index, edge_index)] = cell
+                if cell.size_index == self._selected_size_index:
+                    self._paint_fit_cell(cell.roi_index, edge_index, cell)
         self._stage = outcome.status.value
         self.fit_matrix_summary.setText(
             f"{outcome.attempted}/{outcome.total_fits} attempted · {outcome.succeeded} fit results · "
-            f"{outcome.failed} failed · {outcome.needs_review} need review · {outcome.cancelled} stopped"
+            f"{outcome.failed} failed · {outcome.needs_review} need review · "
+            f"{outcome.skipped} skipped · {outcome.cancelled} stopped"
         )
         if outcome.status is AgentFitRunStatus.COMPLETE:
             self.fit_results_title.setText("Analysis completed")
             self.fit_results_status.setText(
                 f"{outcome.succeeded} fits completed · all results ready to inspect"
             )
-            status = "Seven-location fitting completed. Review the matrix and selected evidence."
+            status = "Seven-location, seven-size fitting completed. Review the matrix and selected evidence."
         elif outcome.status is AgentFitRunStatus.COMPLETE_WITH_ISSUES:
             self.fit_results_title.setText("Results need review")
             self.fit_results_status.setText(
-                f"{outcome.failed} failed · {outcome.needs_review} need review"
+                f"{outcome.failed} failed · {outcome.skipped} skipped · "
+                f"{outcome.needs_review} need review"
             )
             status = (
-                f"Fitting completed · {outcome.failed} failed · {outcome.needs_review} need review."
+                f"Fitting completed · {outcome.failed} failed · {outcome.skipped} skipped · "
+                f"{outcome.needs_review} need review."
             )
         elif outcome.status is AgentFitRunStatus.STOPPED:
             self.fit_results_title.setText("Analysis stopped")
@@ -2123,16 +2276,20 @@ class AgentWindow(QMainWindow):
             None,
         )
         if first_review is not None:
+            self._selected_size_index = first_review.size_index
+            self.fit_size_combo.setCurrentIndex(self._selected_size_index)
             self._selected_roi_index = first_review.roi_index
             self._selected_edge_index = next(
                 index for index, edge in enumerate(outcome.edges) if edge.hkl == first_review.hkl
             )
+        self._select_size_index(self._selected_size_index)
         self.fit_matrix.setCurrentCell(self._selected_roi_index, self._selected_edge_index)
         self._update_selected_fit_evidence()
         self.plan_text.setPlainText(
             self.plan_text.toPlainText()
             + f"\n\nLocal fitting: {outcome.attempted}/{outcome.total_fits} attempted, "
-            f"{outcome.succeeded} results, {outcome.failed} failed, {outcome.needs_review} need review. "
+            f"{outcome.succeeded} results, {outcome.failed} failed, {outcome.skipped} skipped, "
+            f"{outcome.needs_review} need review. "
             + outcome.message
             + "\nNo mapping, phase confirmation, strain, or stress calculation was performed."
         )

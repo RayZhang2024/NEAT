@@ -203,11 +203,9 @@ class FakeVision:
 class FakeSevenRoiVision(FakeVision):
     """Fake the same bounded request while returning six added locations."""
 
-    def __init__(self, *, medium_location: str | None = None,
-                 retry_stays_uncertain: bool = False, **kwargs):
+    def __init__(self, *, medium_location: str | None = None, **kwargs):
         super().__init__(**kwargs)
         self.medium_location = medium_location
-        self.retry_stays_uncertain = retry_stays_uncertain
 
     def inspect(self, stage, images, prompt):
         if stage not in {"sample_roi", "sample_locations"}:
@@ -230,19 +228,12 @@ class FakeSevenRoiVision(FakeVision):
         }
         additional = []
         for index, coordinates in enumerate(rois[1:]):
-            if (stage == "sample_locations" and self.medium_location == chr(65 + index)
-                    and sum(call[0] == "sample_locations" for call in self.calls) > 1
-                    and not self.retry_stays_uncertain):
-                coordinates = (40, 45, 30, 35)
+            caution = stage == "sample_locations" and self.medium_location == chr(65 + index)
             additional.append({
                 "roi": dict(zip(("x_min", "x_max", "y_min", "y_max"), coordinates)),
-                "reason": "Distinct visible sample interior.",
-                "confidence": "medium" if (
-                    self.medium_location == chr(65 + index)
-                    and (self.retry_stays_uncertain or
-                         sum(call[0] == "sample_locations" for call in self.calls) == 1)
-                ) else "high",
-                "ambiguity_flags": [],
+                "reason": "Near the sample boundary." if caution else "Visible sample region.",
+                "confidence": "medium" if caution else "high",
+                "ambiguity_flags": ["Near the sample boundary."] if caution else [],
             })
         return {**reference, **({"additional_rois": additional} if stage == "sample_locations" else {})}
 
@@ -478,10 +469,10 @@ class VisionServiceTests(unittest.TestCase):
         self.assertEqual(len(outcome.spatial_roi_candidates), 7)
         self.assertEqual(len(model.calls), 3)
         self.assertEqual(len(model.calls[-1][1]), 3)
-        self.assertIn("Already accepted locations", model.calls[-1][2])
+        self.assertIn("Existing locations", model.calls[-1][2])
         self.assertEqual(len(outcome.inspected_frames), 3)
 
-    def test_ambiguous_spatial_roi_is_replaced_before_fitting(self):
+    def test_medium_confidence_spatial_roi_is_kept_without_retry(self):
         handle, preflight = _fixture()
         outcome = run_visual_rehearsal(
             "seven-roi-run",
@@ -493,18 +484,65 @@ class VisionServiceTests(unittest.TestCase):
 
         self.assertEqual(len(outcome.spatial_roi_candidates), 7)
         self.assertTrue(all(candidate.accepted for candidate in outcome.spatial_roi_candidates))
-        self.assertEqual(outcome.request_stages[-2:], ("sample_locations", "sample_locations"))
+        self.assertEqual(outcome.request_stages[-1], "sample_locations")
+        self.assertEqual(outcome.spatial_roi_candidates[3].confidence, "medium")
 
-    def test_ambiguous_spatial_roi_remains_unaccepted_after_bounded_retries(self):
+    def test_boundary_caution_is_preserved_without_blocking_the_location(self):
         handle, preflight = _fixture()
         outcome = run_visual_rehearsal(
             "seven-roi-run", handle, preflight,
-            FakeSevenRoiVision(medium_location="C", retry_stays_uncertain=True),
+            FakeSevenRoiVision(medium_location="C"),
             require_spatial_rois=True,
         )
-        self.assertFalse(outcome.spatial_roi_candidates[3].accepted)
+        candidate = outcome.spatial_roi_candidates[3]
+        self.assertTrue(candidate.accepted)
+        self.assertEqual(candidate.ambiguity_flags, ("Near the sample boundary.",))
+        self.assertEqual(outcome.request_stages.count("sample_locations"), 1)
+
+    def test_replacement_retry_rejects_repeated_center_and_moves_location(self):
+        handle, preflight = _fixture()
+
+        class MovingRetryVision(FakeSevenRoiVision):
+            def inspect(self, stage, images, prompt):
+                response = super().inspect(stage, images, prompt)
+                if stage != "sample_locations":
+                    return response
+                attempt = sum(call[0] == "sample_locations" for call in self.calls)
+                replacement_coordinates = {
+                    1: (20, 22, 20, 22),  # Invalid 2 × 2 proposal.
+                    2: (19, 23, 19, 23),  # Valid size, but the same center.
+                    3: (26, 30, 20, 24),  # A new location.
+                }[attempt]
+                x_min, x_max, y_min, y_max = replacement_coordinates
+                response["additional_rois"][2]["roi"] = {
+                    "x_min": x_min,
+                    "x_max": x_max,
+                    "y_min": y_min,
+                    "y_max": y_max,
+                }
+                return response
+
+        model = MovingRetryVision()
+        outcome = run_visual_rehearsal(
+            "seven-roi-run", handle, preflight, model, require_spatial_rois=True
+        )
+
+        candidate = outcome.spatial_roi_candidates[3]
+        self.assertTrue(candidate.accepted)
+        self.assertEqual(candidate.proposed_coordinates, (26, 30, 20, 24))
         self.assertEqual(outcome.request_stages.count("sample_locations"), 3)
-        self.assertIn("No safe replacement after two retries", outcome.spatial_roi_candidates[3].validation_error)
+        location_prompts = [call[2] for call in model.calls if call[0] == "sample_locations"]
+        self.assertIn("C: x[20,22), y[20,22)", location_prompts[1])
+        self.assertIn("C: x[19,23), y[19,23)", location_prompts[2])
+        tried_centers = {
+            (20 + 22, 20 + 22),
+            (19 + 23, 19 + 23),
+        }
+        final_center = (
+            candidate.proposed_coordinates[0] + candidate.proposed_coordinates[1],
+            candidate.proposed_coordinates[2] + candidate.proposed_coordinates[3],
+        )
+        self.assertNotIn(final_center, tried_centers)
 
     def test_actual_pngs_roi_bootstrap_overlay_and_no_scientific_writes(self):
         handle, preflight = _fixture()
