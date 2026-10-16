@@ -100,6 +100,7 @@ def agent_langsmith_context(
     region: str,
     workspace_id: str = "",
     workflow: str,
+    thread_id: str | None = None,
 ) -> Iterator[bool]:
     """Set the addressed LangSmith context for one opt-in workflow stage."""
     try:
@@ -145,6 +146,7 @@ def agent_langsmith_context(
             address=address,
             tags=tags,
             client=client,
+            metadata={"thread_id": thread_id} if thread_id else None,
         ):
             yield True
     finally:

@@ -866,6 +866,8 @@ def run_agent_fitting(
                 "blocked": False,
             },
             config={
+                "run_name": "NEAT: Macro-pixel fitting",
+                "configurable": {"thread_id": plan.run_id},
                 "recursion_limit": (
                     len(plan.spatial_rois) * len(plan.macro_pixel_sizes) + total + 10
                 )

@@ -993,6 +993,7 @@ def run_visual_rehearsal(
             environment=langsmith_environment,
             region=langsmith_region,
             workspace_id=langsmith_workspace_id,
+            thread_id=run_id,
             workflow="neat_sample_roi",
         ):
             response = inspector.inspect(
@@ -1236,7 +1237,11 @@ def run_visual_rehearsal(
     ):
         phase_state = phase_graph.compile().invoke(
             {"phases": [], "overlays": (), "proposal": None, "request_stages": []},
-            config={"configurable": {"thread_id": run_id}, "recursion_limit": 8},
+            config={
+                "run_name": "NEAT: Phase comparison",
+                "configurable": {"thread_id": run_id},
+                "recursion_limit": 8,
+            },
         )
     phases = phase_state["phases"]
     overlays = phase_state["overlays"]
@@ -1465,6 +1470,7 @@ def run_visual_rehearsal(
                     "tried_coordinates": {},
                 },
                 config={
+                    "run_name": "NEAT: Sample location selection",
                     "configurable": {"thread_id": run_id},
                     "recursion_limit": 8,
                 },
