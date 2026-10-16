@@ -33,12 +33,17 @@ from NEAT.services.agent_fitting import (
     run_agent_fitting,
     validate_spatial_roi_candidates,
 )
+from NEAT.services.agent_mapping import (
+    build_mapping_calibration_plan,
+    mean_mapping_shape_parameters,
+)
 from NEAT.services.agent_vision import trusted_phase_edges
 from NEAT.services.scientific_observation import (
     StaleDatasetError,
     create_dataset_handle,
     get_roi_spectrum,
 )
+from NEAT.ui.agent_fitting_worker import AgentFitWorker
 
 ROI_BOUNDS = (
     RoiBounds(15, 35, 15, 35),
@@ -229,6 +234,74 @@ def _macro_pixel_outcome(
 
 
 class AgentFittingTests(TestCase):
+    def test_mapping_calibration_uses_one_exact_size_with_the_same_locations(self):
+        handle, plan, _clock = _make_run(2)
+        selected_hkl = plan.edges[1].hkl
+
+        calibration = build_mapping_calibration_plan(
+            plan, 19, hkls=(selected_hkl,)
+        )
+
+        self.assertEqual(calibration.spatial_rois, plan.spatial_rois)
+        self.assertEqual(tuple(edge.hkl for edge in calibration.edges), (selected_hkl,))
+        self.assertEqual(
+            tuple((size.width, size.height) for size in calibration.macro_pixel_sizes),
+            ((19, 19),),
+        )
+        self.assertEqual((calibration.dataset_id, calibration.revision), (handle.dataset_id, handle.revision))
+
+    def test_mapping_calibration_fits_all_seven_locations_at_the_exact_size(self):
+        handle, plan, _clock = _make_run(1)
+        calibration = build_mapping_calibration_plan(plan, 19)
+        calls = []
+
+        def fit(_wavelengths, _intensities, config, **_kwargs):
+            calls.append(config.hkl)
+            return _successful_attempt(config)
+
+        engine = type("FitSpy", (), {"fit_individual_edge": staticmethod(fit)})()
+        with patch("NEAT.services.agent_fitting.FittingEngine", return_value=engine):
+            outcome = run_agent_fitting(
+                handle, calibration, mapping_calibration=True
+            )
+
+        self.assertEqual(outcome.total_fits, 7)
+        self.assertEqual(outcome.succeeded, 7)
+        self.assertEqual(len(calls), 7)
+        self.assertEqual({cell.macro_pixel_width for cell in outcome.cells}, {19})
+
+    def test_mapping_parameter_means_use_only_successful_finite_fits(self):
+        outcome = _macro_pixel_outcome(((0.01,) * 7,))
+        cells = []
+        successful_values = []
+        for cell in outcome.cells:
+            if cell.size_index != 4:
+                cells.append(replace(cell, state=AgentFitCellState.FAILED, attempt=None))
+                continue
+            if cell.roi_index == 0:
+                cells.append(replace(cell, state=AgentFitCellState.NEEDS_REVIEW))
+                continue
+            if cell.roi_index == 6:
+                cells.append(replace(cell, state=AgentFitCellState.FAILED, attempt=None))
+                continue
+            t_value = 0.01 * (cell.roi_index + 1)
+            eta_value = 0.1 * (cell.roi_index + 1)
+            result = replace(
+                cell.attempt.result,
+                t_fit=t_value,
+                eta_fit=eta_value,
+            )
+            cells.append(replace(cell, attempt=replace(cell.attempt, result=result)))
+            successful_values.append((t_value, eta_value))
+        outcome = replace(outcome, cells=tuple(cells))
+
+        means = mean_mapping_shape_parameters(outcome, size_index=4)
+
+        self.assertEqual(len(means), 1)
+        self.assertEqual(means[0].valid_locations, 5)
+        self.assertAlmostEqual(means[0].t, np.mean([value[0] for value in successful_values]))
+        self.assertAlmostEqual(means[0].eta, np.mean([value[1] for value in successful_values]))
+
     def test_macro_pixel_size_series_uses_requested_rounding_and_rectangles(self):
         expected_square = ((6, 6), (8, 8), (10, 10), (13, 13), (17, 17), (21, 21), (26, 26))
         sizes = build_macro_pixel_sizes(13, 13)
@@ -400,6 +473,26 @@ class AgentFittingTests(TestCase):
         for before, after in zip(source_snapshot, handle.frames):
             np.testing.assert_array_equal(before, after)
         self.assertTrue(any(event.attempted == 147 for event in progress))
+
+    def test_unexpected_worker_error_reports_detail_and_logs_traceback(self):
+        handle, plan, _clock = _make_run(1)
+        worker = AgentFitWorker(handle, plan)
+        outcomes = []
+        worker.completed.connect(outcomes.append)
+
+        with (
+            patch(
+                "NEAT.ui.agent_fitting_worker.run_agent_fitting",
+                side_effect=TypeError("unexpected graph state payload"),
+            ),
+            self.assertLogs("NEAT.ui.agent_fitting_worker", level="ERROR") as logs,
+        ):
+            worker.run()
+
+        self.assertEqual(len(outcomes), 1)
+        self.assertIn("TypeError: unexpected graph state payload", outcomes[0].message)
+        self.assertIn("launch console", outcomes[0].message)
+        self.assertIn("Traceback", "\n".join(logs.output))
 
     def test_five_edges_run_every_safe_location_size_combination(self):
         handle, plan, _clock = _make_run(5)

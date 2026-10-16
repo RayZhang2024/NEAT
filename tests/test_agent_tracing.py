@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from typing import TypedDict
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+from langgraph.graph import END, START, StateGraph
 
 from NEAT.services.agent_tracing import (
     TracedLLMCallResult,
+    _new_langchain_agent_tracer,
     agent_langsmith_context,
     openai_chat_completion_usage_metadata,
     trace_llm_call,
@@ -13,6 +17,60 @@ from NEAT.services.agent_tracing import (
 
 
 class AgentTracingTests(TestCase):
+    def test_langgraph_invocation_runs_with_addressed_tracer_context(self):
+        class State(TypedDict):
+            value: int
+
+        graph_builder = StateGraph(State)
+        graph_builder.add_node("increment", lambda state: {"value": state["value"] + 1})
+        graph_builder.add_edge(START, "increment")
+        graph_builder.add_edge("increment", END)
+        graph = graph_builder.compile()
+
+        with (
+            patch("NEAT.services.agent_tracing._new_client", return_value=MagicMock()),
+            agent_langsmith_context(
+                enabled=True,
+                api_key="ls-test-secret",
+                agent_id="neat-test-agent",
+                environment="development",
+                region="eu",
+                workflow="neat_test_workflow",
+            ) as active,
+        ):
+            self.assertTrue(active)
+            self.assertEqual(graph.invoke({"value": 1}), {"value": 2})
+
+    def test_addressed_tracer_accepts_langchain_reconstruction_arguments(self):
+        client = object()
+        address = {
+            "kind": "AGENT",
+            "id": "neat-test-agent",
+            "environment": "DEVELOPMENT",
+        }
+        tracer = _new_langchain_agent_tracer(
+            client=client,
+            address=address,
+            tags=["neat-agent", "test"],
+        )
+
+        reconstructed = type(tracer)(
+            example_id="00000000-0000-0000-0000-000000000001",
+            project_name="default",
+            client=client,
+            tags=["reconstructed"],
+            metadata={"source": "test"},
+        )
+
+        self.assertEqual(
+            str(reconstructed.example_id),
+            "00000000-0000-0000-0000-000000000001",
+        )
+        self.assertIs(reconstructed.client, client)
+        self.assertEqual(reconstructed.tags, ["reconstructed"])
+        self.assertEqual(reconstructed.tracing_metadata, {"source": "test"})
+        self.assertIsNone(reconstructed.project_name)
+
     def test_openai_usage_is_normalized_for_langsmith(self):
         self.assertEqual(
             openai_chat_completion_usage_metadata(

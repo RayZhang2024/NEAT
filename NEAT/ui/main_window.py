@@ -200,6 +200,8 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
         self.agent_planning_worker = None
         self.agent_vision_worker = None
         self.agent_fitting_worker = None
+        self.agent_mapping_calibration_worker = None
+        self.agent_mapping_worker = None
         self.setup_menu_bar()
 
         # Variables for storing image data and auto-adjust parameters
@@ -1262,6 +1264,16 @@ class FitsViewer(QMainWindow, PreprocessingMixin, FittingMixin, PostProcessingMi
             agent_window = getattr(self, "agent_window", None)
             if agent_window is not None:
                 agent_window.fit_worker_retired(worker, callbacks_suppressed)
+        elif role == "agent_mapping_calibration":
+            agent_window = getattr(self, "agent_window", None)
+            if agent_window is not None:
+                agent_window.mapping_calibration_worker_retired(
+                    worker, callbacks_suppressed
+                )
+        elif role == "agent_mapping":
+            agent_window = getattr(self, "agent_window", None)
+            if agent_window is not None:
+                agent_window.mapping_worker_retired(worker, callbacks_suppressed)
         if self._shutdown_close_pending and callbacks_suppressed:
             if role == "fits_image_loader":
                 self._hide_load_progress_dialog()
