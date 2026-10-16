@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Literal, TypedDict, cast
 
 LANGSMITH_REGION_ENDPOINTS = {
@@ -16,6 +17,43 @@ LANGSMITH_REGION_ENDPOINTS = {
 
 class LangSmithConnectionError(RuntimeError):
     """A safe, credential-free LangSmith connection-test failure."""
+
+
+@dataclass(frozen=True)
+class TracedLLMCallResult:
+    """Keep provider usage alongside the output until the LLM run is finalized."""
+
+    output: Any
+    usage_metadata: Mapping[str, int] | None = None
+
+
+def openai_chat_completion_usage_metadata(
+    response: object,
+) -> dict[str, int] | None:
+    """Normalize OpenAI Chat Completions token counts for LangSmith."""
+    if not isinstance(response, Mapping):
+        return None
+    usage = response.get("usage")
+    if not isinstance(usage, Mapping):
+        return None
+
+    counts: dict[str, int] = {}
+    for field, provider_fields in (
+        ("input_tokens", ("prompt_tokens", "input_tokens")),
+        ("output_tokens", ("completion_tokens", "output_tokens")),
+        ("total_tokens", ("total_tokens",)),
+    ):
+        for provider_field in provider_fields:
+            value = usage.get(provider_field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                counts[field] = value
+                break
+
+    if "total_tokens" not in counts and {
+        "input_tokens", "output_tokens"
+    }.issubset(counts):
+        counts["total_tokens"] = counts["input_tokens"] + counts["output_tokens"]
+    return counts or None
 
 
 class _AgentAddress(TypedDict):
@@ -162,13 +200,32 @@ def trace_llm_call(
     operation: Callable[[], Any],
 ) -> Any:
     """Trace one direct provider request as an LLM child run when enabled."""
+    def unwrap_result(
+        result: Any,
+        *,
+        get_current_run_tree: Callable[[], Any] | None = None,
+    ) -> Any:
+        if not isinstance(result, TracedLLMCallResult):
+            return result
+        if result.usage_metadata and get_current_run_tree is not None:
+            try:
+                run_tree = get_current_run_tree()
+                if run_tree is not None:
+                    run_tree.metadata.update(
+                        usage_metadata=dict(result.usage_metadata)
+                    )
+            # Tracing metadata failures must not block the provider call.
+            except Exception:  # noqa: BLE001
+                pass
+        return result.output
+
     try:
         from langsmith import traceable
-        from langsmith.run_helpers import get_tracing_context
+        from langsmith.run_helpers import get_current_run_tree, get_tracing_context
     except (ImportError, OSError):
-        return operation()
+        return unwrap_result(operation())
     if not get_tracing_context().get("enabled"):
-        return operation()
+        return unwrap_result(operation())
 
     operation_started = False
     operation_result: list[Any] = []
@@ -176,7 +233,9 @@ def trace_llm_call(
     def invoke(_inputs: Mapping[str, object]) -> Any:
         nonlocal operation_started
         operation_started = True
-        result = operation()
+        result = unwrap_result(
+            operation(), get_current_run_tree=get_current_run_tree
+        )
         operation_result.append(result)
         return result
 
@@ -187,7 +246,7 @@ def trace_llm_call(
             metadata={"ls_provider": provider, "ls_model_name": model_id},
         )(invoke)
     except Exception:  # noqa: BLE001 - tracing setup must not block the model call
-        return operation()
+        return unwrap_result(operation())
     try:
         return traced_invoke(dict(inputs))
     except Exception:
@@ -195,7 +254,7 @@ def trace_llm_call(
             return operation_result[0]
         if operation_started:
             raise
-        return operation()
+        return unwrap_result(operation())
 
 
 def test_langsmith_trace_connection(

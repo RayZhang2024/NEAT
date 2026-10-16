@@ -34,7 +34,12 @@ from ..domain.observation import (
     WavelengthAxisStatus,
 )
 from .agent_model import validate_agent_settings
-from .agent_tracing import agent_langsmith_context, trace_llm_call
+from .agent_tracing import (
+    TracedLLMCallResult,
+    agent_langsmith_context,
+    openai_chat_completion_usage_metadata,
+    trace_llm_call,
+)
 from .scientific_observation import (
     _PLOT_LOCK,
     DatasetUnavailableError,
@@ -355,7 +360,7 @@ class OpenAIVisionInspector:
 
     def _send_and_parse(
         self, body: Mapping[str, object]
-    ) -> Mapping[str, object]:
+    ) -> TracedLLMCallResult:
         try:
             import httpx
         except ImportError as exc:
@@ -436,6 +441,7 @@ class OpenAIVisionInspector:
             envelope = json.loads(raw)
             if not isinstance(envelope, Mapping):
                 raise VisionError("OpenAI returned an invalid visual-review response.")
+            usage_metadata = openai_chat_completion_usage_metadata(envelope)
             choices = envelope.get("choices")
             if not isinstance(choices, list) or not choices:
                 raise VisionError("OpenAI returned no visual-review choice.")
@@ -464,7 +470,10 @@ class OpenAIVisionInspector:
             ) from exc
         if not isinstance(result, dict):
             raise VisionError("OpenAI model returned a non-object response.")
-        return result
+        return TracedLLMCallResult(
+            output=result,
+            usage_metadata=usage_metadata,
+        )
 
     def cancel(self) -> None:
         with self._lock:

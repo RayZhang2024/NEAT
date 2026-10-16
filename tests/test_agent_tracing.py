@@ -4,10 +4,74 @@ from contextlib import nullcontext
 from unittest import TestCase
 from unittest.mock import patch
 
-from NEAT.services.agent_tracing import agent_langsmith_context, trace_llm_call
+from NEAT.services.agent_tracing import (
+    TracedLLMCallResult,
+    agent_langsmith_context,
+    openai_chat_completion_usage_metadata,
+    trace_llm_call,
+)
 
 
 class AgentTracingTests(TestCase):
+    def test_openai_usage_is_normalized_for_langsmith(self):
+        self.assertEqual(
+            openai_chat_completion_usage_metadata(
+                {
+                    "usage": {
+                        "prompt_tokens": 13,
+                        "completion_tokens": 7,
+                        "total_tokens": 20,
+                    }
+                }
+            ),
+            {"input_tokens": 13, "output_tokens": 7, "total_tokens": 20},
+        )
+
+    def test_llm_usage_metadata_is_attached_to_the_trace_run(self):
+        run_tree = type("RunTree", (), {"metadata": {}})()
+        output = {"status_code": 200, "body": "{}"}
+
+        def traceable_factory(**_options):
+            def decorate(function):
+                def traced(inputs):
+                    return function(inputs)
+
+                return traced
+
+            return decorate
+
+        with (
+            patch("langsmith.traceable", side_effect=traceable_factory),
+            patch(
+                "langsmith.run_helpers.get_tracing_context",
+                return_value={"enabled": True},
+            ),
+            patch(
+                "langsmith.run_helpers.get_current_run_tree",
+                return_value=run_tree,
+            ),
+        ):
+            result = trace_llm_call(
+                name="Test model request",
+                provider="openai",
+                model_id="gpt-test",
+                inputs={},
+                operation=lambda: TracedLLMCallResult(
+                    output=output,
+                    usage_metadata={
+                        "input_tokens": 13,
+                        "output_tokens": 7,
+                        "total_tokens": 20,
+                    },
+                ),
+            )
+
+        self.assertIs(result, output)
+        self.assertEqual(
+            run_tree.metadata["usage_metadata"],
+            {"input_tokens": 13, "output_tokens": 7, "total_tokens": 20},
+        )
+
     def test_llm_call_creates_langsmith_llm_run_with_inputs_and_outputs(self):
         observed = {}
         inputs = {
