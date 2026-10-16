@@ -197,10 +197,31 @@ def fitting_function_3(
                 l_shift = 0.5 + np.arctan(u_shift) / np.pi
                 return l_plain - shift * (l_plain - l_shift)
 
+            delta = x - x_hkl
+            erfc_argument = -delta / (np.sqrt(2) * s) + s / t
+            exp_erfc = np.empty_like(np.asarray(delta, dtype=float))
+            nonnegative_argument = erfc_argument >= 0
+            delta_array = np.asarray(delta, dtype=float)
+            exp_erfc[nonnegative_argument] = (
+                np.exp(
+                    -0.5 * (delta_array[nonnegative_argument] / s) ** 2
+                    + (np.sqrt(2) - 1)
+                    * delta_array[nonnegative_argument]
+                    / t
+                    - 0.5 * (s / t) ** 2
+                )
+                * special.erfcx(erfc_argument[nonnegative_argument])
+            )
+            negative_argument = ~nonnegative_argument
+            exp_erfc[negative_argument] = (
+                np.exp(
+                    -delta_array[negative_argument] / t
+                    + s**2 / (2 * t**2)
+                )
+                * special.erfc(erfc_argument[negative_argument])
+            )
             g_term = 0.5 * (
-                special.erfc(-(x - x_hkl) / (np.sqrt(2) * s))
-                - np.exp(-(x - x_hkl) / t + s**2 / (2 * t**2))
-                * special.erfc(-(x - x_hkl) / (np.sqrt(2) * s) + s / t)
+                special.erfc(-delta / (np.sqrt(2) * s)) - exp_erfc
             )
 
             l_term = _l_int_exp_tail(x, x_hkl, s, t)

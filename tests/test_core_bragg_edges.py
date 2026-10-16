@@ -1,5 +1,6 @@
 import math
 import unittest
+import warnings
 
 import numpy as np
 
@@ -52,6 +53,30 @@ class TestCoreBraggEdges(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(gaussian)))
         self.assertTrue(np.all(np.isfinite(lorentzian)))
         self.assertFalse(np.allclose(gaussian, lorentzian))
+
+    def test_edge_model_avoids_overflow_in_gaussian_exponential_tail(self):
+        x = np.array([2.0])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            result = fitting_function_3(
+                x,
+                a0=0.1,
+                b0=0.02,
+                a_hkl=0.3,
+                b_hkl=0.01,
+                s=0.5,
+                t=0.01,
+                eta=0.0,
+                hkl_list=[(1, 0, 0)],
+                min_wavelength=1.8,
+                max_wavelength=2.2,
+                structure_type="cubic",
+                lattice_params={"a": 1.0},
+            )
+
+        self.assertTrue(np.all(np.isfinite(result)))
+        self.assertGreater(result[0], 0.0)
+        self.assertEqual(caught, [])
 
     def test_edge_model_ignores_edge_outside_fit_window(self):
         x = np.linspace(1.0, 1.5, 21)
