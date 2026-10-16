@@ -121,9 +121,13 @@ class SpatialRoiPreviewWidget(QWidget):
         self.setAccessibleName("Actual sample image with labelled, clickable spatial ROIs")
         self.setAccessibleDescription(
             "Seven original-pixel sample regions are labelled Reference and A through F. "
+            "A dashed outline and exclamation mark indicate advisory visual cautions. "
             "Click a rectangle or press 1 through 7 to select its fitting results."
         )
-        self.setToolTip("Click a labelled ROI to show its result row; keyboard keys 1–7 also select ROIs.")
+        self.setToolTip(
+            "Dashed outlines and ! indicate visual cautions, which do not block fitting. "
+            "Click a labelled ROI to show its result row; keyboard keys 1–7 also select ROIs."
+        )
 
     def set_preview(self, png_bytes, mapping, candidates=()) -> None:
         pixmap = QPixmap()
@@ -179,13 +183,23 @@ class SpatialRoiPreviewWidget(QWidget):
             ).intersected(target)
             if rect.isEmpty():
                 continue
+            caution = (
+                candidate.confidence not in {"high", "user-selected"}
+                or bool(candidate.ambiguity_flags)
+                or "boundary" in candidate.reason.casefold()
+                or "overlap" in candidate.reason.casefold()
+            )
             color = QColor(self._COLORS[index] if candidate.accepted else "#ff3030")
             pen = QPen(color, 3 if index == self._selected_index else 2)
-            if not candidate.accepted:
+            if not candidate.accepted or caution:
                 pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
             painter.drawRect(rect)
-            text = candidate.label if candidate.accepted else f"{candidate.label}?"
+            text = (
+                f"{candidate.label}!" if candidate.accepted and caution
+                else candidate.label if candidate.accepted
+                else f"{candidate.label}?"
+            )
             label_rect = QRectF(rect.left(), rect.top(), max(30, len(text) * 9 + 8), 18)
             painter.fillRect(label_rect, QColor("#17212b"))
             painter.setPen(color)
@@ -775,6 +789,10 @@ class AgentWindow(QMainWindow):
         self.fit_size_combo.currentIndexChanged.connect(self._select_size_index)
         size_row.addWidget(self.fit_size_combo, 1)
         left_layout.addLayout(size_row)
+        self.fit_size_baseline_note = QLabel("", left_panel)
+        self.fit_size_baseline_note.setWordWrap(True)
+        self.fit_size_baseline_note.setStyleSheet("color: #536073; font-size: 11px;")
+        left_layout.addWidget(self.fit_size_baseline_note)
 
         filter_row = QHBoxLayout()
         self.fit_results_all_button = QPushButton("All 7 locations", left_panel)
@@ -1018,7 +1036,7 @@ class AgentWindow(QMainWindow):
         if index == 1:
             self.step_evidence_heading.setText(titles[1])
             self.step_evidence_subtitle.setText(
-                "The proposed sample regions, their original-pixel coordinates, and local checks."
+                "The proposed sample regions, their coordinates, and any visual cautions."
             )
             candidates = visual.spatial_roi_candidates if visual is not None else ()
             if result is not None and result.frames:
@@ -1034,8 +1052,10 @@ class AgentWindow(QMainWindow):
                     "Location checks",
                     [
                         (
-                            f"{accepted} of {len(candidates)} locations have valid coordinates. "
-                            "NEAT separately checks bounds, overlap, and fitting windows before start."
+                            f"{accepted} of 7 required locations have fit-ready coordinates. "
+                            f"{max(0, len(candidates) - accepted)} proposed locations need valid coordinates; "
+                            f"{max(0, 7 - len(candidates))} proposals are missing. "
+                            "Image bounds and size are required; overlap, confidence, and boundary proximity are advisory."
                         )
                     ],
                 )
@@ -1051,9 +1071,11 @@ class AgentWindow(QMainWindow):
                         bounds = f"x[{x_min},{x_max}), y[{y_min},{y_max})"
                     else:
                         bounds = "coordinates unavailable"
-                    state = "Accepted" if candidate.accepted else "Not validated"
+                    state = "Ready" if candidate.accepted else "Needs valid coordinates"
                     reason = candidate.validation_error or candidate.reason
                     details = f"{candidate.label}: {state} · {bounds}"
+                    if candidate.confidence:
+                        details += f" · confidence: {candidate.confidence} (advisory)"
                     if reason:
                         details += f" · {reason}"
                     if candidate.ambiguity_flags:
@@ -1351,13 +1373,16 @@ class AgentWindow(QMainWindow):
             accepted = sum(item.accepted for item in candidates)
             conclusions[1] = (
                 "7 sample locations selected" if len(candidates) == 7 and accepted == 7
-                else "No safe set of seven locations found" if len(candidates) == 7
+                else f"{accepted} of 7 locations have valid coordinates" if len(candidates) == 7
+                else "Reference only · six locations missing" if len(candidates) == 1 and visual.phase_id
                 else "Locations not selected" if visual.phase_id
                 else "Waiting for phase comparison"
             )
             evidence[1] = (
-                f"{accepted} of {len(candidates)} proposed locations passed visual ROI checks. "
-                "NEAT also checks bounds, overlap and fitting windows before fitting."
+                f"{accepted} of 7 required locations have fit-ready coordinates. "
+                f"{max(0, len(candidates) - accepted)} proposed locations need valid coordinates; "
+                f"{max(0, 7 - len(candidates))} proposals are missing. "
+                "Image bounds and size are required; overlap, confidence, and boundary proximity are advisory."
             )
             inspectable[1] = True
             conclusions[2] = (
@@ -1709,6 +1734,14 @@ class AgentWindow(QMainWindow):
                 f"{size.label} · {size.scale_level:+d} step"
             )
             self.fit_size_combo.addItem(label)
+        baseline_size = next(
+            (size for size in plan.macro_pixel_sizes if size.scale_level == 0),
+            plan.macro_pixel_sizes[0],
+        )
+        self.fit_size_baseline_note.setText(
+            f"Fixed baseline: {baseline_size.width} × {baseline_size.height} px. "
+            "Each location is tested at this size and three smaller and larger sizes."
+        )
         self._selected_size_index = next(
             (index for index, size in enumerate(plan.macro_pixel_sizes) if size.scale_level == 0),
             0,
@@ -2028,7 +2061,7 @@ class AgentWindow(QMainWindow):
         )
         self.plan_text.setPlainText(
             self.plan_text.toPlainText()
-            + "\n\nNEAT validated seven distinct spatial ROIs, the provisional built-in phase, and the selected trusted edges. Local fitting is queued."
+            + "\n\nNEAT validated seven spatial ROI coordinate sets, the provisional built-in phase, and the selected trusted edges. Visual cautions remain available in the location evidence. Local fitting is queued."
         )
 
     def _start_pending_fitting(self) -> None:

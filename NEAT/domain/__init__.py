@@ -1,6 +1,8 @@
 """GUI-independent scientific contracts."""
 
 from .agent_fitting import (
+    MACRO_PIXEL_BASELINE_HEIGHT,
+    MACRO_PIXEL_BASELINE_WIDTH,
     MACRO_PIXEL_SCALE_FACTOR,
     MACRO_PIXEL_SIZE_LEVELS,
     MAX_SELECTED_EDGES,
@@ -66,6 +68,8 @@ from .preprocessing import (
 from .preprocessing_inputs import LoadedImageRun
 
 __all__ = [
+    "MACRO_PIXEL_BASELINE_HEIGHT",
+    "MACRO_PIXEL_BASELINE_WIDTH",
     "MACRO_PIXEL_SCALE_FACTOR",
     "MACRO_PIXEL_SIZE_LEVELS",
     "MAX_SELECTED_EDGES",

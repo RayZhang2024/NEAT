@@ -66,6 +66,7 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 class LocationGraphState(TypedDict):
     attempt: int
     candidates: tuple[SpatialRoiCandidate, ...]
+    tried_coordinates: dict[str, tuple[tuple[int, int, int, int], ...]]
 
 
 class PhaseGraphState(TypedDict):
@@ -635,7 +636,7 @@ def _spatial_roi_candidate(
             reason,
             str(confidence),
             flags,
-            validation_error=validation_error or "No safe sample location was proposed.",
+            validation_error=validation_error or "No coordinates were proposed for this location.",
         )
     if not isinstance(raw_rect, Mapping) or set(raw_rect) != {
         "x_min", "x_max", "y_min", "y_max"
@@ -687,18 +688,16 @@ def _spatial_roi_candidate(
             coords,
             validation_error or "ROI width and height must each be 3–128 pixels.",
         )
-    if confidence != "high" or flags:
-        validation_error = validation_error or (
-            "The model reported low confidence or unresolved visual ambiguity."
-        )
+    warnings = list(flags)
     for other in previously_proposed:
         overlap_width = max(0, min(roi.x_max, other.x_max) - max(roi.x_min, other.x_min))
         overlap_height = max(0, min(roi.y_max, other.y_max) - max(roi.y_min, other.y_min))
         if overlap_width * overlap_height:
-            validation_error = validation_error or "The rectangle overlaps another proposed ROI."
+            warnings.append("The rectangle overlaps another proposed ROI.")
             break
     return SpatialRoiCandidate(
-        label, roi, reason, str(confidence), flags, coords, validation_error
+        label, roi, reason, str(confidence), tuple(dict.fromkeys(warnings)),
+        coords, validation_error
     )
 
 
@@ -966,15 +965,17 @@ def run_visual_rehearsal(
             "Use original-image half-open coordinates: x coordinates for columns and y coordinates for rows. "
             "Each side must be "
             f"between {MIN_ROI_WIDTH} and {MAX_ROI_WIDTH} original pixels inclusive and every rectangle must be inside the image. "
-            "Prefer similarly sized rectangles spread across clearly visible sample material; avoid duplicate, "
-            "overlapping, masked, background, boundary or ambiguous locations. Brightness alone does not prove "
+            "Prefer similarly sized rectangles spread across clearly visible sample material where practical. "
+            "Brightness alone does not prove "
             "sample material. "
             "Fine speckled brightness or contrast variation within visible sample material "
             "is normal in this dataset; "
-            "do not flag it or lower confidence solely for that texture. Flag concrete concerns such as crossing a "
-            "sample boundary, including masked/background pixels, or uncertainty that the material is the sample. "
-            "If a requested location is not clearly safe, return roi null for that location and "
-            "explain why."
+            "do not flag it or lower confidence solely for that texture. Sample-boundary proximity, overlap, "
+            "and visual uncertainty are cautions, not automatic reasons to reject a coordinate proposal. "
+            "Keep every rectangle within image bounds. Report concrete concerns such as crossing a sample "
+            "boundary, including masked/background pixels, or uncertainty that the material is the sample. "
+            "If a location is doubtful but coordinates can still be proposed, return those coordinates with "
+            "lower confidence and explain the caution; return roi null only when no location can be identified."
             + location_request
             + " "
             "Return only the structured fields required by the schema."
@@ -982,7 +983,8 @@ def run_visual_rehearsal(
         if roi_override is not None:
             prompt += (
                 f" The user-selected Reference ROI is x[{roi_override.x_min},{roi_override.x_max}), "
-                f"y[{roi_override.y_min},{roi_override.y_max}); do not move it or overlap it."
+                f"y[{roi_override.y_min},{roi_override.y_max}); do not move it. "
+                "Any overlap is a caution, not a rejection."
             )
         with agent_langsmith_context(
             enabled=langsmith_enabled,
@@ -1303,9 +1305,190 @@ def run_visual_rehearsal(
             response_validation_error=validation_error,
         )
 
+    def select_spatial_locations() -> None:
+        """Select the seven fitting locations after phase and edge validation."""
+        nonlocal model_inspected_frames, spatial_roi_candidates, spatial_rois_png
+        if not require_spatial_rois:
+            return
+        progress(86, "Selecting seven fitting locations after phase comparison")
+        reference_candidate = spatial_roi_candidates[0]
+        image_shape = dataset.image_shape
+        assert image_shape is not None
+
+        def propose_locations(state: LocationGraphState) -> dict[str, object]:
+            selected = list(state["candidates"])
+            attempt = state["attempt"]
+            tried_coordinates = {
+                label: list(coordinates)
+                for label, coordinates in state["tried_coordinates"].items()
+            }
+            pending = (
+                list("ABCDEF") if attempt == 0
+                else [candidate.label for candidate in selected[1:] if not candidate.accepted]
+            )
+            if not pending:
+                return {
+                    "attempt": attempt,
+                    "candidates": tuple(selected),
+                    "tried_coordinates": {
+                        label: tuple(coordinates)
+                        for label, coordinates in tried_coordinates.items()
+                    },
+                }
+            fixed = [candidate for candidate in selected if candidate.accepted]
+            fixed_coordinates = [
+                f"{candidate.label}: x[{candidate.roi.x_min},{candidate.roi.x_max}), "
+                f"y[{candidate.roi.y_min},{candidate.roi.y_max})"
+                for candidate in fixed if candidate.roi is not None
+            ]
+            previous_failed_coordinates = []
+            for label in pending:
+                for prior_coordinates in tried_coordinates.get(label, []):
+                    x_min, x_max, y_min, y_max = prior_coordinates
+                    previous_failed_coordinates.append(
+                        f"{label}: x[{x_min},{x_max}), y[{y_min},{y_max})"
+                    )
+            prompt = (
+                "These are the same three measured frame previews, with image row zero at the top. "
+                f"Original shape (rows, columns): {dataset.image_shape}. "
+                f"The measured spectrum gave a provisional {phase_id} comparison; this is not proof "
+                "of material identity or fit quality. Select sample fitting locations "
+                "using original-image half-open x/y coordinates. Each side must be 3–128 pixels. "
+                "Prefer clearly visible sample material and spread locations where practical. Boundary proximity, "
+                "overlap, and visual uncertainty are cautions, not automatic rejection reasons; every ROI must "
+                "still remain within image bounds. "
+                "Fine speckled brightness or contrast variation within visible sample material "
+                "is normal in this dataset; "
+                "do not flag it or lower confidence solely for that texture. Flag concrete concerns such as crossing a "
+                "sample boundary, including masked/background pixels, or uncertainty that the material is the sample. "
+                "Brightness alone does not prove suitability. Do not claim measured SNR. "
+                f"Existing locations, which must not move: {'; '.join(fixed_coordinates)}. "
+                "For each location being retried, move its center away from every prior proposal: "
+                f"{'; '.join(previous_failed_coordinates) or 'no prior coordinates available'}. "
+                "A replacement must use a center that has not been tried for that location. "
+                "Overlapping rectangles are allowed; include overlap as a caution when relevant. "
+                f"Propose locations for {', '.join(pending)} only. If a location is doubtful, choose "
+                "the best coordinate proposal and report the uncertainty rather than rejecting it. "
+                "Return roi null only if no coordinates can be proposed. "
+                "Return `roi` for the fixed Reference and exactly six `additional_rois` in A–F "
+                "order. For labels not requested, repeat the accepted location or return roi null. "
+                "Each entry needs roi, reason, confidence (low/medium/high), and ambiguity_flags."
+            )
+            response = inspector.inspect("sample_locations", tuple(frame_pngs), prompt)
+            request_stages.append("sample_locations")
+            _checkpoint(handle, cancelled, started)
+            if not isinstance(response, Mapping):
+                response = {}
+            raw_candidates = response.get("additional_rois")
+            if not isinstance(raw_candidates, list) or len(raw_candidates) != 6:
+                raw_candidates = []
+            next_candidates = [reference_candidate]
+            for index, label in enumerate("ABCDEF"):
+                current = selected[index + 1] if index + 1 < len(selected) else None
+                if label not in pending and current is not None:
+                    next_candidates.append(current)
+                    continue
+                previous = tuple(
+                    candidate.roi for candidate in (fixed + next_candidates[1:])
+                    if candidate.roi is not None and candidate.label != label
+                )
+                raw = raw_candidates[index] if index < len(raw_candidates) else None
+                candidate = _spatial_roi_candidate(
+                    raw, label=label, image_shape=image_shape,
+                    previously_proposed=previous,
+                )
+                label_history = tried_coordinates.setdefault(label, [])
+                proposed_coordinates = candidate.proposed_coordinates
+                if proposed_coordinates is not None:
+                    new_x_min, new_x_max, new_y_min, new_y_max = (
+                        proposed_coordinates
+                    )
+                    same_center_as_previous = any(
+                        old_x_min + old_x_max == new_x_min + new_x_max
+                        and old_y_min + old_y_max == new_y_min + new_y_max
+                        for old_x_min, old_x_max, old_y_min, old_y_max in label_history
+                    )
+                    if same_center_as_previous:
+                        candidate = SpatialRoiCandidate(
+                            label, candidate.roi, candidate.reason, candidate.confidence,
+                            candidate.ambiguity_flags, candidate.proposed_coordinates,
+                            "Replacement must use a center not tried previously.",
+                        )
+                    if proposed_coordinates not in label_history:
+                        label_history.append(proposed_coordinates)
+                next_candidates.append(candidate)
+            return {
+                "attempt": attempt + 1,
+                "candidates": tuple(next_candidates),
+                "tried_coordinates": {
+                    label: tuple(coordinates)
+                    for label, coordinates in tried_coordinates.items()
+                },
+            }
+
+        def route_location_attempt(state: LocationGraphState) -> str:
+            candidates = state["candidates"]
+            if len(candidates) == 7 and all(item.accepted for item in candidates):
+                return "finish"
+            if state["attempt"] >= 3:
+                return "finish"
+            return "retry"
+
+        try:
+            from langgraph.graph import END, START, StateGraph
+        except (ImportError, OSError) as exc:
+            raise VisionUnavailable(
+                "Visual location selection requires NEAT's optional [agent] extra."
+            ) from exc
+        location_graph = StateGraph(LocationGraphState)
+        location_graph.add_node("propose_locations", propose_locations)
+        location_graph.add_edge(START, "propose_locations")
+        location_graph.add_conditional_edges(
+            "propose_locations",
+            route_location_attempt,
+            {"retry": "propose_locations", "finish": END},
+        )
+        compiled_location_graph = location_graph.compile()
+        with agent_langsmith_context(
+            enabled=langsmith_enabled,
+            api_key=langsmith_api_key,
+            agent_id=langsmith_agent_id,
+            environment=langsmith_environment,
+            region=langsmith_region,
+            workspace_id=langsmith_workspace_id,
+            workflow="neat_location_selection",
+        ):
+            location_state = compiled_location_graph.invoke(
+                {
+                    "attempt": 0,
+                    "candidates": (reference_candidate,),
+                    "tried_coordinates": {},
+                },
+                config={
+                    "configurable": {"thread_id": run_id},
+                    "recursion_limit": 8,
+                },
+            )
+        selected = list(location_state["candidates"])
+        model_inspected_frames = tuple(frame.frame_index for frame in frames)
+        spatial_roi_candidates = tuple(
+            candidate if candidate.accepted else SpatialRoiCandidate(
+                candidate.label, candidate.roi, candidate.reason, candidate.confidence,
+                candidate.ambiguity_flags, candidate.proposed_coordinates,
+                ("Reference region was not validated. " if candidate.label == "Reference"
+                 else "No valid replacement after two retries. ")
+                + (candidate.validation_error or "Location was not validated."),
+            )
+            for candidate in selected
+        )
+        spatial_rois_png = render_spatial_roi_overlay(
+            frame_pngs[0], mapping, spatial_roi_candidates
+        )
+
     recommended_display_window: tuple[float, float] | None = None
 
     def provisional_interval_review(diagnostic: str) -> VisionOutcome:
+        select_spatial_locations()
         if not complete_flanks_available:
             diagnostic += (
                 " The measured wavelength axis does not contain the complete default "
@@ -1555,134 +1738,7 @@ def run_visual_rehearsal(
             "Fewer than 10 measured wavelengths fall in the locally calculated edge-flank envelope."
         )
     display_interval_diagnostic = " ".join(interval_notes)
-    if require_spatial_rois:
-        progress(86, "Selecting seven fitting locations after phase comparison")
-        reference_candidate = spatial_roi_candidates[0]
-        image_shape = dataset.image_shape
-        assert image_shape is not None
-        def propose_locations(state: LocationGraphState) -> dict[str, object]:
-            selected = list(state["candidates"])
-            attempt = state["attempt"]
-            pending = (
-                list("ABCDEF") if attempt == 0
-                else [candidate.label for candidate in selected[1:] if not candidate.accepted]
-            )
-            if not pending:
-                return {"attempt": attempt, "candidates": tuple(selected)}
-            fixed = [candidate for candidate in selected if candidate.accepted]
-            fixed_coordinates = [
-                f"{candidate.label}: x[{candidate.roi.x_min},{candidate.roi.x_max}), "
-                f"y[{candidate.roi.y_min},{candidate.roi.y_max})"
-                for candidate in fixed if candidate.roi is not None
-            ]
-            prompt = (
-                "These are the same three measured frame previews, with image row zero at the top. "
-                f"Original shape (rows, columns): {dataset.image_shape}. "
-                f"The measured spectrum gave a provisional {phase_id} comparison; this is not proof "
-                "of material identity or fit quality. Select distinct interior fitting locations "
-                "using original-image half-open x/y coordinates. Each side must be 3–128 pixels. "
-                "Avoid sample boundaries, background, overlap, masked or ambiguous material. "
-                "Fine speckled brightness or contrast variation within visible sample material "
-                "is normal in this dataset; "
-                "do not flag it or lower confidence solely for that texture. Flag concrete concerns such as crossing a "
-                "sample boundary, including masked/background pixels, or uncertainty that the material is the sample. "
-                "Brightness alone does not prove suitability. Do not claim measured SNR. "
-                f"Already accepted locations, which must not move or overlap: {'; '.join(fixed_coordinates)}. "
-                f"Propose locations for {', '.join(pending)} only. If a location is doubtful, choose "
-                "a different sample-interior rectangle; if none is clear, return roi null. "
-                "Return `roi` for the fixed Reference and exactly six `additional_rois` in A–F "
-                "order. For labels not requested, repeat the accepted location or return roi null. "
-                "Each entry needs roi, reason, confidence (low/medium/high), and ambiguity_flags."
-            )
-            response = inspector.inspect("sample_locations", tuple(frame_pngs), prompt)
-            request_stages.append("sample_locations")
-            _checkpoint(handle, cancelled, started)
-            if not isinstance(response, Mapping):
-                response = {}
-            raw_candidates = response.get("additional_rois")
-            if not isinstance(raw_candidates, list) or len(raw_candidates) != 6:
-                raw_candidates = []
-            next_candidates = [reference_candidate]
-            for index, label in enumerate("ABCDEF"):
-                current = selected[index + 1] if index + 1 < len(selected) else None
-                if label not in pending and current is not None:
-                    next_candidates.append(current)
-                    continue
-                previous = tuple(
-                    candidate.roi for candidate in (fixed + next_candidates[1:])
-                    if candidate.roi is not None and candidate.label != label
-                )
-                raw = raw_candidates[index] if index < len(raw_candidates) else None
-                candidate = _spatial_roi_candidate(
-                    raw, label=label, image_shape=image_shape,
-                    previously_proposed=previous,
-                )
-                if (
-                    current is not None and not current.accepted and candidate.accepted
-                    and candidate.roi == current.roi
-                ):
-                    candidate = SpatialRoiCandidate(
-                        label, candidate.roi, candidate.reason, candidate.confidence,
-                        candidate.ambiguity_flags, candidate.proposed_coordinates,
-                        "Replacement must use a different location.",
-                    )
-                next_candidates.append(candidate)
-            return {"attempt": attempt + 1, "candidates": tuple(next_candidates)}
-
-        def route_location_attempt(state: LocationGraphState) -> str:
-            candidates = state["candidates"]
-            if len(candidates) == 7 and all(item.accepted for item in candidates):
-                return "finish"
-            if state["attempt"] >= 3:
-                return "finish"
-            return "retry"
-
-        try:
-            from langgraph.graph import END, START, StateGraph
-        except (ImportError, OSError) as exc:
-            raise VisionUnavailable(
-                "Visual location selection requires NEAT's optional [agent] extra."
-            ) from exc
-        location_graph = StateGraph(LocationGraphState)
-        location_graph.add_node("propose_locations", propose_locations)
-        location_graph.add_edge(START, "propose_locations")
-        location_graph.add_conditional_edges(
-            "propose_locations",
-            route_location_attempt,
-            {"retry": "propose_locations", "finish": END},
-        )
-        compiled_location_graph = location_graph.compile()
-        with agent_langsmith_context(
-            enabled=langsmith_enabled,
-            api_key=langsmith_api_key,
-            agent_id=langsmith_agent_id,
-            environment=langsmith_environment,
-            region=langsmith_region,
-            workspace_id=langsmith_workspace_id,
-            workflow="neat_location_selection",
-        ):
-            location_state = compiled_location_graph.invoke(
-                {"attempt": 0, "candidates": (reference_candidate,)},
-                config={
-                    "configurable": {"thread_id": run_id},
-                    "recursion_limit": 8,
-                },
-            )
-        selected = list(location_state["candidates"])
-        model_inspected_frames = tuple(frame.frame_index for frame in frames)
-        spatial_roi_candidates = tuple(
-            candidate if candidate.accepted else SpatialRoiCandidate(
-                candidate.label, candidate.roi, candidate.reason, candidate.confidence,
-                candidate.ambiguity_flags, candidate.proposed_coordinates,
-                ("Reference region was not validated. " if candidate.label == "Reference"
-                 else "No safe replacement after two retries. ")
-                + (candidate.validation_error or "Location was not validated."),
-            )
-            for candidate in selected
-        )
-        spatial_rois_png = render_spatial_roi_overlay(
-            frame_pngs[0], mapping, spatial_roi_candidates
-        )
+    select_spatial_locations()
     progress(100, "Visual proposal ready for user review")
     return VisionOutcome(
         run_id,

@@ -111,13 +111,13 @@ class _FakeSpatialVisionWorker(QThread):
         self.run_id = run_id
         self._stopped = False
         bounds = (
-            RoiBounds(8, 13, 8, 13),
-            RoiBounds(18, 23, 8, 13),
-            RoiBounds(28, 33, 8, 13),
-            RoiBounds(38, 43, 8, 13),
-            RoiBounds(8, 13, 20, 25),
-            RoiBounds(18, 23, 20, 25),
-            RoiBounds(28, 33, 20, 25),
+            RoiBounds(23, 28, 23, 28),
+            RoiBounds(28, 33, 23, 28),
+            RoiBounds(33, 38, 23, 28),
+            RoiBounds(23, 28, 28, 33),
+            RoiBounds(28, 33, 28, 33),
+            RoiBounds(33, 38, 28, 33),
+            RoiBounds(28, 33, 33, 38),
         )
         candidates = tuple(
             SpatialRoiCandidate(
@@ -531,7 +531,9 @@ class AgentPreflightTests(unittest.TestCase):
             successful_cell.attempt.region1,
         )
 
-    def test_ambiguous_spatial_proposal_blocks_all_fits(self):
+    def test_medium_confidence_spatial_proposal_does_not_block_fits(self):
+        from NEAT.domain.agent_fitting import AgentFitRunStatus
+
         self._prepare_spatial_fit_host()
 
         class AmbiguousSpatialWorker(_FakeSpatialVisionWorker):
@@ -543,22 +545,26 @@ class AgentPreflightTests(unittest.TestCase):
                     self.outcome, spatial_roi_candidates=tuple(candidates)
                 )
 
-        fit_engine = Mock()
+        fit_method = Mock(side_effect=lambda _wave, _signal, config, **_kwargs: _successful_fit(config))
+        fit_engine = type(
+            "FitSpy", (), {"fit_individual_edge": staticmethod(fit_method)}
+        )()
         with (
             patch("NEAT.ui.agent_window.VisionWorker", AmbiguousSpatialWorker),
             patch("NEAT.services.agent_fitting.FittingEngine", return_value=fit_engine),
         ):
             self.window.start_autonomous_analysis()
             self._wait_for(
-                lambda: self.window._stage == "fitting_needs_input"
+                lambda: self.window._fit_outcome is not None
+                and self.window._fit_worker is None
                 and not self.host._shutdown_worker_inventory.workers,
                 timeout=20,
             )
 
-        fit_engine.fit_individual_edge.assert_not_called()
-        self.assertIsNone(self.window._fit_outcome)
-        self.assertIn("ROI C", self.window.status_label.text())
-        self.assertIn("no local fit was started", self.window.fit_matrix_summary.text())
+        self.assertEqual(self.window._fit_outcome.status, AgentFitRunStatus.COMPLETE)
+        self.assertEqual(self.window._fit_outcome.attempted, 49)
+        self.assertEqual(fit_method.call_count, 49)
+        self.assertEqual(self.window._vision_outcome.spatial_roi_candidates[3].confidence, "medium")
 
     def test_visual_response_error_and_uncertainty_have_distinct_pause_messages(self):
         self._prepare_spatial_fit_host()
@@ -1413,7 +1419,7 @@ class AgentPreflightTests(unittest.TestCase):
             ["phase_shortlist", "phase_overlay", "sample_locations", "sample_locations", "sample_locations"],
         )
         self.assertIn("ROI x[1,10), y[1,10)", models[1].calls[0][2])
-        self.assertIn("Already accepted locations", models[1].calls[2][2])
+        self.assertIn("Existing locations", models[1].calls[2][2])
         self.assertEqual(self.host.selected_area, (16, 52, 18, 50))
         self.assertEqual(self.window._adjusted_roi, adjusted)
         self.assertEqual(self.window._adjusted_roi_dataset_token, token)

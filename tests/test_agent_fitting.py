@@ -32,13 +32,13 @@ from NEAT.services.scientific_observation import (
 )
 
 ROI_BOUNDS = (
-    RoiBounds(6, 14, 6, 14),
-    RoiBounds(31, 39, 6, 14),
-    RoiBounds(56, 64, 6, 14),
-    RoiBounds(6, 14, 31, 39),
-    RoiBounds(31, 39, 31, 39),
-    RoiBounds(56, 64, 31, 39),
-    RoiBounds(31, 39, 56, 64),
+    RoiBounds(15, 35, 15, 35),
+    RoiBounds(40, 60, 15, 35),
+    RoiBounds(65, 85, 15, 35),
+    RoiBounds(15, 35, 40, 60),
+    RoiBounds(40, 60, 40, 60),
+    RoiBounds(65, 85, 40, 60),
+    RoiBounds(40, 60, 65, 85),
 )
 
 
@@ -46,7 +46,7 @@ def _make_run(edge_count: int = 3):
     wavelengths = np.linspace(0.5, 5.0, 800)
     images = []
     for frame_index in range(wavelengths.size):
-        image = np.zeros((75, 75), dtype=np.float32)
+        image = np.zeros((100, 100), dtype=np.float32)
         for roi_index, roi in enumerate(ROI_BOUNDS):
             image[roi.y_min : roi.y_max, roi.x_min : roi.x_max] = (
                 roi_index + frame_index / 100.0
@@ -173,27 +173,38 @@ class AgentFittingTests(TestCase):
         self.assertEqual(edge.region3.max_wavelength, edge.region1.max_wavelength)
         self.assertEqual((edge.s, edge.t, edge.eta), (0.0015, 0.012, 0.45))
 
-    def test_rejects_missing_ambiguous_overlapping_and_out_of_bounds_rois(self):
+    def test_visual_cautions_and_overlap_are_allowed_but_invalid_geometry_is_rejected(self):
         _handle, plan, _clock = _make_run()
-        variants = (
-            plan.spatial_rois[:-1],
-            plan.spatial_rois[:6] + (
-                SpatialRoiCandidate("F", ROI_BOUNDS[-1], "uncertain", "medium"),
-            ),
-            plan.spatial_rois[:6] + (
-                SpatialRoiCandidate("F", ROI_BOUNDS[-2], "overlap", "high"),
-            ),
-            plan.spatial_rois[:6] + (
-                SpatialRoiCandidate("F", RoiBounds(70, 80, 56, 66), "outside", "high"),
+        uncertain = plan.spatial_rois[:6] + (
+            SpatialRoiCandidate(
+                "F", ROI_BOUNDS[-1], "Near the sample boundary.", "low",
+                ("Boundary proximity is uncertain.",),
             ),
         )
-        handle, _plan, _clock = _make_run()
-        for candidates in variants:
+        overlapping = plan.spatial_rois[:6] + (
+            SpatialRoiCandidate("F", ROI_BOUNDS[-2], "overlap", "high"),
+        )
+        self.assertEqual(
+            validate_spatial_roi_candidates(uncertain, _handle.image_shape),
+            ROI_BOUNDS,
+        )
+        self.assertEqual(
+            validate_spatial_roi_candidates(overlapping, _handle.image_shape),
+            ROI_BOUNDS[:-1] + (ROI_BOUNDS[-2],),
+        )
+
+        invalid = (
+            plan.spatial_rois[:-1],
+            plan.spatial_rois[:6] + (
+                SpatialRoiCandidate("F", RoiBounds(96, 106, 56, 66), "outside", "high"),
+            ),
+        )
+        for candidates in invalid:
             with (
                 self.subTest(candidates=candidates[-1]),
                 self.assertRaises(AgentFitBlocked),
             ):
-                validate_spatial_roi_candidates(candidates, handle.image_shape)
+                validate_spatial_roi_candidates(candidates, _handle.image_shape)
 
     def test_three_edges_fit_all_seven_rois_using_legacy_window_order_and_free_shape(self):
         handle, plan, _clock = _make_run(3)
@@ -307,10 +318,10 @@ class AgentFittingTests(TestCase):
             outcome = run_agent_fitting(handle, plan)
 
         self.assertEqual(outcome.total_fits, 49)
-        self.assertEqual((outcome.attempted, outcome.skipped, len(calls)), (47, 2, 47))
+        self.assertEqual((outcome.attempted, outcome.skipped, len(calls)), (43, 6, 43))
         self.assertEqual(outcome.status, AgentFitRunStatus.COMPLETE_WITH_ISSUES)
         skipped = [cell for cell in outcome.cells if cell.state is AgentFitCellState.SKIPPED]
-        self.assertEqual({cell.size_index for cell in skipped}, {5, 6})
+        self.assertEqual({cell.size_index for cell in skipped}, {1, 2, 3, 4, 5, 6})
         self.assertTrue(all(cell.roi_label == "Reference" for cell in skipped))
         self.assertTrue(all("extends outside the image" in cell.message for cell in skipped))
 

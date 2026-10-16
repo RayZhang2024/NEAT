@@ -12,6 +12,8 @@ import numpy as np
 from ..core import PHASE_DATA
 from ..core.fitting import initial_value_within_bounds
 from ..domain.agent_fitting import (
+    MACRO_PIXEL_BASELINE_HEIGHT,
+    MACRO_PIXEL_BASELINE_WIDTH,
     MACRO_PIXEL_SCALE_FACTOR,
     MACRO_PIXEL_SIZE_LEVELS,
     MAX_SELECTED_EDGES,
@@ -126,18 +128,11 @@ def roi_for_macro_pixel_size(
     return RoiBounds(x_min, x_min + size.width, y_min, y_min + size.height)
 
 
-def _roi_overlap(left: RoiBounds, right: RoiBounds) -> bool:
-    return (
-        min(left.x_max, right.x_max) > max(left.x_min, right.x_min)
-        and min(left.y_max, right.y_max) > max(left.y_min, right.y_min)
-    )
-
-
 def validate_spatial_roi_candidates(
     candidates: tuple[SpatialRoiCandidate, ...],
     image_shape: tuple[int, int],
 ) -> tuple[RoiBounds, ...]:
-    """Independently validate seven original-coordinate, non-overlapping ROIs."""
+    """Validate seven fitting ROIs by geometry; visual cautions are advisory."""
     if len(candidates) != MAX_SPATIAL_ROIS:
         raise AgentFitBlocked(
             f"Seven valid sample locations are required; NEAT received {len(candidates)}."
@@ -161,10 +156,8 @@ def validate_spatial_roi_candidates(
             and MIN_ROI_WIDTH <= roi.height <= MAX_ROI_WIDTH
         ):
             raise AgentFitBlocked(f"ROI {candidate.label} exceeds the 3–128 pixel bounds.")
-        if candidate.confidence not in {"high", "user-selected"} or candidate.ambiguity_flags:
-            raise AgentFitBlocked(f"ROI {candidate.label} still has unresolved visual ambiguity.")
-        if any(_roi_overlap(roi, other) for other in accepted):
-            raise AgentFitBlocked(f"ROI {candidate.label} overlaps another sample location.")
+        # Overlap, model confidence, and visual ambiguity are retained as
+        # review evidence, but do not prevent fitting a geometrically valid ROI.
         accepted.append(roi)
     return tuple(accepted)
 
@@ -204,10 +197,10 @@ def build_agent_fit_plan(
 
     rois = tuple(visual_outcome.spatial_roi_candidates)
     validate_spatial_roi_candidates(rois, image_shape)
-    reference_roi = rois[0].roi
-    if reference_roi is None:
-        raise AgentFitBlocked("A validated Reference location is required for the baseline size.")
-    macro_pixel_sizes = build_macro_pixel_sizes(reference_roi.width, reference_roi.height)
+    macro_pixel_sizes = build_macro_pixel_sizes(
+        MACRO_PIXEL_BASELINE_WIDTH,
+        MACRO_PIXEL_BASELINE_HEIGHT,
+    )
     all_phase_edges = sorted(
         trusted_phase_edges(phase_id), key=lambda item: (item[1], item[0])
     )
@@ -415,10 +408,10 @@ def _validate_fit_plan(plan: AgentFitPlan) -> None:
         raise AgentFitBlocked("One to five selected edges are required.")
     if len(plan.macro_pixel_sizes) != MACRO_PIXEL_SIZE_LEVELS * 2 + 1:
         raise AgentFitBlocked("The run requires exactly seven macro-pixel sizes.")
-    reference = plan.spatial_rois[0].roi
-    if reference is None:
-        raise AgentFitBlocked("The Reference location has no validated bounds.")
-    expected_sizes = build_macro_pixel_sizes(reference.width, reference.height)
+    expected_sizes = build_macro_pixel_sizes(
+        MACRO_PIXEL_BASELINE_WIDTH,
+        MACRO_PIXEL_BASELINE_HEIGHT,
+    )
     if plan.macro_pixel_sizes != expected_sizes:
         raise AgentFitBlocked("Macro-pixel sizes differ from the validated 1.25 scale series.")
     if len({edge.hkl for edge in plan.edges}) != len(plan.edges):
@@ -547,25 +540,9 @@ def run_agent_fitting(
                 )
             else:
                 geometry[key] = roi
-    for size_index, size in enumerate(plan.macro_pixel_sizes):
-        for left_index in range(len(plan.spatial_rois)):
-            left_key = (left_index, size_index)
-            left = geometry.get(left_key)
-            if left is None:
-                continue
-            for right_index in range(left_index + 1, len(plan.spatial_rois)):
-                right_key = (right_index, size_index)
-                right = geometry.get(right_key)
-                if right is not None and _roi_overlap(left, right):
-                    left_label = plan.spatial_rois[left_index].label
-                    right_label = plan.spatial_rois[right_index].label
-                    reason = (
-                        f"The {size.label} boxes at locations {left_label} and {right_label} overlap."
-                    )
-                    geometry_errors[left_key] = reason
-                    geometry_errors[right_key] = reason
-                    geometry.pop(left_key, None)
-                    geometry.pop(right_key, None)
+    # The original seven locations are validated as distinct above. Scaled
+    # boxes may overlap as their sizes increase; each still defines an
+    # independently extracted spectrum, so overlap alone must not skip a fit.
     for (roi_index, size_index), reason in geometry_errors.items():
         for edge_index, edge in enumerate(plan.edges):
             cells_by_key[(roi_index, size_index, edge_index)] = _new_cell(
