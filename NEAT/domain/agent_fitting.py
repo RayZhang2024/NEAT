@@ -19,6 +19,8 @@ MACRO_PIXEL_BASELINE_WIDTH = 20
 MACRO_PIXEL_BASELINE_HEIGHT = 20
 MACRO_PIXEL_SIZE_LEVELS = 3
 MACRO_PIXEL_SCALE_FACTOR = 1.25
+MACRO_PIXEL_TARGET_RELATIVE_UNCERTAINTY_PERCENT = 0.02
+MACRO_PIXEL_FLAG_RELATIVE_UNCERTAINTY_PERCENT = 0.05
 MAX_STORED_FIT_CURVE_POINTS = 1_000_000
 SPATIAL_ROI_LABELS = ("Reference", "A", "B", "C", "D", "E", "F")
 
@@ -53,6 +55,43 @@ class AgentMacroPixelSize:
     @property
     def label(self) -> str:
         return f"{self.width} × {self.height} px"
+
+
+@dataclass(frozen=True)
+class AgentMacroPixelUncertaintyPoint:
+    """Across-location uncertainty summary for one edge at one tested size."""
+
+    size: AgentMacroPixelSize
+    mean_relative_uncertainty_percent: float | None
+    standard_deviation_percent: float | None
+    valid_locations: int
+
+
+@dataclass(frozen=True)
+class AgentMacroPixelEdgeAssessment:
+    """Flag status and target-size estimate for one selected HKL."""
+
+    hkl: HKL
+    points: tuple[AgentMacroPixelUncertaintyPoint, ...]
+    valid_uncertainties: int
+    above_flag_threshold: int
+    excluded: bool
+    complete_location_coverage: bool
+    target_crossing_width: float | None
+    rounded_target_width: int | None
+    crossing_kind: str | None
+
+
+@dataclass(frozen=True)
+class AgentMacroPixelSelection:
+    """Exploratory mapping-size suggestion derived from the local fit sweep."""
+
+    edges: tuple[AgentMacroPixelEdgeAssessment, ...]
+    selected_width: int | None
+    selected_hkls: tuple[HKL, ...]
+    run_complete: bool
+    target_relative_uncertainty_percent: float = MACRO_PIXEL_TARGET_RELATIVE_UNCERTAINTY_PERCENT
+    flag_relative_uncertainty_percent: float = MACRO_PIXEL_FLAG_RELATIVE_UNCERTAINTY_PERCENT
 
 
 @dataclass(frozen=True)
@@ -170,8 +209,10 @@ class AgentFitOutcome:
 
 
 __all__ = [
+    "MACRO_PIXEL_FLAG_RELATIVE_UNCERTAINTY_PERCENT",
     "MACRO_PIXEL_SCALE_FACTOR",
     "MACRO_PIXEL_SIZE_LEVELS",
+    "MACRO_PIXEL_TARGET_RELATIVE_UNCERTAINTY_PERCENT",
     "MAX_SELECTED_EDGES",
     "MAX_SPATIAL_ROIS",
     "MAX_STORED_FIT_CURVE_POINTS",
@@ -184,4 +225,7 @@ __all__ = [
     "AgentFitProgress",
     "AgentFitRunStatus",
     "AgentMacroPixelSize",
+    "AgentMacroPixelUncertaintyPoint",
+    "AgentMacroPixelEdgeAssessment",
+    "AgentMacroPixelSelection",
 ]

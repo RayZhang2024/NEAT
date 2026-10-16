@@ -8,6 +8,8 @@ from dataclasses import replace
 from uuid import uuid4
 
 import numpy as np
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
 from PyQt5.QtCore import QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
@@ -44,6 +46,7 @@ from ..domain.agent_fitting import (
     AgentFitPlan,
     AgentFitProgress,
     AgentFitRunStatus,
+    AgentMacroPixelSelection,
 )
 from ..domain.agent_model import (
     AgentModelMode,
@@ -77,6 +80,7 @@ from ..domain.observation import (
 )
 from ..services.agent_fitting import (
     AgentFitBlocked,
+    analyze_macro_pixel_selection,
     build_agent_fit_plan,
     roi_for_macro_pixel_size,
 )
@@ -337,6 +341,172 @@ class FitCurveWidget(QWidget):
             painter.drawPoint(int(px), int(py))
 
 
+class MacroPixelUncertaintyCanvas(FigureCanvasQTAgg):
+    """Compact log-scale summary of relative d uncertainty by macro-pixel width."""
+
+    _COLORS = ("#2878B5", "#35A45A", "#D97706", "#7A5BB5", "#C45160")
+    _MARKERS = ("o", "D", "s", "^", "v")
+
+    def __init__(self, parent=None) -> None:
+        self.figure = Figure(figsize=(8.2, 2.8), dpi=100)
+        self.axes = self.figure.add_subplot(111)
+        super().__init__(self.figure)
+        self.setParent(parent)
+        self.setMinimumHeight(205)
+        self.setMaximumHeight(280)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setAccessibleName("Relative d-spacing uncertainty by macro-pixel size")
+        self.setToolTip(
+            "Each curve shows mean relative d-spacing uncertainty across the seven sample locations. "
+            "Error bars show the standard deviation."
+        )
+        self.set_summary(None)
+
+    @staticmethod
+    def _hkl_label(hkl: tuple[int, int, int]) -> str:
+        return "(" + "".join(str(value) for value in hkl) + ")"
+
+    def set_summary(self, summary: AgentMacroPixelSelection | None) -> None:
+        axes = self.axes
+        axes.clear()
+        axes.set_facecolor("white")
+        if summary is None:
+            axes.set_axis_off()
+            axes.text(
+                0.5, 0.5,
+                "The uncertainty comparison will appear after fitting completes.",
+                ha="center", va="center", color="#64748B", transform=axes.transAxes,
+            )
+            self.draw_idle()
+            return
+
+        axes.set_axis_on()
+        axes.set_yscale("log")
+        axes.axhline(
+            summary.target_relative_uncertainty_percent,
+            color="#27364B", linestyle=(0, (5, 3)), linewidth=1.1, zorder=1,
+        )
+        axes.axhline(
+            summary.flag_relative_uncertainty_percent,
+            color="#7A8491", linestyle=(0, (1, 2)), linewidth=1.0, zorder=1,
+        )
+        all_widths: list[float] = []
+        positive_y: list[float] = [
+            summary.target_relative_uncertainty_percent,
+            summary.flag_relative_uncertainty_percent,
+        ]
+        plotted_edges = 0
+        for index, edge in enumerate(summary.edges):
+            if edge.excluded:
+                continue
+            points = [
+                point for point in edge.points
+                if point.mean_relative_uncertainty_percent is not None
+                and point.mean_relative_uncertainty_percent > 0
+            ]
+            if not points:
+                continue
+            widths = [float(point.size.width) for point in points]
+            means = [float(point.mean_relative_uncertainty_percent) for point in points]
+            lower_errors = [
+                min(point.standard_deviation_percent or 0.0, mean * 0.99)
+                for point, mean in zip(points, means)
+            ]
+            upper_errors = [point.standard_deviation_percent or 0.0 for point in points]
+            axes.errorbar(
+                widths,
+                means,
+                yerr=np.asarray([lower_errors, upper_errors]),
+                color=self._COLORS[index % len(self._COLORS)],
+                marker=self._MARKERS[index % len(self._MARKERS)],
+                markersize=4.5,
+                linewidth=1.7,
+                elinewidth=1.0,
+                capsize=2.5,
+                label=(
+                    f"{self._hkl_label(edge.hkl)} · target ≈{edge.rounded_target_width} px"
+                    if edge.rounded_target_width is not None
+                    else self._hkl_label(edge.hkl)
+                ),
+                zorder=3,
+            )
+            plotted_edges += 1
+            all_widths.extend(widths)
+            positive_y.extend(
+                value
+                for mean, lower, upper in zip(means, lower_errors, upper_errors)
+                for value in (mean - lower, mean + upper)
+                if value > 0
+            )
+            if edge.target_crossing_width is not None:
+                crossing = edge.target_crossing_width
+                color = self._COLORS[index % len(self._COLORS)]
+                if edge.crossing_kind == "extrapolated" and points:
+                    last_point = points[-1]
+                    axes.plot(
+                        [last_point.size.width, crossing],
+                        [last_point.mean_relative_uncertainty_percent,
+                         summary.target_relative_uncertainty_percent],
+                        color=color, linestyle=(0, (4, 3)), linewidth=1.5, zorder=2,
+                    )
+                axes.scatter(
+                    [crossing], [summary.target_relative_uncertainty_percent],
+                    marker="D", s=28, color=color, edgecolor="white", linewidth=0.6, zorder=5,
+                )
+                all_widths.append(crossing)
+
+        axes.text(
+            0.99, summary.flag_relative_uncertainty_percent,
+            f"{summary.flag_relative_uncertainty_percent:g}% flag",
+            transform=axes.get_yaxis_transform(), ha="right", va="bottom",
+            fontsize=7, color="#657080", backgroundcolor="white",
+        )
+        axes.text(
+            0.99, summary.target_relative_uncertainty_percent,
+            f"{summary.target_relative_uncertainty_percent:g}% target",
+            transform=axes.get_yaxis_transform(), ha="right", va="bottom",
+            fontsize=7, color="#27364B", backgroundcolor="white",
+        )
+        if summary.selected_width is not None:
+            axes.axvline(
+                summary.selected_width, color="#64748B", linestyle=(0, (3, 3)),
+                linewidth=1.1, alpha=0.9, zorder=1,
+            )
+            all_widths.append(float(summary.selected_width))
+        if plotted_edges == 0:
+            axes.text(
+                0.5, 0.5, "No edge has usable uncertainty results to plot.",
+                transform=axes.transAxes, ha="center", va="center", color="#64748B",
+            )
+
+        widths_for_ticks = sorted({
+            int(round(width)) for width in all_widths if width > 0
+        })
+        measured_widths = [
+            point.size.width for edge in summary.edges for point in edge.points
+        ]
+        if measured_widths:
+            axes.set_xticks(sorted(set(measured_widths + widths_for_ticks)))
+            x_min = min(measured_widths)
+            x_max = max([*measured_widths, *all_widths])
+            axes.set_xlim(max(0, x_min - 2), x_max + max(2, (x_max - x_min) * 0.06))
+        axes.set_ylim(max(min(positive_y) * 0.7, 1e-6), max(positive_y) * 1.35)
+        axes.set_xlabel("ROI width (pixels)", fontsize=8, labelpad=3)
+        axes.set_ylabel("Mean relative d uncertainty (%)", fontsize=8, labelpad=3)
+        axes.tick_params(axis="both", labelsize=7, colors="#334155")
+        axes.grid(True, which="major", color="#DCE3EA", linewidth=0.6, alpha=0.85)
+        axes.grid(True, which="minor", axis="y", color="#E8EDF2", linewidth=0.4, alpha=0.65)
+        # Keep compatibility with the project's supported Matplotlib >=3.5;
+        # list-based spine selection was added in a later release.
+        axes.spines["top"].set_visible(False)
+        axes.spines["right"].set_visible(False)
+        axes.spines[["left", "bottom"]].set_color("#A8B3C0")
+        if plotted_edges:
+            axes.legend(loc="upper right", fontsize=7, frameon=False, ncol=min(3, plotted_edges))
+        self.figure.tight_layout(pad=1.2)
+        self.draw_idle()
+
+
 class AgentWindow(QMainWindow):
     """One top-level companion window per NEAT main window."""
 
@@ -372,6 +542,7 @@ class AgentWindow(QMainWindow):
         self._run_langsmith_credential_resolver: AgentCredentialResolver | None = None
         self._fit_plan: AgentFitPlan | None = None
         self._fit_outcome: AgentFitOutcome | None = None
+        self._macro_pixel_selection: AgentMacroPixelSelection | None = None
         self._pending_fit_plan: AgentFitPlan | None = None
         self._selected_roi_index = 0
         self._selected_size_index = 3
@@ -755,6 +926,24 @@ class AgentWindow(QMainWindow):
         self.fit_results_status.setAccessibleName("Fit run completion summary")
         title_row.addWidget(self.fit_results_status)
         page_layout.addLayout(title_row)
+
+        self.mapping_size_summary_group = QGroupBox(
+            "Mapping-size guidance", self.fit_results_page
+        )
+        mapping_summary_layout = QVBoxLayout(self.mapping_size_summary_group)
+        mapping_summary_layout.setContentsMargins(8, 6, 8, 6)
+        mapping_summary_layout.setSpacing(3)
+        self.mapping_size_summary_label = QLabel(
+            "The uncertainty comparison will appear after fitting completes.",
+            self.mapping_size_summary_group,
+        )
+        self.mapping_size_summary_label.setWordWrap(True)
+        self.mapping_size_summary_label.setAccessibleName("Suggested mapping size and edge estimates")
+        mapping_summary_layout.addWidget(self.mapping_size_summary_label)
+        self.mapping_size_chart = MacroPixelUncertaintyCanvas(self.mapping_size_summary_group)
+        mapping_summary_layout.addWidget(self.mapping_size_chart)
+        self.mapping_size_summary_group.hide()
+        page_layout.addWidget(self.mapping_size_summary_group)
 
         self.fit_results_splitter = QSplitter(Qt.Horizontal, self.fit_results_page)
         self.fit_results_splitter.setChildrenCollapsible(False)
@@ -1413,6 +1602,12 @@ class AgentWindow(QMainWindow):
                         f" · {fit.needs_review} "
                         + ("needs review" if fit.needs_review == 1 else "need review")
                     )
+                if self._macro_pixel_selection is not None:
+                    selected_width = self._macro_pixel_selection.selected_width
+                    if selected_width is not None:
+                        conclusions[3] += f" · suggested mapping size {selected_width} × {selected_width} px"
+                    else:
+                        conclusions[3] += " · no qualifying mapping size estimate"
             elif fit.status is AgentFitRunStatus.STOPPED:
                 heading = "Analysis stopped"
                 conclusions[3] = f"Stopped · {fit.attempted}/{fit.total_fits} fits attempted"
@@ -1421,6 +1616,8 @@ class AgentWindow(QMainWindow):
                 conclusions[3] = "Local fitting did not complete"
                 notice = fit.message
             evidence[3] = self.fit_matrix_summary.text() + "\n" + fit.message
+            if self._macro_pixel_selection is not None:
+                evidence[3] += "\n" + self.mapping_size_summary_label.text()
             inspectable[3] = bool(self._fit_cells)
         elif self._stage == "fitting_needs_input":
             heading = "Analysis needs your review"
@@ -1686,6 +1883,13 @@ class AgentWindow(QMainWindow):
                 self.show_step_conclusions()
         self._fit_plan = None
         self._fit_outcome = None
+        self._macro_pixel_selection = None
+        if hasattr(self, "mapping_size_chart"):
+            self.mapping_size_chart.set_summary(None)
+            self.mapping_size_summary_label.setText(
+                "The uncertainty comparison will appear after fitting completes."
+            )
+            self.mapping_size_summary_group.hide()
         self._pending_fit_plan = None
         self._fit_cells.clear()
         self._selected_roi_index = 0
@@ -2197,6 +2401,73 @@ class AgentWindow(QMainWindow):
         item.setBackground(color)
         self._refresh_fit_result_filters()
 
+    def _update_mapping_size_summary(self, outcome: AgentFitOutcome) -> None:
+        selection = analyze_macro_pixel_selection(outcome)
+        self._macro_pixel_selection = selection
+        self.mapping_size_chart.set_summary(selection)
+        lines: list[str] = []
+        if not selection.run_complete:
+            lines.append(
+                "Partial sweep · available fits are shown, but no mapping size is suggested until the run completes."
+            )
+        elif selection.selected_width is not None:
+            edges = ", ".join(
+                MacroPixelUncertaintyCanvas._hkl_label(hkl)
+                for hkl in selection.selected_hkls
+            )
+            lines.append(
+                f"Suggested mapping ROI: {selection.selected_width} × "
+                f"{selection.selected_width} px · estimated 0.02% target crossing for {edges}."
+            )
+        else:
+            lines.append(
+                "No mapping size suggested · no complete, non-flagged edge curve reached the 0.02% target."
+            )
+
+        crossing_text = []
+        excluded_text = []
+        incomplete_text = []
+        for edge in selection.edges:
+            label = MacroPixelUncertaintyCanvas._hkl_label(edge.hkl)
+            if edge.excluded:
+                excluded_text.append(
+                    f"{label} omitted ({edge.above_flag_threshold}/{edge.valid_uncertainties} "
+                    "available results exceed 0.05%)."
+                )
+            elif edge.rounded_target_width is not None and edge.target_crossing_width is not None:
+                method = {
+                    "interpolated": "interpolated",
+                    "extrapolated": "extrapolated",
+                    "minimum_tested_size": "already meets target at the smallest tested size",
+                }.get(edge.crossing_kind, "estimated")
+                if edge.crossing_kind == "minimum_tested_size":
+                    crossing_text.append(
+                        f"{label}: {edge.rounded_target_width} px ({method})"
+                    )
+                else:
+                    crossing_text.append(
+                        f"{label}: {edge.target_crossing_width:.1f} → "
+                        f"{edge.rounded_target_width} px ({method})"
+                    )
+            elif not edge.complete_location_coverage:
+                incomplete_text.append(f"{label} has incomplete seven-location fit coverage")
+
+        if crossing_text:
+            lines.append("Target crossing by edge: " + "; ".join(crossing_text) + ".")
+        if excluded_text:
+            lines.append(" ".join(excluded_text))
+        if incomplete_text:
+            lines.append("No target estimate for " + "; ".join(incomplete_text) + ".")
+        lines.append(
+            "Plot shows mean ± SD across locations; edges with more than half of valid "
+            "fits above 0.05% are omitted."
+        )
+        lines.append(
+            "Exploratory fit-uncertainty guidance only; this does not change NEAT's mapping settings."
+        )
+        self.mapping_size_summary_label.setText("\n".join(lines))
+        self.mapping_size_summary_group.setVisible(bool(outcome.cells))
+
     def _on_fit_completed(self, run_id: str, worker: AgentFitWorker, outcome: AgentFitOutcome) -> None:
         if (
             run_id != self._agent_run_id
@@ -2220,6 +2491,7 @@ class AgentWindow(QMainWindow):
                 message="Stop was requested before the completion callback was delivered. Completed cell evidence is retained; the run is marked stopped.",
             )
         self._fit_outcome = outcome
+        self._update_mapping_size_summary(outcome)
         self._fit_cells.clear()
         for cell in outcome.cells:
             edge_index = next(

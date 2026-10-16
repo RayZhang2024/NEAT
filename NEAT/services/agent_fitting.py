@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from fractions import Fraction
-from math import isfinite
+from math import ceil, isfinite, log
 from typing import TypedDict
 
 import numpy as np
@@ -12,10 +12,12 @@ import numpy as np
 from ..core import PHASE_DATA
 from ..core.fitting import initial_value_within_bounds
 from ..domain.agent_fitting import (
+    MACRO_PIXEL_FLAG_RELATIVE_UNCERTAINTY_PERCENT,
     MACRO_PIXEL_BASELINE_HEIGHT,
     MACRO_PIXEL_BASELINE_WIDTH,
     MACRO_PIXEL_SCALE_FACTOR,
     MACRO_PIXEL_SIZE_LEVELS,
+    MACRO_PIXEL_TARGET_RELATIVE_UNCERTAINTY_PERCENT,
     MAX_SELECTED_EDGES,
     MAX_SPATIAL_ROIS,
     MAX_STORED_FIT_CURVE_POINTS,
@@ -27,7 +29,10 @@ from ..domain.agent_fitting import (
     AgentFitPlan,
     AgentFitProgress,
     AgentFitRunStatus,
+    AgentMacroPixelEdgeAssessment,
+    AgentMacroPixelSelection,
     AgentMacroPixelSize,
+    AgentMacroPixelUncertaintyPoint,
 )
 from ..domain.agent_vision import SpatialRoiCandidate, VisionOutcome
 from ..domain.fitting import (
@@ -126,6 +131,160 @@ def roi_for_macro_pixel_size(
     x_min = (roi.x_min + roi.x_max - size.width) // 2
     y_min = (roi.y_min + roi.y_max - size.height) // 2
     return RoiBounds(x_min, x_min + size.width, y_min, y_min + size.height)
+
+
+def analyze_macro_pixel_selection(outcome: AgentFitOutcome) -> AgentMacroPixelSelection:
+    """Summarize relative d uncertainties and recommend the smallest target crossing.
+
+    The flag rate is counted over the available finite location × size
+    measurements for each edge. A crossing estimate is only produced when the
+    run completed and that edge has valid uncertainty values at every location
+    and tested size. Interpolation and extrapolation are linear in log(y),
+    matching the displayed logarithmic uncertainty axis.
+    """
+    sizes = tuple(outcome.macro_pixel_sizes)
+    edges = tuple(outcome.edges)
+    expected_locations = (
+        outcome.total_fits // (len(sizes) * len(edges))
+        if sizes and edges else 0
+    )
+    values_by_edge_size: dict[tuple[tuple[int, int, int], int], list[float]] = {
+        (edge.hkl, size_index): []
+        for edge in edges
+        for size_index in range(len(sizes))
+    }
+    for cell in outcome.cells:
+        if (
+            cell.state not in {AgentFitCellState.SUCCEEDED, AgentFitCellState.NEEDS_REVIEW}
+            or not (0 <= cell.size_index < len(sizes))
+        ):
+            continue
+        attempt_result = cell.attempt.result if cell.attempt is not None else None
+        if attempt_result is None:
+            continue
+        d_fit = float(attempt_result.d_fit)
+        d_unc = float(attempt_result.d_unc)
+        if not isfinite(d_fit) or d_fit == 0 or not isfinite(d_unc) or d_unc <= 0:
+            continue
+        relative_percent = abs(d_unc / d_fit) * 100.0
+        if not isfinite(relative_percent) or relative_percent <= 0:
+            continue
+        key = (cell.hkl, cell.size_index)
+        if key in values_by_edge_size:
+            values_by_edge_size[key].append(relative_percent)
+
+    completed_run = outcome.status in {
+        AgentFitRunStatus.COMPLETE,
+        AgentFitRunStatus.COMPLETE_WITH_ISSUES,
+    }
+    assessments: list[AgentMacroPixelEdgeAssessment] = []
+    for edge in edges:
+        point_values = [
+            values_by_edge_size[(edge.hkl, size_index)]
+            for size_index in range(len(sizes))
+        ]
+        all_values = [value for values in point_values for value in values]
+        flagged_count = sum(
+            value > MACRO_PIXEL_FLAG_RELATIVE_UNCERTAINTY_PERCENT
+            for value in all_values
+        )
+        excluded = bool(all_values) and flagged_count > len(all_values) / 2
+        complete_coverage = bool(expected_locations) and all(
+            len(values) == expected_locations for values in point_values
+        )
+        points: list[AgentMacroPixelUncertaintyPoint] = []
+        for size, values in zip(sizes, point_values):
+            mean = float(np.mean(values)) if values else None
+            standard_deviation = (
+                float(np.std(values, ddof=1)) if len(values) > 1 else None
+            )
+            points.append(
+                AgentMacroPixelUncertaintyPoint(
+                    size=size,
+                    mean_relative_uncertainty_percent=mean,
+                    standard_deviation_percent=standard_deviation,
+                    valid_locations=len(values),
+                )
+            )
+
+        crossing_width: float | None = None
+        crossing_kind: str | None = None
+        if completed_run and complete_coverage and not excluded and sizes:
+            means = [point.mean_relative_uncertainty_percent for point in points]
+            first_target_index = next(
+                (
+                    index for index, mean in enumerate(means)
+                    if mean is not None
+                    and mean <= MACRO_PIXEL_TARGET_RELATIVE_UNCERTAINTY_PERCENT
+                ),
+                None,
+            )
+            if first_target_index == 0:
+                crossing_width = float(sizes[0].width)
+                crossing_kind = "minimum_tested_size"
+            elif first_target_index is not None:
+                previous_index = first_target_index - 1
+                previous_mean = means[previous_index]
+                target_mean = means[first_target_index]
+                if (
+                    previous_mean is not None
+                    and target_mean is not None
+                    and previous_mean > MACRO_PIXEL_TARGET_RELATIVE_UNCERTAINTY_PERCENT
+                    and target_mean > 0
+                ):
+                    x0 = float(sizes[previous_index].width)
+                    x1 = float(sizes[first_target_index].width)
+                    log_y0 = log(previous_mean)
+                    log_y1 = log(target_mean)
+                    target_log = log(MACRO_PIXEL_TARGET_RELATIVE_UNCERTAINTY_PERCENT)
+                    crossing_width = x0 + (target_log - log_y0) * (x1 - x0) / (log_y1 - log_y0)
+                    crossing_kind = "interpolated"
+            elif len(sizes) >= 2:
+                x0, x1 = float(sizes[-2].width), float(sizes[-1].width)
+                y0, y1 = means[-2], means[-1]
+                if (
+                    y0 is not None
+                    and y1 is not None
+                    and y0 > y1 > 0
+                    and y1 > MACRO_PIXEL_TARGET_RELATIVE_UNCERTAINTY_PERCENT
+                ):
+                    target_log = log(MACRO_PIXEL_TARGET_RELATIVE_UNCERTAINTY_PERCENT)
+                    crossing_width = x1 + (target_log - log(y1)) * (x1 - x0) / (log(y1) - log(y0))
+                    crossing_kind = "extrapolated"
+
+        rounded_width = ceil(crossing_width) if crossing_width is not None else None
+        assessments.append(
+            AgentMacroPixelEdgeAssessment(
+                hkl=edge.hkl,
+                points=tuple(points),
+                valid_uncertainties=len(all_values),
+                above_flag_threshold=flagged_count,
+                excluded=excluded,
+                complete_location_coverage=complete_coverage,
+                target_crossing_width=crossing_width,
+                rounded_target_width=rounded_width,
+                crossing_kind=crossing_kind,
+            )
+        )
+
+    eligible_widths: list[int] = []
+    for assessment in assessments:
+        width = assessment.rounded_target_width
+        if not assessment.excluded and width is not None:
+            eligible_widths.append(width)
+    selected_width = min(eligible_widths, default=None)
+    selected_hkls = tuple(
+        assessment.hkl
+        for assessment in assessments
+        if not assessment.excluded
+        if assessment.rounded_target_width == selected_width
+    ) if selected_width is not None else ()
+    return AgentMacroPixelSelection(
+        edges=tuple(assessments),
+        selected_width=selected_width,
+        selected_hkls=selected_hkls,
+        run_complete=completed_run,
+    )
 
 
 def validate_spatial_roi_candidates(
@@ -918,6 +1077,7 @@ def run_agent_fitting(
 
 __all__ = [
     "AgentFitBlocked",
+    "analyze_macro_pixel_selection",
     "build_agent_fit_plan",
     "build_macro_pixel_sizes",
     "roi_for_macro_pixel_size",
