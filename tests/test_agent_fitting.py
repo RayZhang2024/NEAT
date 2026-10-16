@@ -8,8 +8,16 @@ from unittest.mock import patch
 
 import numpy as np
 
-from NEAT.domain.agent_fitting import AgentFitCellState, AgentFitRunStatus
+from NEAT.domain.agent_fitting import (
+    AgentEdgeFitPlan,
+    AgentFitCellResult,
+    AgentFitCellState,
+    AgentFitOutcome,
+    AgentFitRunStatus,
+    AgentMacroPixelSize,
+)
 from NEAT.domain.agent_vision import SpatialRoiCandidate, VisionOutcome, VisionStatus
+from NEAT.domain.fitting import WavelengthRegion
 from NEAT.domain.individual_edge import (
     IndividualEdgeFitAttempt,
     IndividualEdgeFitResult,
@@ -18,6 +26,7 @@ from NEAT.domain.individual_edge import (
 from NEAT.domain.observation import DatasetMode, DatasetRevisionClock, RoiBounds
 from NEAT.services.agent_fitting import (
     AgentFitBlocked,
+    analyze_macro_pixel_selection,
     build_agent_fit_plan,
     build_macro_pixel_sizes,
     roi_for_macro_pixel_size,
@@ -127,6 +136,98 @@ def _successful_attempt(config):
     )
 
 
+def _macro_pixel_outcome(
+    uncertainty_curves,
+    *,
+    status=AgentFitRunStatus.COMPLETE,
+    failed_cells=frozenset(),
+    vary_by_location=False,
+):
+    sizes = tuple(
+        AgentMacroPixelSize(level, width, width)
+        for level, width in enumerate((10, 12, 16, 20, 25, 32, 40), start=-3)
+    )
+    edges = tuple(
+        AgentEdgeFitPlan(
+            source_row=index,
+            hkl=(index + 1, 1, 0),
+            edge_wavelength=2.0 + index,
+            region1=WavelengthRegion(2.5 + index, 3.0 + index),
+            region2=WavelengthRegion(1.0 + index, 1.5 + index),
+            region3=WavelengthRegion(1.0 + index, 3.0 + index),
+        )
+        for index in range(len(uncertainty_curves))
+    )
+    x = np.linspace(0.1, 0.2, 3)
+    curve = RegionFitCurve(x, x.copy(), x.copy())
+    cells = []
+    for roi_index, roi_label in enumerate(("Reference", "A", "B", "C", "D", "E", "F")):
+        for size_index, size in enumerate(sizes):
+            for edge_index, edge in enumerate(edges):
+                key = (roi_index, size_index, edge_index)
+                if key in failed_cells:
+                    cells.append(
+                        AgentFitCellResult(
+                            roi_index, roi_label, ROI_BOUNDS[roi_index], edge.hkl,
+                            AgentFitCellState.FAILED, size_index=size_index,
+                            macro_pixel_width=size.width, macro_pixel_height=size.height,
+                        )
+                    )
+                    continue
+                relative_percent = uncertainty_curves[edge_index][size_index]
+                if vary_by_location:
+                    relative_percent *= 1 + (roi_index - 3) * 0.01
+                d_fit = 2.34
+                result = IndividualEdgeFitResult(
+                    source_row=edge.source_row,
+                    hkl=edge.hkl,
+                    region1=curve,
+                    region2=curve,
+                    region3=curve,
+                    d_fit=d_fit,
+                    d_unc=d_fit * relative_percent / 100,
+                    s_fit=0.001,
+                    s_unc=0.0001,
+                    t_fit=0.01,
+                    t_unc=0.001,
+                    eta_fit=0.5,
+                    eta_unc=0.01,
+                    edge_height=0.1,
+                    edge_width=0.02,
+                    rms=0.003,
+                    baseline_params={},
+                )
+                attempt = IndividualEdgeFitAttempt(
+                    region1=curve, region2=curve, region3=curve, result=result
+                )
+                cells.append(
+                    AgentFitCellResult(
+                        roi_index, roi_label, ROI_BOUNDS[roi_index], edge.hkl,
+                        AgentFitCellState.SUCCEEDED, attempt=attempt,
+                        size_index=size_index, macro_pixel_width=size.width,
+                        macro_pixel_height=size.height,
+                    )
+                )
+    failed_count = len(failed_cells)
+    return AgentFitOutcome(
+        run_id="macro-pixel-test",
+        dataset_id="macro-pixel-test",
+        revision=1,
+        status=status,
+        phase_id="Fe_bcc",
+        edges=edges,
+        cells=tuple(cells),
+        total_fits=len(cells),
+        attempted=len(cells),
+        succeeded=len(cells) - failed_count,
+        failed=failed_count,
+        needs_review=0,
+        skipped=0,
+        cancelled=0,
+        macro_pixel_sizes=sizes,
+    )
+
+
 class AgentFittingTests(TestCase):
     def test_macro_pixel_size_series_uses_requested_rounding_and_rectangles(self):
         expected_square = ((6, 6), (8, 8), (10, 10), (13, 13), (17, 17), (21, 21), (26, 26))
@@ -144,6 +245,53 @@ class AgentFittingTests(TestCase):
         for dimensions in ((0, 13), (13, -1), (3, 3)):
             with self.subTest(dimensions=dimensions), self.assertRaises(AgentFitBlocked):
                 build_macro_pixel_sizes(*dimensions)
+
+    def test_macro_pixel_uncertainty_selects_smallest_rounded_target_crossing(self):
+        outcome = _macro_pixel_outcome(
+            (
+                (0.03, 0.015, 0.012, 0.009, 0.007, 0.005, 0.004),
+                (0.06, 0.06, 0.06, 0.06, 0.06, 0.06, 0.06),
+            ),
+            vary_by_location=True,
+        )
+
+        selection = analyze_macro_pixel_selection(outcome)
+
+        first_edge, flagged_edge = selection.edges
+        self.assertTrue(first_edge.complete_location_coverage)
+        self.assertEqual(first_edge.points[0].valid_locations, 7)
+        self.assertGreater(first_edge.points[0].standard_deviation_percent, 0)
+        self.assertAlmostEqual(first_edge.target_crossing_width, 11.1699, places=3)
+        self.assertEqual(first_edge.rounded_target_width, 12)
+        self.assertTrue(flagged_edge.excluded)
+        self.assertEqual(flagged_edge.above_flag_threshold, 49)
+        self.assertEqual(selection.selected_width, 12)
+        self.assertEqual(selection.selected_hkls, (first_edge.hkl,))
+
+    def test_macro_pixel_uncertainty_extrapolates_on_log_axis(self):
+        outcome = _macro_pixel_outcome(
+            ((0.05, 0.045, 0.04, 0.035, 0.03, 0.027, 0.024),)
+        )
+
+        edge = analyze_macro_pixel_selection(outcome).edges[0]
+
+        self.assertEqual(edge.crossing_kind, "extrapolated")
+        self.assertGreater(edge.target_crossing_width, 40)
+        self.assertEqual(edge.rounded_target_width, int(np.ceil(edge.target_crossing_width)))
+
+    def test_macro_pixel_uncertainty_does_not_recommend_incomplete_sweep(self):
+        outcome = _macro_pixel_outcome(
+            ((0.01, 0.009, 0.008, 0.007, 0.006, 0.005, 0.004),),
+            status=AgentFitRunStatus.COMPLETE_WITH_ISSUES,
+            failed_cells={(0, 0, 0)},
+        )
+
+        selection = analyze_macro_pixel_selection(outcome)
+
+        self.assertTrue(selection.run_complete)
+        self.assertFalse(selection.edges[0].complete_location_coverage)
+        self.assertIsNone(selection.edges[0].target_crossing_width)
+        self.assertIsNone(selection.selected_width)
 
     def test_scaled_boxes_keep_each_location_center_with_at_most_half_pixel_rounding(self):
         _plan_handle, plan, _clock = _make_run(1)

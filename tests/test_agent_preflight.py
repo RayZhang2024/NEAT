@@ -288,12 +288,14 @@ class AgentPreflightTests(unittest.TestCase):
         self.assertIn("7 sample locations", self.window.summary_page.rows[2].conclusion_label.text())
         self.assertEqual(
             self.window.summary_page.rows[3].conclusion_label.text(),
-            "49 fits attempted across 7 sizes",
+            "49 fits attempted across 7 sizes · suggested mapping size 10 × 10 px",
         )
         self.assertFalse(self.window.summary_page.review_button.isVisible())
         self.assertFalse(self.window.fit_matrix.isVisible())
         self.window.summary_page.results_button.click()
         self.assertTrue(self.window.fit_matrix.isVisible())
+        self.assertTrue(self.window.mapping_size_summary_group.isVisible())
+        self.assertIn("estimated 0.02% target crossing", self.window.mapping_size_summary_label.text())
         self.assertIn("49/49 attempted", self.window.fit_matrix_summary.text())
         self.assertIn("d_fit", self.window.fit_detail_label.text())
         baseline_cell = next(
