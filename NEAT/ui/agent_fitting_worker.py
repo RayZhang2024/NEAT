@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from threading import Event
 
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -22,6 +23,8 @@ from ..services.agent_fitting import (
 from ..services.agent_model import AgentCredentialResolver, AgentModelError
 from ..services.scientific_observation import ScientificDatasetHandle, StaleDatasetError
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class AgentFitWorker(QThread):
     """Perform only local numerical work; never read a QWidget from this thread."""
@@ -36,6 +39,7 @@ class AgentFitWorker(QThread):
         *,
         agent_settings: AgentModelSettings | None = None,
         langsmith_credential_resolver: AgentCredentialResolver | None = None,
+        mapping_calibration: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -46,6 +50,7 @@ class AgentFitWorker(QThread):
         self._plan: AgentFitPlan | None = plan
         self._agent_settings = agent_settings or AgentModelSettings()
         self._langsmith_credential_resolver = langsmith_credential_resolver
+        self._mapping_calibration = bool(mapping_calibration)
         self._cancel = Event()
 
     def stop(self) -> None:
@@ -126,6 +131,7 @@ class AgentFitWorker(QThread):
                 langsmith_environment=self._agent_settings.langsmith_environment,
                 langsmith_region=self._agent_settings.langsmith_region,
                 langsmith_workspace_id=self._agent_settings.langsmith_workspace_id,
+                mapping_calibration=self._mapping_calibration,
             )
         except StaleDatasetError:
             outcome = AgentFitOutcome(
@@ -154,11 +160,21 @@ class AgentFitWorker(QThread):
                 message=str(exc),
             )
         except Exception as exc:  # noqa: BLE001 - contain unexpected worker errors at Qt boundary
+            _LOGGER.exception("Unexpected error in the local fitting workflow")
+            try:
+                detail = str(exc).strip()
+            except Exception:  # noqa: BLE001 - an unusual exception must not escape Qt boundary
+                detail = "Error details unavailable."
+            if not detail:
+                detail = "No additional error details were provided."
             outcome = self._terminal_outcome(
                 plan,
                 status=AgentFitRunStatus.FAILED,
                 cell_state=AgentFitCellState.FAILED,
-                message=f"Local fitting failed safely ({type(exc).__name__}).",
+                message=(
+                    f"Local fitting failed safely ({type(exc).__name__}: "
+                    f"{detail[:300]}). See the launch console for the traceback."
+                ),
             )
         finally:
             self._handle = None

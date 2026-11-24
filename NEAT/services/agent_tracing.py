@@ -114,8 +114,13 @@ def _new_langchain_agent_tracer(
     from langchain_core.tracers.langchain import LangChainTracer
 
     class _AddressedLangChainTracer(LangChainTracer):
-        def __init__(self) -> None:
-            super().__init__(client=client, tags=tags)
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # LangChain Core may reconstruct tracers with constructor fields such
+            # as example_id. Preserve those upstream kwargs while supplying our
+            # address-aware client and tags as defaults.
+            kwargs.setdefault("client", client)
+            kwargs.setdefault("tags", tags)
+            super().__init__(*args, **kwargs)
             # LangChainTracer falls back to the ``default`` project when this is
             # unset. Addressed traces must have no project destination.
             self.project_name = None

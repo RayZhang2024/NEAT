@@ -43,6 +43,7 @@ from NEAT.domain.agent_model import (
 from NEAT.domain.agent_planning import PlannerSource, PlanningOutcome, PlanningStatus
 from NEAT.domain.agent_preflight import PreflightReadiness, representative_frame_indices
 from NEAT.domain.agent_vision import SpatialRoiCandidate, VisionOutcome, VisionStatus
+from NEAT.services.agent_mapping import MappingShapeParameterMean
 from NEAT.domain.individual_edge import (
     IndividualEdgeFitAttempt,
     IndividualEdgeFitResult,
@@ -239,6 +240,16 @@ class AgentPreflightTests(unittest.TestCase):
         )
         self.window._update_model_readiness()
         return images, wavelengths
+
+    def test_mapping_parameter_summary_formats_hkl_labels(self):
+        self.window._mapping_hkls = ((2, 1, 1), (2, 0, 0))
+
+        self.window._accept_mapping_parameters(
+            (MappingShapeParameterMean((2, 1, 1), 0.01, 0.5, 7),)
+        )
+
+        self.assertIn("(211) t=0.01", self.window._mapping_message)
+        self.assertIn("(200)", self.window._mapping_message)
 
     def test_one_click_preflight_visual_validation_and_seven_roi_fit(self):
         from NEAT.domain.agent_fitting import AgentFitRunStatus

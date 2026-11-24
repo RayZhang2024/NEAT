@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import json
+import math
+import os
 from dataclasses import replace
 from uuid import uuid4
 
@@ -72,6 +74,7 @@ from ..domain.agent_preflight import (
 )
 from ..domain.agent_vision import SpatialRoiCandidate, VisionOutcome, VisionStatus
 from ..domain.fitting import FittingParameterBounds
+from ..domain.individual_edge import IndividualEdgeFitConfig
 from ..domain.observation import (
     DatasetMode,
     ObservationStatus,
@@ -90,12 +93,19 @@ from ..services.agent_model import (
     AgentModelSettingsRepository,
     canonical_payload_for_context,
 )
+from ..services.agent_mapping import (
+    MappingShapeParameterMean,
+    build_mapping_calibration_plan,
+    mean_mapping_shape_parameters,
+)
+from ..services.fitting_engine import FittingEngine
 from ..services.agent_vision import render_roi_overlay
 from ..services.scientific_observation import (
     DatasetUnavailableError,
     ObservationErrorBase,
 )
 from .agent_fitting_worker import AgentFitWorker
+from .agent_mapping_worker import AgentMappingWorker
 from .agent_model_settings_dialog import AgentModelSettingsDialog
 from .agent_planning_worker import PlanningWorker
 from .agent_preflight_worker import PreflightWorker
@@ -507,6 +517,68 @@ class MacroPixelUncertaintyCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
 
+class MappingResultCanvas(FigureCanvasQTAgg):
+    """Show one edge's d-spacing map beside its uncertainty map."""
+
+    @staticmethod
+    def _hkl_label(hkl: tuple[int, int, int]) -> str:
+        return "(" + "".join(str(value) for value in hkl) + ")"
+
+    def __init__(self, parent=None) -> None:
+        self.figure = Figure(figsize=(9.2, 4.2), dpi=100)
+        super().__init__(self.figure)
+        self.setParent(parent)
+        self.setMinimumHeight(320)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setAccessibleName("Mapped d-spacing and fit uncertainty")
+        self.set_maps(None, None, "")
+
+    def set_maps(
+        self,
+        d_spacing: np.ndarray | None,
+        uncertainty: np.ndarray | None,
+        edge_label: str,
+    ) -> None:
+        self.figure.clear()
+        axes = self.figure.subplots(1, 2)
+        for axis in axes:
+            axis.set_facecolor("#f4f6f8")
+        if d_spacing is None or uncertainty is None:
+            for axis in axes:
+                axis.set_axis_off()
+            axes[0].text(
+                0.5, 0.5, "The map will appear after mapping completes.",
+                ha="center", va="center", color="#64748B", transform=axes[0].transAxes,
+            )
+            self.draw_idle()
+            return
+
+        panels = (
+            (d_spacing, "d-spacing fit (Å)", "viridis"),
+            (uncertainty, "d-spacing uncertainty (Å)", "magma"),
+        )
+        for axis, (values, title, cmap) in zip(axes, panels):
+            finite = np.isfinite(values)
+            axis.set_title(title, fontsize=10)
+            if not finite.any():
+                axis.set_axis_off()
+                axis.text(
+                    0.5, 0.5, "No successful fits for this edge.",
+                    ha="center", va="center", color="#64748B", transform=axis.transAxes,
+                )
+                continue
+            image = axis.imshow(
+                np.ma.masked_invalid(values), origin="upper", interpolation="nearest",
+                aspect="equal", cmap=cmap,
+            )
+            axis.set_xlabel("X pixel")
+            axis.set_ylabel("Y pixel")
+            self.figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+        self.figure.suptitle(edge_label)
+        self.figure.tight_layout()
+        self.draw_idle()
+
+
 class AgentWindow(QMainWindow):
     """One top-level companion window per NEAT main window."""
 
@@ -517,6 +589,8 @@ class AgentWindow(QMainWindow):
         self._planning_worker: PlanningWorker | None = None
         self._vision_worker: VisionWorker | None = None
         self._fit_worker: AgentFitWorker | None = None
+        self._mapping_calibration_worker: AgentFitWorker | None = None
+        self._mapping_worker: AgentMappingWorker | None = None
         self._active_run_id: str | None = None
         self._agent_run_id: str | None = None
         self._stage = "idle"
@@ -543,6 +617,16 @@ class AgentWindow(QMainWindow):
         self._fit_plan: AgentFitPlan | None = None
         self._fit_outcome: AgentFitOutcome | None = None
         self._macro_pixel_selection: AgentMacroPixelSelection | None = None
+        self._mapping_pending = False
+        self._mapping_state = "not_started"
+        self._mapping_message = "Mapping will start automatically after a usable size is selected."
+        self._mapping_pixel_size: int | None = None
+        self._mapping_parameters: tuple[MappingShapeParameterMean, ...] = ()
+        self._mapping_hkls: tuple[tuple[int, int, int], ...] = ()
+        self._mapping_result_paths: tuple[str, ...] = ()
+        self._mapping_result_maps: dict[tuple[int, int, int], tuple[np.ndarray, np.ndarray]] = {}
+        self._mapping_area: tuple[int, int, int, int] | None = None
+        self._mapping_step: tuple[int, int] | None = None
         self._pending_fit_plan: AgentFitPlan | None = None
         self._selected_roi_index = 0
         self._selected_size_index = 3
@@ -594,7 +678,7 @@ class AgentWindow(QMainWindow):
         self.overview_heading = QLabel("Explore fitting across seven sample locations", self.overview_panel)
         overview_layout.addWidget(self.overview_heading)
         self.scope_label = QLabel(
-            "One run checks the dataset, reviews representative frames and the measured spectrum, then fits one to five trusted edges at seven locations and seven macro-pixel sizes. Fitting runs locally; results are exploratory and do not confirm a phase, strain, or stress.",
+            "One run checks the dataset, reviews the phase and sample locations, fits trusted edges at seven locations and seven macro-pixel sizes, then automatically maps at the suggested size. Fitting runs locally; results are exploratory and do not confirm a phase, strain, or stress.",
             self.overview_panel,
         )
         self.scope_label.setWordWrap(True)
@@ -1183,8 +1267,8 @@ class AgentWindow(QMainWindow):
             label.setFixedSize(scaled.size())
 
     def _populate_step_evidence(self, index: int) -> None:
-        titles = ("Dataset check", "Sample locations", "Phase comparison")
-        index = max(0, min(index, 3))
+        titles = ("Dataset check", "Sample locations", "Phase comparison", "Local fitting", "Mapping")
+        index = max(0, min(index, 4))
         if index in (1, 2):
             index = 3 - index
         self._clear_step_evidence()
@@ -1336,6 +1420,63 @@ class AgentWindow(QMainWindow):
             )
             return
 
+        if index == 4:
+            self.step_evidence_heading.setText(titles[4])
+            self.step_evidence_subtitle.setText(
+                "NEAT's local edge-fit map at the selected macro-pixel size."
+            )
+            details = [self._mapping_message]
+            if self._mapping_pixel_size is not None:
+                details.append(
+                    f"Mapping box: {self._mapping_pixel_size} × "
+                    f"{self._mapping_pixel_size} px."
+                )
+            if self._mapping_step is not None:
+                details.append(
+                    f"Step: X={self._mapping_step[0]}, Y={self._mapping_step[1]} px."
+                )
+            if self._mapping_area is not None:
+                x_min, x_max, y_min, y_max = self._mapping_area
+                details.append(f"Mapping area: x[{x_min},{x_max}), y[{y_min},{y_max}).")
+            if self._mapping_parameters:
+                details.append(
+                    "Fixed t and eta are arithmetic means of successful location fits: "
+                    + "; ".join(
+                        f"{MappingResultCanvas._hkl_label(item.hkl)}: "
+                        f"t={item.t:.7g}, eta={item.eta:.7g}, "
+                        f"{item.valid_locations}/7 locations"
+                        for item in self._mapping_parameters
+                    ) + "."
+                )
+            if self._mapping_result_paths:
+                details.append("Saved output files:\n" + "\n".join(self._mapping_result_paths))
+            self._add_step_evidence_group("Mapping run", details)
+            if not self._mapping_result_maps:
+                self._add_step_evidence_text(
+                    self._mapping_message or "No mapping results are available."
+                )
+                return
+            selector_row = QHBoxLayout()
+            selector_row.addWidget(QLabel("HKL:", self.step_evidence_content))
+            self._mapping_edge_selector = QComboBox(self.step_evidence_content)
+            self._mapping_edge_selector.addItems(
+                [MappingResultCanvas._hkl_label(hkl) for hkl in self._mapping_hkls]
+            )
+            self._mapping_edge_selector.currentIndexChanged.connect(
+                self._update_mapping_result_canvas
+            )
+            selector_row.addWidget(self._mapping_edge_selector)
+            selector_row.addStretch()
+            self.step_evidence_layout.addLayout(selector_row)
+            self._mapping_result_canvas = MappingResultCanvas(self.step_evidence_content)
+            self.step_evidence_layout.addWidget(self._mapping_result_canvas, 1)
+            self._update_mapping_result_canvas()
+            self._add_step_evidence_text(
+                "Exploratory d_fit output follows NEAT's legacy d_fit convention; "
+                "physical calibration, strain, and stress need separate validation."
+            )
+            return
+
         self.step_evidence_heading.setText("Local fitting")
         self.step_evidence_subtitle.setText(
             "The seven-location fit matrix, per-fit measurements, curves and residuals."
@@ -1347,6 +1488,22 @@ class AgentWindow(QMainWindow):
             )
             return
         self.show_fit_results()
+
+    def _update_mapping_result_canvas(self, _index: int | None = None) -> None:
+        canvas = getattr(self, "_mapping_result_canvas", None)
+        selector = getattr(self, "_mapping_edge_selector", None)
+        if canvas is None or selector is None or not self._mapping_hkls:
+            return
+        index = selector.currentIndex()
+        if not 0 <= index < len(self._mapping_hkls):
+            canvas.set_maps(None, None, "")
+            return
+        hkl = self._mapping_hkls[index]
+        maps = self._mapping_result_maps.get(hkl)
+        if maps is None:
+            canvas.set_maps(None, None, MappingResultCanvas._hkl_label(hkl))
+            return
+        canvas.set_maps(*maps, MappingResultCanvas._hkl_label(hkl))
 
     def show_fit_results(self) -> None:
         if self._fit_plan is None or not self._fit_cells:
@@ -1538,9 +1695,9 @@ class AgentWindow(QMainWindow):
             return
         page = self.summary_page
         active = self._has_active_worker()
-        conclusions = ["Not started"] * 4
-        evidence = ["No evidence is available yet."] * 4
-        inspectable = [False] * 4
+        conclusions = ["Not started"] * 5
+        evidence = ["No evidence is available yet."] * 5
+        inspectable = [False] * 5
         result = self._result
         visual = self._vision_outcome
         fit = self._fit_outcome
@@ -1593,7 +1750,9 @@ class AgentWindow(QMainWindow):
                 evidence[3] = self.fit_matrix_summary.text()
         if fit is not None:
             if fit.status in {AgentFitRunStatus.COMPLETE, AgentFitRunStatus.COMPLETE_WITH_ISSUES}:
-                heading = "Analysis complete"
+                heading = "Analysis complete" if self._mapping_state in {
+                    "complete", "partial", "unavailable", "failed", "not_started"
+                } else "Analysis in progress"
                 conclusions[3] = f"{fit.attempted} fits attempted across 7 sizes"
                 if fit.failed or fit.skipped:
                     conclusions[3] += f" · {fit.failed} failed, {fit.skipped} skipped"
@@ -1635,23 +1794,64 @@ class AgentWindow(QMainWindow):
             and self._agent_settings.mode is AgentModelMode.LOCAL
         ):
             heading = "Dataset review complete"
-            conclusions[1:] = ["Not run in local-model mode"] * 3
+            conclusions[1:] = ["Not run in local-model mode"] * 4
             notice = "A read-only plan is available. Local-model mode does not run the OpenAI visual fitting workflow."
         if self._proposal_withdrawn:
             heading = "ROI adjustment saved" if self._adjusted_roi is not None else "Proposal withdrawn"
-            conclusions[1:] = ["Earlier proposal withdrawn", "Earlier proposal withdrawn", "Earlier fits withdrawn"]
-            evidence[1:] = ["Run analysis again to review current evidence."] * 3
-            inspectable[1:] = [False] * 3
+            conclusions[1:] = [
+                "Earlier proposal withdrawn", "Earlier proposal withdrawn",
+                "Earlier fits withdrawn", "Mapping not started",
+            ]
+            evidence[1:] = ["Run analysis again to review current evidence."] * 4
+            inspectable[1:] = [False] * 4
             notice = "Run analysis again to extract a fresh spectrum and prepare new results."
         if self._cancellation_requested or self._stage in {"cancelled", "stopped"}:
             heading = "Stopping analysis…" if active else "Analysis stopped"
             notice = "Completed fit evidence remains available." if self._fit_cells else "No fit results are available."
         if self._stale:
             heading = "Dataset changed"
-            conclusions = ["Rerun required"] * 4
-            evidence = ["Earlier evidence no longer describes the current dataset."] * 4
-            inspectable = [False] * 4
+            conclusions = ["Rerun required"] * 5
+            evidence = ["Earlier evidence no longer describes the current dataset."] * 5
+            inspectable = [False] * 5
             notice = "Run analysis again to inspect the current dataset."
+        if fit is not None and not self._stale and not self._proposal_withdrawn:
+            mapping_evidence = self._mapping_message
+            if self._mapping_pixel_size is not None:
+                mapping_evidence = (
+                    f"Mapping size: {self._mapping_pixel_size} × "
+                    f"{self._mapping_pixel_size} px. " + mapping_evidence
+                )
+            if self._mapping_step is not None:
+                mapping_evidence += (
+                    f" Step: {self._mapping_step[0]} × {self._mapping_step[1]} px."
+                )
+            if self._mapping_parameters:
+                means = "; ".join(
+                    f"{MappingResultCanvas._hkl_label(item.hkl)} t={item.t:.6g}, "
+                    f"eta={item.eta:.6g} (n={item.valid_locations})"
+                    for item in self._mapping_parameters
+                )
+                mapping_evidence += " Fixed t and eta means: " + means + "."
+            if self._mapping_result_paths:
+                mapping_evidence += "\nSaved files:\n" + "\n".join(self._mapping_result_paths)
+            if self._mapping_state == "complete":
+                conclusions[4] = f"Mapping complete · {len(self._mapping_hkls)} edges"
+            elif self._mapping_state == "partial":
+                conclusions[4] = "Mapping completed with a save warning"
+            elif self._mapping_state == "calibrating":
+                conclusions[4] = "Preparing fixed t and eta values…"
+            elif self._mapping_state == "running":
+                conclusions[4] = "Mapping in progress…"
+            elif self._mapping_state == "stopped":
+                conclusions[4] = "Mapping stopped · partial results were not saved"
+            elif self._mapping_state == "unavailable":
+                conclusions[4] = "No eligible mapping size; mapping not started"
+            elif self._mapping_state == "failed":
+                conclusions[4] = "Mapping could not start or complete"
+            else:
+                conclusions[4] = "Preparing mapping…"
+            evidence[4] = mapping_evidence
+            inspectable[4] = True
         page.heading.setText(heading)
         page.subtitle.setText("Here is what each step found." if fit is not None else subtitle)
         page.notice.setText(notice)
@@ -1884,6 +2084,17 @@ class AgentWindow(QMainWindow):
         self._fit_plan = None
         self._fit_outcome = None
         self._macro_pixel_selection = None
+        if self._mapping_worker is None and self._mapping_calibration_worker is None:
+            self._mapping_pending = False
+            self._mapping_state = "not_started"
+            self._mapping_message = "Mapping will start automatically after a usable size is selected."
+            self._mapping_pixel_size = None
+            self._mapping_parameters = ()
+            self._mapping_hkls = ()
+            self._mapping_result_paths = ()
+            self._mapping_result_maps.clear()
+            self._mapping_area = None
+            self._mapping_step = None
         if hasattr(self, "mapping_size_chart"):
             self.mapping_size_chart.set_summary(None)
             self.mapping_size_summary_label.setText(
@@ -2539,6 +2750,19 @@ class AgentWindow(QMainWindow):
             self.fit_results_status.setText(outcome.message)
             status = "Fitting ended safely. Review the run details."
         self._set_status(status)
+        if outcome.status in {
+            AgentFitRunStatus.COMPLETE,
+            AgentFitRunStatus.COMPLETE_WITH_ISSUES,
+        }:
+            self._mapping_pending = True
+            self._mapping_state = "preparing"
+            self._mapping_message = (
+                "Preparing the automatic map from the completed location-fit sweep."
+            )
+        else:
+            self._mapping_pending = False
+            self._mapping_state = "unavailable"
+            self._mapping_message = "The location-fit sweep did not complete; mapping was not started."
         self.progress_bar.setValue(100 if outcome.status is not AgentFitRunStatus.STOPPED else min(99, self.progress_bar.value()))
         first_review = next(
             (
@@ -2563,7 +2787,7 @@ class AgentWindow(QMainWindow):
             f"{outcome.succeeded} results, {outcome.failed} failed, {outcome.skipped} skipped, "
             f"{outcome.needs_review} need review. "
             + outcome.message
-            + "\nNo mapping, phase confirmation, strain, or stress calculation was performed."
+            + "\nIf a mapping size is available, NEAT will now start its local mapping fit automatically."
         )
         self._update_controls()
 
@@ -2575,6 +2799,598 @@ class AgentWindow(QMainWindow):
         if run_id == self._agent_run_id and self._cancellation_requested and not self._stale:
             self._stage = "cancelled"
             self._set_status("Autonomous analysis stopped after the current local fit completed safely.")
+        elif run_id == self._agent_run_id and self._mapping_pending:
+            self._start_mapping_from_fit_sweep()
+        self._update_controls()
+
+    def _start_mapping_from_fit_sweep(self) -> None:
+        """Use the selected uncertainty target size and begin automatic mapping."""
+        if (
+            not self._mapping_pending
+            or self._fit_plan is None
+            or self._fit_outcome is None
+            or self._macro_pixel_selection is None
+            or self._cancellation_requested
+            or self._stale
+            or self._parent_closing
+        ):
+            return
+        self._mapping_pending = False
+        width = self._macro_pixel_selection.selected_width
+        if width is None or not self._macro_pixel_selection.run_complete:
+            self._mapping_state = "unavailable"
+            self._mapping_message = (
+                "The completed sweep did not produce an eligible target-crossing size; mapping was not started."
+            )
+            self._set_status(self._mapping_message)
+            self._update_controls()
+            return
+        eligible_hkls = tuple(
+            assessment.hkl for assessment in self._macro_pixel_selection.edges
+            if not assessment.excluded
+        )
+        if not eligible_hkls:
+            self._mapping_failure("No edge remained eligible for mapping after the uncertainty screen.")
+            return
+        self._mapping_pixel_size = width
+        self._mapping_hkls = eligible_hkls
+        self._mapping_result_paths = ()
+        self._mapping_result_maps.clear()
+        required_mapping_controls = (
+            "min_x_input", "max_x_input", "min_y_input", "max_y_input",
+            "box_width_input", "box_height_input", "step_x_input", "step_y_input",
+            "interpolation_checkbox",
+        )
+        if any(
+            getattr(self._main_window, name, None) is None
+            for name in required_mapping_controls
+        ):
+            self._mapping_failure(
+                "NEAT's mapping settings are unavailable; mapping was not started."
+            )
+            return
+        work_directory = getattr(self._main_window, "work_directory", "")
+        if not work_directory or not os.path.isdir(work_directory):
+            self._mapping_failure("NEAT has no valid output folder for mapping results.")
+            return
+        fitted_size_index = next(
+            (
+                index for index, size in enumerate(self._fit_outcome.macro_pixel_sizes)
+                if size.width == width and size.height == width
+            ),
+            None,
+        )
+        if fitted_size_index is not None:
+            means = mean_mapping_shape_parameters(
+                self._fit_outcome,
+                size_index=fitted_size_index,
+                hkls=eligible_hkls,
+            )
+            self._accept_mapping_parameters(means)
+            self._start_batch_mapping()
+            return
+
+        adapter = getattr(self._main_window, "scientific_observation_api", None)
+        if adapter is None or adapter.revision_clock.current() != self._dataset_token:
+            self._mark_stale()
+            return
+        try:
+            handle = adapter.capture_dataset()
+            calibration_plan = build_mapping_calibration_plan(
+                self._fit_plan, width, hkls=eligible_hkls
+            )
+        except (DatasetUnavailableError, ObservationErrorBase, ValueError) as exc:
+            self._mapping_failure(
+                f"Could not prepare the exact-size parameter fits ({type(exc).__name__}); mapping was not started."
+            )
+            return
+        if (handle.dataset_id, handle.revision) != self._dataset_token:
+            self._mark_stale()
+            return
+        settings = self._run_snapshot.settings if self._run_snapshot is not None else self._agent_settings
+        worker = AgentFitWorker(
+            handle,
+            calibration_plan,
+            agent_settings=settings,
+            langsmith_credential_resolver=self._run_langsmith_credential_resolver,
+            mapping_calibration=True,
+            parent=self._main_window,
+        )
+        self._mapping_calibration_worker = worker
+        self._main_window.agent_mapping_calibration_worker = worker
+        self._main_window._track_shutdown_worker(worker, "agent_mapping_calibration")
+        run_id = self._agent_run_id
+        self._main_window._connect_shutdown_worker_signal(
+            worker,
+            worker.progress,
+            lambda event, rid=run_id, current=worker: self._on_mapping_calibration_progress(
+                rid, current, event
+            ),
+            current_attribute="agent_mapping_calibration_worker",
+        )
+        self._main_window._connect_shutdown_worker_signal(
+            worker,
+            worker.completed,
+            lambda outcome, rid=run_id, current=worker: self._on_mapping_calibration_completed(
+                rid, current, outcome
+            ),
+            current_attribute="agent_mapping_calibration_worker",
+        )
+        self._main_window._connect_shutdown_worker_signal(
+            worker,
+            worker.finished,
+            lambda rid=run_id, current=worker: self._on_mapping_calibration_finished(
+                rid, current
+            ),
+            current_attribute="agent_mapping_calibration_worker",
+        )
+        self._mapping_state = "calibrating"
+        self._mapping_message = (
+            f"Running seven-location fits at the recommended {width} × {width} px size "
+            "to calculate fixed t and eta means."
+        )
+        self._stage = "mapping_calibration_running"
+        self.progress_bar.setValue(1)
+        self._set_status(self._mapping_message)
+        self._update_controls()
+        worker.start()
+
+    def _on_mapping_calibration_progress(
+        self, run_id: str | None, worker: AgentFitWorker, event: AgentFitProgress
+    ) -> None:
+        if (
+            run_id != self._agent_run_id
+            or worker is not self._mapping_calibration_worker
+            or self._parent_closing
+            or self._cancellation_requested
+            or self._stale
+        ):
+            return
+        self._check_revision()
+        if self._stale:
+            return
+        self.progress_bar.setValue(min(29, 5 + int(24 * event.completed / max(1, event.total_fits))))
+        self._mapping_message = event.message
+        self._set_status(event.message)
+
+    def _on_mapping_calibration_completed(
+        self, run_id: str | None, worker: AgentFitWorker, outcome: AgentFitOutcome
+    ) -> None:
+        if (
+            run_id != self._agent_run_id
+            or worker is not self._mapping_calibration_worker
+            or outcome.run_id != run_id
+            or self._parent_closing
+            or getattr(self._main_window, "_shutdown_close_pending", False)
+        ):
+            return
+        if self._cancellation_requested:
+            self._mapping_state = "stopped"
+            self._mapping_message = "Mapping parameter calibration was stopped; no mapping results were saved."
+            return
+        self._check_revision()
+        if self._stale or outcome.status is AgentFitRunStatus.STALE:
+            self._mark_stale()
+            return
+        if outcome.status not in {
+            AgentFitRunStatus.COMPLETE,
+            AgentFitRunStatus.COMPLETE_WITH_ISSUES,
+        }:
+            self._mapping_failure(
+                outcome.message or "No valid location fits were available to set mapping t and eta."
+            )
+            return
+        means = mean_mapping_shape_parameters(
+            outcome, size_index=0, hkls=self._mapping_hkls
+        )
+        self._accept_mapping_parameters(means)
+        self._update_controls()
+
+    def _accept_mapping_parameters(
+        self, means: tuple[MappingShapeParameterMean, ...]
+    ) -> None:
+        self._mapping_parameters = tuple(means)
+        valid_hkls = tuple(item.hkl for item in means)
+        missing = tuple(hkl for hkl in self._mapping_hkls if hkl not in valid_hkls)
+        self._mapping_hkls = valid_hkls
+        if not means:
+            self._mapping_failure(
+                "No successful location fits supplied finite t and eta values; mapping was not started."
+            )
+            return
+        summary = "; ".join(
+            f"{MappingResultCanvas._hkl_label(item.hkl)} t={item.t:.6g}, "
+            f"eta={item.eta:.6g} from {item.valid_locations}/7 locations"
+            for item in means
+        )
+        self._mapping_state = "preparing"
+        self._mapping_message = "Mapping parameters prepared: " + summary + "."
+        if missing:
+            self._mapping_message += (
+                " Edges without a successful parameter mean were omitted: "
+                + ", ".join(MappingResultCanvas._hkl_label(hkl) for hkl in missing)
+                + "."
+            )
+
+    def _on_mapping_calibration_finished(
+        self, run_id: str | None, worker: AgentFitWorker
+    ) -> None:
+        if self._mapping_calibration_worker is worker:
+            self._mapping_calibration_worker = None
+        if getattr(self._main_window, "agent_mapping_calibration_worker", None) is worker:
+            self._main_window.agent_mapping_calibration_worker = None
+        if run_id == self._agent_run_id and not self._cancellation_requested and not self._stale:
+            if self._mapping_parameters:
+                self._start_batch_mapping()
+            elif self._mapping_state not in {"failed", "stopped"}:
+                self._mapping_failure("Mapping parameter calibration ended without usable results.")
+        self._update_controls()
+
+    def mapping_calibration_worker_retired(
+        self, worker: AgentFitWorker, callbacks_suppressed: bool
+    ) -> None:
+        if self._mapping_calibration_worker is worker:
+            self._mapping_calibration_worker = None
+        if not self._parent_closing and callbacks_suppressed:
+            self._mapping_pending = False
+            if self._mapping_state == "calibrating":
+                self._mapping_state = "stopped"
+                self._mapping_message = "Mapping calibration stopped safely; no map was started."
+        if self._mapping_calibration_worker is None and self._mapping_worker is None:
+            self._revision_timer.stop()
+        self._update_controls()
+
+    def _apply_mapping_parameters_to_table(self) -> None:
+        table = getattr(self._main_window, "bragg_table", None)
+        if table is None:
+            return
+        means = {item.hkl: item for item in self._mapping_parameters}
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            try:
+                hkl = tuple(int(value) for value in ast.literal_eval(item.text()))
+            except (AttributeError, SyntaxError, TypeError, ValueError):
+                continue
+            mean = means.get(hkl)
+            if mean is None:
+                continue
+            for column, value in ((9, mean.t), (10, mean.eta)):
+                cell = table.item(row, column)
+                if cell is None:
+                    cell = QTableWidgetItem()
+                    table.setItem(row, column, cell)
+                cell.setText(f"{value:.10g}")
+
+    def _start_batch_mapping(self) -> None:
+        if (
+            not self._mapping_parameters
+            or not self._mapping_hkls
+            or self._mapping_pixel_size is None
+            or self._cancellation_requested
+            or self._stale
+            or self._parent_closing
+        ):
+            return
+        self._check_revision()
+        if self._stale:
+            return
+        adapter = getattr(self._main_window, "scientific_observation_api", None)
+        if adapter is None:
+            self._mapping_failure("The dataset access service is unavailable; mapping was not started.")
+            return
+        try:
+            handle = adapter.capture_dataset()
+        except (DatasetUnavailableError, ObservationErrorBase, ValueError):
+            self._mapping_failure("Could not capture the current image stack for mapping.")
+            return
+        if (handle.dataset_id, handle.revision) != self._dataset_token or not handle.frames:
+            self._mark_stale()
+            return
+        main = self._main_window
+        size = self._mapping_pixel_size
+        step = max(1, math.floor(size / 2 - 1))
+        try:
+            x_min = int(main.min_x_input.text())
+            x_max = int(main.max_x_input.text())
+            y_min = int(main.min_y_input.text())
+            y_max = int(main.max_y_input.text())
+            image_height, image_width = handle.image_shape
+        except (AttributeError, TypeError, ValueError):
+            self._mapping_failure("The existing mapping area is invalid; mapping was not started.")
+            return
+        if not (
+            0 <= x_min < x_max <= image_width
+            and 0 <= y_min < y_max <= image_height
+            and x_max - x_min >= size
+            and y_max - y_min >= size
+        ):
+            self._mapping_failure(
+                "The existing mapping area cannot contain the suggested box; mapping was not started."
+            )
+            return
+        work_directory = getattr(main, "work_directory", "")
+        if not work_directory or not os.path.isdir(work_directory):
+            self._mapping_failure("NEAT has no valid output folder for mapping results.")
+            return
+
+        # Apply the same fields and mapping-area pathway used by Mapping Setting,
+        # without opening a confirmation dialog. The user's area and interpolation
+        # setting are preserved.
+        main.box_width_input.setText(str(size))
+        main.box_height_input.setText(str(size))
+        main.step_x_input.setText(str(step))
+        main.step_y_input.setText(str(step))
+        apply_settings = getattr(main, "_apply_mapping_settings_from_inputs", None)
+        if not callable(apply_settings) or not apply_settings():
+            self._mapping_failure("NEAT could not apply the suggested mapping settings.")
+            return
+        set_fixed = getattr(main, "set_fix_parameter_state", None)
+        if callable(set_fixed):
+            set_fixed("t", True)
+            set_fixed("eta", True)
+        else:
+            header = getattr(main, "bragg_header", None)
+            if header is not None:
+                header.set_column_checked(9, True)
+                header.set_column_checked(10, True)
+        self._apply_mapping_parameters_to_table()
+        save_settings = getattr(main, "save_user_settings", None)
+        if callable(save_settings):
+            save_settings()
+
+        edge_by_hkl = {edge.hkl: edge for edge in self._fit_plan.edges}
+        parameter_by_hkl = {item.hkl: item for item in self._mapping_parameters}
+        edge_configs = tuple(
+            IndividualEdgeFitConfig(
+                source_row=edge_by_hkl[hkl].source_row,
+                hkl=hkl,
+                d=None,
+                regions=(
+                    edge_by_hkl[hkl].region2,
+                    edge_by_hkl[hkl].region1,
+                    edge_by_hkl[hkl].region3,
+                ),
+                s=edge_by_hkl[hkl].s,
+                t=parameter_by_hkl[hkl].t,
+                eta=parameter_by_hkl[hkl].eta,
+                is_known_phase=True,
+                structure_type=self._fit_plan.structure_type,
+                lattice_params=self._fit_plan.lattice_params,
+                fitting_parameter_bounds=self._fit_plan.fitting_parameter_bounds,
+            )
+            for hkl in self._mapping_hkls
+            if hkl in edge_by_hkl and hkl in parameter_by_hkl
+        )
+        if not edge_configs:
+            self._mapping_failure("No edge has usable mapping parameters.")
+            return
+        try:
+            fit_context = main._build_batch_fit_context()
+        except (AttributeError, TypeError, ValueError):
+            fit_context = {}
+        metadata_keys = (
+            "flight_path", "flight_path_source", "data_source", "input_file",
+            "min_wavelength", "max_wavelength", "selected_phase", "bragg_rows_text",
+        )
+        output_metadata = {key: fit_context.get(key) for key in metadata_keys}
+        output_metadata["selected_phase"] = self._fit_plan.phase_id
+        total_boxes = (
+            ((y_max - y_min - size) // step + 1)
+            * ((x_max - x_min - size) // step + 1)
+        )
+        if total_boxes <= 0:
+            self._mapping_failure("The mapping area contains no valid fit locations.")
+            return
+        settings = self._run_snapshot.settings if self._run_snapshot is not None else self._agent_settings
+        worker = AgentMappingWorker(
+            fitting_engine=FittingEngine(),
+            edge_configs=edge_configs,
+            images=handle.frames,
+            wavelengths=handle.wavelengths,
+            output_metadata=output_metadata,
+            min_x=x_min,
+            max_x=x_max,
+            min_y=y_min,
+            max_y=y_max,
+            box_width=size,
+            box_height=size,
+            step_x=step,
+            step_y=step,
+            total_boxes=total_boxes,
+            work_directory=work_directory,
+            interpolation_enabled=bool(main.interpolation_checkbox.isChecked()),
+            fix_s=bool(main.fix_s_enabled()) if callable(getattr(main, "fix_s_enabled", None)) else False,
+            fix_t=bool(main.fix_t_enabled()) if callable(getattr(main, "fix_t_enabled", None)) else True,
+            fix_eta=bool(main.fix_eta_enabled()) if callable(getattr(main, "fix_eta_enabled", None)) else True,
+            run_id=self._agent_run_id or "",
+            dataset_id=handle.dataset_id,
+            revision=handle.revision,
+            agent_settings=settings,
+            langsmith_credential_resolver=self._run_langsmith_credential_resolver,
+            mapping_area=(x_min, x_max, y_min, y_max),
+            parent=main,
+        )
+        self._mapping_area = (x_min, x_max, y_min, y_max)
+        self._mapping_step = (step, step)
+        self._mapping_worker = worker
+        main.agent_mapping_worker = worker
+        main._track_shutdown_worker(worker, "agent_mapping")
+        run_id = self._agent_run_id
+        main._connect_shutdown_worker_signal(
+            worker,
+            worker.progress_updated,
+            lambda percent, rid=run_id, current=worker: self._on_mapping_progress(
+                rid, current, percent
+            ),
+            current_attribute="agent_mapping_worker",
+        )
+        main._connect_shutdown_worker_signal(
+            worker,
+            worker.message,
+            lambda message, rid=run_id, current=worker: self._on_mapping_message(
+                rid, current, message
+            ),
+            current_attribute="agent_mapping_worker",
+        )
+        main._connect_shutdown_worker_signal(
+            worker,
+            worker.finished,
+            lambda paths, rid=run_id, current=worker: self._on_mapping_completed(
+                rid, current, paths, total_boxes
+            ),
+            current_attribute="agent_mapping_worker",
+        )
+        current_box_slot = getattr(main, "update_current_box", None)
+        if callable(current_box_slot):
+            main._connect_shutdown_worker_signal(
+                worker,
+                worker.current_box_changed,
+                current_box_slot,
+                current_attribute="agent_mapping_worker",
+            )
+        self._mapping_state = "running"
+        self._mapping_message = (
+            f"Mapping {len(edge_configs)} eligible edges at {size} × {size} px; "
+            f"{total_boxes} positions are scheduled."
+        )
+        self._stage = "mapping_running"
+        self.progress_bar.setValue(30)
+        self._set_status(self._mapping_message)
+        self._update_controls()
+        worker.start()
+
+    def _on_mapping_progress(
+        self, run_id: str | None, worker: AgentMappingWorker, percent: int
+    ) -> None:
+        if (
+            run_id != self._agent_run_id
+            or worker is not self._mapping_worker
+            or self._parent_closing
+            or self._cancellation_requested
+            or self._stale
+        ):
+            return
+        self._check_revision()
+        if self._stale:
+            return
+        self.progress_bar.setValue(min(99, 30 + int(0.69 * percent)))
+        self._set_status(f"Mapping in progress · {percent}% of positions checked.")
+
+    def _on_mapping_message(
+        self, run_id: str | None, worker: AgentMappingWorker, message: str
+    ) -> None:
+        if run_id != self._agent_run_id or worker is not self._mapping_worker:
+            return
+        if not self._cancellation_requested and not self._stale:
+            self._mapping_message = str(message)
+            self._set_status(str(message))
+
+    def _on_mapping_completed(
+        self,
+        run_id: str | None,
+        worker: AgentMappingWorker,
+        payload: str,
+        total_boxes: int,
+    ) -> None:
+        if (
+            run_id != self._agent_run_id
+            or worker is not self._mapping_worker
+            or self._parent_closing
+            or getattr(self._main_window, "_shutdown_close_pending", False)
+        ):
+            return
+        self._check_revision()
+        if self._stale:
+            return
+        if self._cancellation_requested:
+            self._mapping_state = "stopped"
+            self._mapping_message = "Mapping stopped safely. Partial results were not saved."
+            self._mapping_result_paths = ()
+            self._mapping_result_maps.clear()
+            self._stage = "cancelled"
+            self._set_status(self._mapping_message)
+            self._update_controls()
+            return
+        paths = tuple(
+            path.strip() for path in str(payload or "").splitlines()
+            if path.strip() and os.path.isfile(path.strip())
+        )
+        self._mapping_result_paths = paths
+        success_counts: list[str] = []
+        self._mapping_result_maps.clear()
+        for index, hkl in enumerate(self._mapping_hkls):
+            if index >= len(worker.edge_configs):
+                break
+            d_values = worker.a_array[:, :, index]
+            d_uncertainty = worker.a_unc_array[:, :, index]
+            self._mapping_result_maps[hkl] = (
+                np.array(d_values, copy=True),
+                np.array(d_uncertainty, copy=True),
+            )
+            coverage_values = (
+                worker.successful_center_mask[:, :, index]
+                if worker.successful_center_mask is not None
+                else d_values
+            )
+            x_min, x_max, y_min, y_max = self._mapping_area or (
+                0, coverage_values.shape[1], 0, coverage_values.shape[0]
+            )
+            successful = 0
+            size = self._mapping_pixel_size or worker.box_width
+            for y in range(y_min, y_max - size + 1, worker.step_y):
+                for x in range(x_min, x_max - size + 1, worker.step_x):
+                    center_row = y + worker.box_height // 2
+                    center_col = x + worker.box_width // 2
+                    if np.isfinite(coverage_values[center_row, center_col]):
+                        successful += 1
+            coverage = 100.0 * successful / max(1, total_boxes)
+            success_counts.append(
+                f"{MappingResultCanvas._hkl_label(hkl)} {successful}/{total_boxes} ({coverage:.1f}%)"
+            )
+        has_results = bool(self._mapping_result_maps) and any(
+            np.isfinite(values[0]).any() for values in self._mapping_result_maps.values()
+        )
+        if has_results and len(paths) >= 2:
+            self._mapping_state = "complete"
+            self._mapping_message = "Map fits succeeded at these positions: " + "; ".join(success_counts) + "."
+            self.progress_bar.setValue(100)
+            self._stage = "complete"
+        elif has_results or paths:
+            self._mapping_state = "partial"
+            self._mapping_message = (
+                "Mapping produced some results, but both CSV outputs were not confirmed. "
+                + ("Successful positions: " + "; ".join(success_counts) + "." if has_results else "")
+            )
+            self._stage = "complete_with_issues"
+        else:
+            self._mapping_state = "failed"
+            self._mapping_message = "No successful map fits were saved. Review the mapping area and fit windows."
+            self._stage = "complete_with_issues"
+        self._set_status(self._mapping_message)
+        self._update_controls()
+
+    def mapping_worker_retired(
+        self, worker: AgentMappingWorker, callbacks_suppressed: bool
+    ) -> None:
+        if self._mapping_worker is worker:
+            self._mapping_worker = None
+        if getattr(self._main_window, "agent_mapping_worker", None) is worker:
+            self._main_window.agent_mapping_worker = None
+        if not self._parent_closing and callbacks_suppressed and self._mapping_state == "running":
+            self._mapping_state = "stopped"
+            self._mapping_result_paths = ()
+            self._mapping_result_maps.clear()
+            self._mapping_message = "Mapping stopped safely; partial results were not saved."
+        if self._mapping_worker is None and self._mapping_calibration_worker is None:
+            self._revision_timer.stop()
+        self._update_controls()
+
+    def _mapping_failure(self, message: str) -> None:
+        self._mapping_pending = False
+        self._mapping_state = "failed"
+        self._mapping_message = str(message)
+        self._stage = "complete_with_issues"
+        self._set_status(self._mapping_message)
         self._update_controls()
 
     def fit_worker_retired(self, worker: AgentFitWorker, callbacks_suppressed: bool) -> None:
@@ -2590,6 +3406,8 @@ class AgentWindow(QMainWindow):
                 self._reset_fit_results()
                 self._set_status("Local fitting stopped while NEAT was closing.")
             self._update_controls()
+            if not self._has_active_worker():
+                self._revision_timer.stop()
 
     def preview_adjusted_roi(self) -> None:
         if self._result is None or not self._result.frames or self._vision_outcome is None or self._has_active_worker():
@@ -2686,6 +3504,16 @@ class AgentWindow(QMainWindow):
             self._vision_worker.stop()
         if self._fit_worker is not None:
             self._fit_worker.stop()
+        if self._mapping_calibration_worker is not None:
+            self._mapping_calibration_worker.stop()
+        if self._mapping_worker is not None:
+            self._mapping_worker.stop()
+        self._mapping_pending = False
+        self._mapping_state = "stale"
+        self._mapping_result_paths = ()
+        self._mapping_result_maps.clear()
+        self._mapping_parameters = ()
+        self._mapping_message = "Dataset changed; earlier mapping evidence was withdrawn."
         self._fit_outcome = None
         self._fit_plan = None
         self._pending_fit_plan = None
@@ -2709,6 +3537,7 @@ class AgentWindow(QMainWindow):
         if (
             self._worker is None and self._planning_worker is None
             and self._vision_worker is None and self._fit_worker is None
+            and self._mapping_calibration_worker is None and self._mapping_worker is None
         ):
             self._revision_timer.stop()
         self._update_controls()
@@ -2720,7 +3549,10 @@ class AgentWindow(QMainWindow):
             inventory is not None
             and any(
                 inventory.has_role(role)
-                for role in ("agent_preflight", "agent_planning", "agent_vision", "agent_fitting")
+                for role in (
+                    "agent_preflight", "agent_planning", "agent_vision", "agent_fitting",
+                    "agent_mapping_calibration", "agent_mapping",
+                )
             )
         )
         return bool(
@@ -2728,10 +3560,13 @@ class AgentWindow(QMainWindow):
             or self._planning_worker is not None
             or self._vision_worker is not None
             or self._fit_worker is not None
+            or self._mapping_calibration_worker is not None
+            or self._mapping_worker is not None
             or self._awaiting_preflight_completion
             or self._pending_planning_context is not None
             or self._pending_vision_result is not None
             or self._pending_fit_plan is not None
+            or self._mapping_pending
             or tracked_worker
         )
 
@@ -2743,6 +3578,7 @@ class AgentWindow(QMainWindow):
             or self._pending_planning_context is not None
             or self._pending_vision_result is not None
             or self._pending_fit_plan is not None
+            or self._mapping_pending
             or (
                 self._worker is not None
                 and not self._preflight_completion_received
@@ -2753,6 +3589,8 @@ class AgentWindow(QMainWindow):
             )
             or (self._vision_worker is not None and self._vision_outcome is None)
             or (self._fit_worker is not None and self._fit_outcome is None)
+            or self._mapping_calibration_worker is not None
+            or self._mapping_worker is not None
         )
 
     def _update_controls(self) -> None:
@@ -3099,11 +3937,14 @@ class AgentWindow(QMainWindow):
         self._pending_planning_context = None
         self._pending_vision_result = None
         self._pending_fit_plan = None
+        self._mapping_pending = False
         for worker in (
             self._worker,
             self._planning_worker,
             self._vision_worker,
             self._fit_worker,
+            self._mapping_calibration_worker,
+            self._mapping_worker,
         ):
             if worker is not None:
                 try:
@@ -3469,6 +4310,8 @@ class AgentWindow(QMainWindow):
             elif self._pending_fit_plan is not None:
                 self._start_pending_fitting()
             self._update_controls()
+            if not self._has_active_worker():
+                self._revision_timer.stop()
 
     def _start_planning(self, context: PlanningContext) -> None:
         if (

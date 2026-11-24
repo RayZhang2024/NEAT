@@ -552,7 +552,7 @@ def _validate_spectrum_edge(
     return points, None
 
 
-def _validate_fit_plan(plan: AgentFitPlan) -> None:
+def _validate_fit_plan(plan: AgentFitPlan, *, mapping_calibration: bool = False) -> None:
     if plan.phase_id not in PHASE_DATA or plan.phase_id == "Unknown_Phase":
         raise AgentFitBlocked("The phase is not in NEAT's trusted catalogue.")
     phase_value = PHASE_DATA[plan.phase_id]
@@ -565,14 +565,21 @@ def _validate_fit_plan(plan: AgentFitPlan) -> None:
         raise AgentFitBlocked("The fit lattice parameters do not match the trusted phase catalogue.")
     if not 1 <= len(plan.edges) <= MAX_SELECTED_EDGES:
         raise AgentFitBlocked("One to five selected edges are required.")
-    if len(plan.macro_pixel_sizes) != MACRO_PIXEL_SIZE_LEVELS * 2 + 1:
-        raise AgentFitBlocked("The run requires exactly seven macro-pixel sizes.")
-    expected_sizes = build_macro_pixel_sizes(
-        MACRO_PIXEL_BASELINE_WIDTH,
-        MACRO_PIXEL_BASELINE_HEIGHT,
-    )
-    if plan.macro_pixel_sizes != expected_sizes:
-        raise AgentFitBlocked("Macro-pixel sizes differ from the validated 1.25 scale series.")
+    if mapping_calibration:
+        if len(plan.macro_pixel_sizes) != 1:
+            raise AgentFitBlocked("Mapping calibration requires exactly one macro-pixel size.")
+        size = plan.macro_pixel_sizes[0]
+        if size.width <= 0 or size.width != size.height:
+            raise AgentFitBlocked("Mapping calibration requires a positive square macro-pixel size.")
+    else:
+        if len(plan.macro_pixel_sizes) != MACRO_PIXEL_SIZE_LEVELS * 2 + 1:
+            raise AgentFitBlocked("The run requires exactly seven macro-pixel sizes.")
+        expected_sizes = build_macro_pixel_sizes(
+            MACRO_PIXEL_BASELINE_WIDTH,
+            MACRO_PIXEL_BASELINE_HEIGHT,
+        )
+        if plan.macro_pixel_sizes != expected_sizes:
+            raise AgentFitBlocked("Macro-pixel sizes differ from the validated 1.25 scale series.")
     if len({edge.hkl for edge in plan.edges}) != len(plan.edges):
         raise AgentFitBlocked("Selected edges must be distinct trusted HKLs.")
     if len({edge.source_row for edge in plan.edges}) != len(plan.edges):
@@ -662,8 +669,9 @@ def run_agent_fitting(
     langsmith_environment: str = "local",
     langsmith_region: str = "eu",
     langsmith_workspace_id: str = "",
+    mapping_calibration: bool = False,
 ) -> AgentFitOutcome:
-    """Run the seven-location, seven-size exploratory edge-fit graph locally."""
+    """Run the local sweep or one-size mapping calibration through the fit graph."""
     total = len(plan.spatial_rois) * len(plan.macro_pixel_sizes) * len(plan.edges)
     if total < 1:
         raise AgentFitBlocked("The fit plan does not contain any location, size, and edge combinations.")
@@ -679,7 +687,7 @@ def run_agent_fitting(
         raise AgentFitBlocked("The local Region 3 fit requires a trusted fcc/bcc lattice parameter.")
     if not isinstance(plan.fitting_parameter_bounds, FittingParameterBounds):
         raise AgentFitBlocked("Configured fitting bounds are invalid.")
-    _validate_fit_plan(plan)
+    _validate_fit_plan(plan, mapping_calibration=mapping_calibration)
 
     cells_by_key: dict[tuple[int, int, int], AgentFitCellResult] = {}
     spectra: dict[tuple[int, int], SpectrumObservation] = {}
@@ -1010,7 +1018,11 @@ def run_agent_fitting(
         environment=langsmith_environment,
         region=langsmith_region,
         workspace_id=langsmith_workspace_id,
-        workflow="neat_macro_pixel_size_sweep",
+        workflow=(
+            "neat_mapping_parameter_calibration"
+            if mapping_calibration else "neat_macro_pixel_size_sweep"
+        ),
+        thread_id=plan.run_id,
     ):
         fit_state = compiled_fit_graph.invoke(
             {
@@ -1025,7 +1037,10 @@ def run_agent_fitting(
                 "blocked": False,
             },
             config={
-                "run_name": "NEAT: Macro-pixel fitting",
+                "run_name": (
+                    "NEAT: Mapping parameter calibration"
+                    if mapping_calibration else "NEAT: Macro-pixel fitting"
+                ),
                 "configurable": {"thread_id": plan.run_id},
                 "recursion_limit": (
                     len(plan.spatial_rois) * len(plan.macro_pixel_sizes) + total + 10

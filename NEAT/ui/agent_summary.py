@@ -92,7 +92,7 @@ class AgentSummaryWidget(QScrollArea):
             ConclusionRow(title, content)
             for title in (
                 "1 · Dataset check", "2 · Phase comparison",
-                "3 · Sample locations", "4 · Local fitting",
+                "3 · Sample locations", "4 · Local fitting", "5 · Mapping",
             )
         )
         for index, row in enumerate(self.rows):
